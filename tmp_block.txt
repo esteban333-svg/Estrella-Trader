@@ -1,0 +1,37 @@
+esfera_visual = estrella_visual
+
+
+
+
+# Panel flotante: posición
+if "panel_pos" not in st.session_state:
+    st.session_state["panel_pos"] = "Arriba derecha"
+
+panel_pos = st.sidebar.selectbox(
+    "Posición del panel",
+    ["Arriba derecha", "Arriba izquierda", "Abajo derecha", "Abajo izquierda"],
+    index=["Arriba derecha", "Arriba izquierda", "Abajo derecha", "Abajo izquierda"].index(
+        st.session_state["panel_pos"]
+    )
+)
+st.session_state["panel_pos"] = panel_pos
+
+
+
+# -----------------------
+# SIDEBAR – CONFIGURACIÓN                    #CARGAR DATOS
+# -----------------------
+# ====== PREMIUM DEMO (ANTES DEL ANÁLISIS) ======
+if "usuario" not in st.session_state:
+    st.session_state["usuario"] = {"id": "local_demo", "es_premium": False}
+
+with st.expander("🧪 Depuración", expanded=False):
+    st.session_state["usuario"]["es_premium"] = st.toggle(
+        "Premium (demo)",
+        value=st.session_state["usuario"].get("es_premium", False),
+        help="Activa funciones premium como 🧠 Enseñar."
+    )
+
+usuario = st.session_state["usuario"]
+
+
