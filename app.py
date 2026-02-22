@@ -47,6 +47,44 @@ except Exception:
     st_autorefresh = None
     _HAS_AUTOREFRESH = False
 
+
+import streamlit as st
+
+st.set_page_config(
+    page_title="Estrella Trader",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+st.markdown("""
+<style>
+
+/* Quita header */
+header {visibility: hidden;}
+
+/* Quita footer */
+footer {visibility: hidden;}
+
+/* Quita marca Streamlit */
+#MainMenu {visibility: hidden;}
+
+/* Quita toolbar */
+div[data-testid="stToolbar"] {display: none;}
+div[data-testid="stDecoration"] {display: none;}
+
+/* Quita padding superior */
+.block-container {
+    padding-top: 0rem;
+    padding-bottom: 0rem;
+}
+
+/* Ocupa toda la pantalla */
+html, body, [data-testid="stAppViewContainer"] {
+    height: 100%;
+}
+
+</style>
+""", unsafe_allow_html=True)
 # -----------------------
 # CONFIGURACION DE LA APP (SIEMPRE PRIMERO)
 # -----------------------
@@ -2351,6 +2389,7 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
+
 
 
 
