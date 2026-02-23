@@ -375,6 +375,17 @@ st.set_page_config(
 )
 st.markdown("""
 <style>
+/* Oculta widgets flotantes de Streamlit Cloud */
+div[data-testid="stStatusWidget"] {display: none !important;}
+div[data-testid="stFloatingActionButton"] {display: none !important;}
+
+/* Oculta footer y marca */
+footer {visibility: hidden;}
+#MainMenu {visibility: hidden;}
+</style>
+""", unsafe_allow_html=True)
+st.markdown("""
+<style>
 
 /* Quita header */
 header {visibility: hidden;}
@@ -2431,6 +2442,7 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
+
 
 
 
