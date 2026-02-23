@@ -1,4 +1,4 @@
-﻿# -----------------------
+# -----------------------
 # IMPORTS DEL PROYECTO DEJAR ARRIBA
 # -----------------------
 import streamlit as st
@@ -306,6 +306,7 @@ div[data-testid="stTextArea"] textarea {{
 }}
 </style>
 """, unsafe_allow_html=True)
+
 # ====== BOTONES ENSEÑAR (COLORES) ======
 st.markdown("""
 <style>
@@ -401,9 +402,27 @@ html, body, [data-testid="stAppViewContainer"] {
 
 </style>
 """, unsafe_allow_html=True)
-
 st.markdown("""
+<style>
 
+/* Fuerza que el contenedor principal ocupe toda la pantalla */
+[data-testid="stAppViewContainer"] {
+    height: 100vh !important;
+}
+
+/* Hace que el bloque principal use todo el alto */
+.block-container {
+    min-height: 100vh !important;
+    padding-top: 0rem !important;
+}
+
+/* Elimina espacio extra interno */
+section.main > div {
+    padding-top: 0rem !important;
+}
+
+</style>
+""", unsafe_allow_html=True)
 # ========= [V1.2-B HELPERS - INICIO] =========
 def color_por_decision(decision: str) -> str:
     d = (decision or "").upper()
@@ -2389,15 +2408,6 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
-
-
-
-
-
-
-
-
-
 
 
 
