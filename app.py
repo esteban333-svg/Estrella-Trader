@@ -305,7 +305,7 @@ div[data-testid="stTextArea"] textarea {{
   color: {COL_TEXT};
 }}
 </style>
-
+""", unsafe_allow_html=True)
 # ====== BOTONES ENSEÑAR (COLORES) ======
 st.markdown("""
 <style>
@@ -401,6 +401,7 @@ html, body, [data-testid="stAppViewContainer"] {
 
 </style>
 """, unsafe_allow_html=True)
+
 st.markdown("""
 
 # ========= [V1.2-B HELPERS - INICIO] =========
@@ -2388,6 +2389,7 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
+
 
 
 
