@@ -1,7 +1,6 @@
 # -----------------------
 # IMPORTS DEL PROYECTO DEJAR ARRIBA
 # -----------------------
-import streamlit as st
 from analysis import obtener_precio_live
 import streamlit as st
 from estrella_ui import render_estado_estrella
@@ -47,6 +46,8 @@ try:
 except Exception:
     st_autorefresh = None
     _HAS_AUTOREFRESH = False
+import streamlit as st
+
 
 # -----------------------
 # CONFIGURACION DE LA APP (SIEMPRE PRIMERO)
@@ -367,7 +368,6 @@ st.markdown("""
 
 
 # ========= [V1.2-B THEME - FIN] =========
-
 # ========= [V1.2-B HELPERS - INICIO] =========
 def color_por_decision(decision: str) -> str:
     d = (decision or "").upper()
@@ -1276,7 +1276,7 @@ st.session_state["premium_prev_state"] = es_premium
 if es_premium:
     with st.sidebar.expander("Premium Tools", expanded=False):
         st.session_state["debug_v13"] = st.toggle(
-            "Mostrar diagnostico v1.3 (Azul/Dorado/Rojo)",
+            "Mostrar diagnostico. Solo en Premium",
             value=st.session_state.get("debug_v13", False),
             help="Activa el panel de diagnostico avanzado."
         )
@@ -1289,7 +1289,7 @@ with st.sidebar.expander("Ayuda", expanded=False):
         st.session_state["show_quick_guide"] = True
 
 # -----------------------
-# SIDEBAR ? CONFIGURACI?N                    #CARGAR DATOS
+# SIDEBAR  CONFIGURACION                    #CARGAR DATOS
 # -----------------------
 
 st.sidebar.header("⚙️ Configuración de mercado")
@@ -1782,7 +1782,7 @@ if not mercado_abierto:
     frase_pedagogica = estado["frase_pedagogica"]
 
 if es_premium and st.session_state.get("debug_v13", False):
-    with st.expander("Diagnostico Premium (v1.3)", expanded=False):
+    with st.expander("Diagnostico Premium ", expanded=False):
         debug = resumen_estado_humano(estado, usuario)
 
         d = debug["direccion"]
@@ -1809,7 +1809,7 @@ if es_premium and st.session_state.get("debug_v13", False):
                 st.write("• " + "\n• ".join(dor["razones"]))
         else:
             st.markdown("### 🟡 Dorado: **NO ACTIVO**")
-            st.caption("No hay ventaja suficiente (esto es correcto).")
+            st.caption("No hay ventaja suficiente.")
 
         r = debug["rojo"]
         if r["nivel"]:
@@ -1817,16 +1817,14 @@ if es_premium and st.session_state.get("debug_v13", False):
             if r["razones"]:
                 st.write("• " + "\n• ".join(r["razones"]))
         else:
-            st.markdown("### 🔴 Rojo (riesgo): —")
-            st.caption("Rojo aparece cuando hay evaluación de riesgo disponible (idealmente con Dorado activo).")
+            st.markdown("### 🔴 Rojo (riesgo)")
+            st.caption("Rojo aparece cuando hay evaluación de riesgo disponible.")
 
         e = debug["ensenar"]
         if e["premium"]:
             st.markdown("### 🧭 Enseñar")
             st.caption("Disponible para tu cuenta.")
-            st.write("Activo ✅" if e["activo"] else "Sin enseñanza relevante en este momento.")
-            if e["titulo"]:
-                st.caption(f"Título: {e['titulo']}")
+
 
 # ========= [PANEL PRINCIPAL FLOTANTE - INICIO] =========
 decision = estado.get("decision", "OBSERVAR")
@@ -1929,24 +1927,24 @@ with st.container(key="refresh_float_panel"):
 if not mercado_abierto:
     st.subheader("⏸️ Mercado cerrado")
     st.write("La lectura operativa queda en pausa hasta la apertura del mercado.")
-elif estado.get("dorado_v13"):
+elif estado.get("dorado"):
     st.subheader("🟡 Ventaja detectada (Dorado)")
-    st.write(estado["dorado_v13"]["resumen"])
-    st.write("Acción:", estado["dorado_v13"]["accion"])
-    st.write("RR estimado:", estado["dorado_v13"]["rr_estimado"])
+    st.write(estado["dorado"]["resumen"])
+    st.write("Acción:", estado["dorado"]["accion"])
+    st.write("RR estimado:", estado["dorado"]["rr_estimado"])
     st.write("Razones:")
-    for r in estado["dorado_v13"]["razones"]:
+    for r in estado["dorado"]["razones"]:
         st.write("•", r)
 else:
     st.subheader("🔵 Azul")
     st.write(estado.get("mensaje", "No hay ventaja suficiente ahora."))
 
-if estado.get("dorado_v13") and estado.get("rojo_v13"):
+if estado.get("dorado") and estado.get("rojo"):
     st.subheader("🔴 Riesgo (Rojo)")
-    st.write(f"Nivel: **{estado['rojo_v13']['nivel']}**")
-    if estado["rojo_v13"]["razones"]:
+    st.write(f"Nivel: **{estado['rojo']['nivel']}**")
+    if estado["rojo"]["razones"]:
         st.write("Razones:")
-        for r in estado["rojo_v13"]["razones"]:
+        for r in estado["rojo"]["razones"]:
             st.write("•", r)
 
 if recalc_estrella and mercado_abierto:
@@ -2353,10 +2351,6 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
-
-
-
-
 
 
 
