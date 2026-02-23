@@ -368,61 +368,6 @@ st.markdown("""
 
 # ========= [V1.2-B THEME - FIN] =========
 
-st.set_page_config(
-    page_title="Estrella Trader",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-st.markdown("""
-<style>
-
-/* Quita header */
-header {visibility: hidden;}
-
-/* Quita footer */
-footer {visibility: hidden;}
-
-/* Quita marca Streamlit */
-#MainMenu {visibility: hidden;}
-
-/* Quita toolbar */
-div[data-testid="stToolbar"] {display: none;}
-div[data-testid="stDecoration"] {display: none;}
-
-/* Quita padding superior */
-.block-container {
-    padding-top: 0rem;
-    padding-bottom: 0rem;
-}
-
-/* Ocupa toda la pantalla */
-html, body, [data-testid="stAppViewContainer"] {
-    height: 100%;
-}
-
-</style>
-""", unsafe_allow_html=True)
-st.markdown("""
-<style>
-
-/* Fuerza que el contenedor principal ocupe toda la pantalla */
-[data-testid="stAppViewContainer"] {
-    height: 100vh !important;
-}
-
-/* Hace que el bloque principal use todo el alto */
-.block-container {
-    min-height: 100vh !important;
-    padding-top: 0rem !important;
-}
-
-/* Elimina espacio extra interno */
-section.main > div {
-    padding-top: 0rem !important;
-}
-
-</style>
-""", unsafe_allow_html=True)
 # ========= [V1.2-B HELPERS - INICIO] =========
 def color_por_decision(decision: str) -> str:
     d = (decision or "").upper()
@@ -2408,6 +2353,7 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
+
 
 
 
