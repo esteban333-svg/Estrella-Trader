@@ -367,11 +367,6 @@ st.markdown("""
 
 
 # ========= [V1.2-B THEME - FIN] =========
-st.set_page_config(
-    page_title="Estrella Trader",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
 
 st.markdown("""
 <style>
@@ -2408,6 +2403,7 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
+
 
 
 
