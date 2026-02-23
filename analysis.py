@@ -1,4 +1,4 @@
-﻿from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 import yfinance as yf
 import pandas as pd
@@ -69,6 +69,28 @@ def obtener_precio_live(ticker: str) -> Optional[float]:
         return None
 
 
+
+fixes = {
+        "ðŸ§­": "🧭",
+        "GuÃa": "Guía",
+        "Ã¡": "á",
+        "Ã©": "é",
+        "Ã­": "í",
+        "Ã³": "ó",
+        "Ãº": "ú",
+        "Ã": "Á",
+        "Ã‰": "É",
+        "Ã": "Í",
+        "Ã“": "Ó",
+        "Ãš": "Ú",
+        "Ã±": "ñ",
+        "Ã‘": "Ñ",
+        "â€”": "—",
+        "â€“": "–",
+        "â€œ": "\"",
+        "â€": "\"",
+        "â€™": "'",
+    }
 # ========= [ENSEÃ‘AR v1.2-C-A - INICIO] =========
 
 def _risk_value(r: str) -> int:
@@ -96,7 +118,7 @@ def detectar_eventos_mercado(estado: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     # Contexto mÃ­nimo
     mercado = estado.get("mercado", estado.get("symbol", ""))
-    sesion = estado.get("sesion", estado.get("sesiÃ³n", ""))
+    sesion = estado.get("sesion", estado.get("sesion", ""))
     esfera = estado.get("esfera", "")
     riesgo = estado.get("riesgo", "Medio")
     decision = estado.get("decision", "")
@@ -120,8 +142,8 @@ def detectar_eventos_mercado(estado: Dict[str, Any]) -> List[Dict[str, Any]]:
         eventos.append(mk(
             "ruptura",
             "Ruptura real",
-            "El mercado saliÃ³ de una zona clara y cambiÃ³ de ritmo. "
-            "En estos puntos la prisa suele costar; la confirmaciÃ³n protege."
+            "El mercado salio de una zona clara y cambio de ritmo. "
+            "En estos puntos la prisa suele costar; la confirmacion protege."
         ))
 
     if fallo_ruptura:
@@ -136,16 +158,16 @@ def detectar_eventos_mercado(estado: Dict[str, Any]) -> List[Dict[str, Any]]:
         eventos.append(mk(
             "cambio_tendencia",
             "Cambio de tendencia",
-            "El mercado cambiÃ³ su lÃ³gica (rÃ©gimen). "
-            "Lo que funcionaba antes puede dejar de funcionar aquÃ­."
+            "El mercado cambio su logica (regimen). "
+            "Lo que funcionaba antes puede dejar de funcionar aqui."
         ))
 
     if expansion_volatilidad:
         eventos.append(mk(
             "expansion_volatilidad",
-            "ExpansiÃ³n tras compresiÃ³n",
+            "Expansion tras compresion",
             "La calma suele preceder al movimiento. "
-            "DespuÃ©s de una compresiÃ³n, es normal que aparezca emociÃ³n: observa antes de actuar."
+            "Despues de una compresionn, es normal que aparezca emocion: observa antes de actuar."
         ))
 
     return eventos
@@ -323,10 +345,10 @@ def calcular_contenido_ensenable(
 
     if decision == "OBSERVAR" and estructura_valida and intencion_no_clara:
         candidatos.append(guia(
-            titulo="ðŸ§­ GuÃ­a de la Estrella",
+            titulo="ðŸ§­ Guia de la Estrella",
             ahora="Ahora: Mantente en OBSERVAR.",
-            porque="La estructura es vÃ¡lida, pero todavÃ­a no hay intenciÃ³n. Entrar aquÃ­ es adivinar.",
-            proximo="PrÃ³ximo paso: espera confirmaciÃ³n (cierre claro + ruptura/rechazo) antes de considerar operar.",
+            porque="La estructura es valida, pero todavia no hay intencion. Entrar aqui es adivinar.",
+            proximo="Proximo paso: espera confirmacn (cierre claro + ruptura/rechazo) antes de considerar operar.",
             tipo="lectura",
             prioridad=2,
             etiqueta="estructura_ok_intencion_no_clara",
@@ -1464,9 +1486,9 @@ def construir_estado_final_estructural(
         "azul_1d": azul_1d,
         "azul_4h": azul_4h,
         "alineacion": alineacion,
-        "dorado_activo": estado.get("dorado_v13") is not None,
-        "micro_score_dorado": (estado.get("dorado_v13") or {}).get("micro_score"),
-        "rojo": estado.get("rojo_v13"),
+        "dorado_activo": estado.get("dorado") is not None,
+        "micro_score_dorado": (estado.get("dorado") or {}).get("micro_score"),
+        "rojo": estado.get("rojo"),
     }
     return estado
 
