@@ -422,7 +422,30 @@ section.main > div {
 }
 
 </style>
+
+
 """, unsafe_allow_html=True)
+st.markdown("""
+<style>
+
+/* Quita botón flotante verde */
+div[data-testid="stFloatingActionButton"] {
+    display: none !important;
+}
+
+/* Quita botón rojo de Community */
+div[data-testid="stStatusWidget"] {
+    display: none !important;
+}
+
+/* Quita icono fullscreen */
+button[title="View fullscreen"] {
+    display: none !important;
+}
+
+</style>
+""", unsafe_allow_html=True)
+
 # ========= [V1.2-B HELPERS - INICIO] =========
 def color_por_decision(decision: str) -> str:
     d = (decision or "").upper()
@@ -2408,6 +2431,7 @@ _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
+
 
 
 
