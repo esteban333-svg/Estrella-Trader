@@ -3,6 +3,7 @@
 # -----------------------
 from analysis import obtener_precio_live
 import streamlit as st
+import streamlit.components.v1 as components
 from estrella_ui import render_estado_estrella
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -12,12 +13,14 @@ import pandas as pd
 from analysis import interpretar_bollinger
 import time
 import math
+import html
 import os
 import random
 import base64
 import json
 import hashlib
 import smtplib
+import logging
 from email.message import EmailMessage
 from uuid import uuid4
 from datetime import datetime, timedelta
@@ -46,7 +49,15 @@ try:
 except Exception:
     st_autorefresh = None
     _HAS_AUTOREFRESH = False
+try:
+    from streamlit_cookies_manager import EncryptedCookieManager
+    _HAS_COOKIE_MANAGER = True
+except Exception:
+    EncryptedCookieManager = None
+    _HAS_COOKIE_MANAGER = False
 import streamlit as st
+
+logger = logging.getLogger(__name__)
 
 
 # -----------------------
@@ -58,7 +69,9 @@ st.set_page_config(
 )
 
 
-# ========= [V1.2-B THEME - INICIO] =========
+# ============================================================
+# BLOQUE: TEMA GLOBAL Y ESTILOS (CSS)
+# ============================================================
 
 COL_BG = "#0F1117"
 COL_CARD = "#161A23"
@@ -69,13 +82,399 @@ COL_MUTE = "#6B7280"
 COL_BLUE = "#4A90E2"
 COL_GOLD = "#F5C26B"
 COL_RED = "#E26D5A"
+BG_STAR_SIZE_PX = 1900
 
 st.markdown(f"""
 <style>
 /* Fondo general */
 .stApp {{
   background-color: {COL_BG};
+  background:
+    radial-gradient(1200px 700px at 50% 18%, rgba(45,56,82,0.30), rgba(15,17,23,0.0) 62%),
+    linear-gradient(rgba(15,17,23,0.96), rgba(15,17,23,0.96));
   color: {COL_TEXT};
+}}
+
+/* Velo oscuro para legibilidad del texto sobre la estrella */
+.stApp::before {{
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background: linear-gradient(rgba(8, 10, 16, 0.46), rgba(8, 10, 16, 0.62));
+}}
+
+/* Capa Plotly de fondo (estrella) */
+.st-key-bg_star_full {{
+  position: fixed !important;
+  inset: 0 !important;
+  z-index: 0 !important;
+  pointer-events: none !important;
+  opacity: 0.42 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  overflow: hidden !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  filter: saturate(0.92) brightness(0.92) !important;
+}}
+
+.st-key-bg_star_full > div {{
+  height: 100vh !important;
+  width: 100vw !important;
+}}
+
+.st-key-bg_star_full [data-testid="stPlotlyChart"] {{
+  position: static !important;
+  left: auto !important;
+  top: auto !important;
+  transform: none !important;
+  width: {BG_STAR_SIZE_PX}px !important;
+  max-width: none !important;
+  height: {BG_STAR_SIZE_PX}px !important;
+}}
+
+.st-key-bg_star_full .js-plotly-plot,
+.st-key-bg_star_full .plot-container,
+.st-key-bg_star_full .svg-container {{
+  width: {BG_STAR_SIZE_PX}px !important;
+  max-width: none !important;
+  height: {BG_STAR_SIZE_PX}px !important;
+}}
+
+.block-container {{
+  position: relative;
+  z-index: 2;
+}}
+
+[data-testid="stSidebar"] {{
+  position: relative;
+  z-index: 3;
+}}
+
+[data-testid="stExpander"] {{
+  background: rgba(12, 16, 28, 0.52);
+  border: 1px solid rgba(255,255,255,0.10);
+  border-radius: 12px;
+}}
+
+/* Núcleo de luz central (efecto observando) */
+.et-core-watch {{
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: min(10vw, 140px);
+  aspect-ratio: 1 / 1;
+  transform: translate(-50%, -50%);
+  z-index: 1;
+  pointer-events: none;
+  border-radius: 50%;
+  background:
+    radial-gradient(circle, rgba(255,255,255,0.78) 0%, rgba(255,255,255,0.34) 26%, rgba(74,144,226,0.12) 58%, rgba(0,0,0,0) 100%);
+  box-shadow: 0 0 42px rgba(255,255,255,0.24), 0 0 110px rgba(74,144,226,0.10);
+  filter: blur(1.2px);
+  opacity: 0.22;
+  animation: et-core-watch-pulse 7.4s ease-in-out infinite;
+}}
+
+@keyframes et-core-watch-pulse {{
+  0%, 100% {{ opacity: 0.16; transform: translate(-50%, -50%) scale(0.98); }}
+  50% {{ opacity: 0.28; transform: translate(-50%, -50%) scale(1.03); }}
+}}
+
+/* Ambiente galaxia persistente (muy ligero) */
+.et-galaxy-ambient {{
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  overflow: hidden;
+}}
+
+.et-galaxy-blob {{
+  position: absolute;
+  width: min(42vw, 560px);
+  aspect-ratio: 1 / 1;
+  border-radius: 999px;
+  mix-blend-mode: screen;
+  filter: blur(26px);
+  will-change: transform, opacity;
+}}
+
+.et-galaxy-b1 {{
+  left: -8vw;
+  top: 18vh;
+  background: radial-gradient(circle, rgba(74,144,226,0.16), rgba(74,144,226,0.02) 62%, rgba(74,144,226,0) 100%);
+  animation: et-galaxy-drift-a 18s ease-in-out infinite;
+}}
+
+.et-galaxy-b2 {{
+  right: -10vw;
+  top: 28vh;
+  background: radial-gradient(circle, rgba(226,109,90,0.14), rgba(226,109,90,0.02) 62%, rgba(226,109,90,0) 100%);
+  animation: et-galaxy-drift-b 21s ease-in-out infinite;
+}}
+
+.et-galaxy-b3 {{
+  left: 24vw;
+  bottom: -14vh;
+  background: radial-gradient(circle, rgba(245,194,107,0.14), rgba(245,194,107,0.02) 62%, rgba(245,194,107,0) 100%);
+  animation: et-galaxy-drift-c 20s ease-in-out infinite;
+}}
+
+/* Intro one-shot al login: esferas se separan */
+.et-login-intro {{
+  position: fixed;
+  inset: 0;
+  z-index: 12;
+  pointer-events: none;
+  overflow: hidden;
+  animation: et-login-intro-out 3.2s ease forwards;
+}}
+
+.et-login-intro-core {{
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 120px;
+  height: 120px;
+  margin-left: -60px;
+  margin-top: -60px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255,255,255,0.95), rgba(255,255,255,0.56) 42%, rgba(255,255,255,0.08) 78%, rgba(255,255,255,0) 100%);
+  box-shadow: 0 0 28px rgba(255,255,255,0.28), 0 0 84px rgba(255,255,255,0.18);
+  will-change: transform, opacity;
+  animation: et-login-core-pulse 3.2s ease forwards;
+}}
+
+.et-login-orb {{
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 180px;
+  height: 180px;
+  margin-left: -90px;
+  margin-top: -90px;
+  border-radius: 50%;
+  mix-blend-mode: screen;
+  will-change: transform, opacity;
+}}
+
+.et-login-orb-r {{
+  background: radial-gradient(circle, rgba(255,255,255,0.50), rgba(226,109,90,0.44) 40%, rgba(226,109,90,0.08) 72%, rgba(226,109,90,0) 100%);
+  animation: et-login-orb-r 3.2s cubic-bezier(0.2, 0.85, 0.2, 1) forwards;
+}}
+
+.et-login-orb-b {{
+  background: radial-gradient(circle, rgba(255,255,255,0.50), rgba(74,144,226,0.44) 40%, rgba(74,144,226,0.08) 72%, rgba(74,144,226,0) 100%);
+  animation: et-login-orb-b 3.2s cubic-bezier(0.2, 0.85, 0.2, 1) forwards;
+}}
+
+.et-login-orb-g {{
+  background: radial-gradient(circle, rgba(255,255,255,0.52), rgba(245,194,107,0.44) 40%, rgba(245,194,107,0.08) 72%, rgba(245,194,107,0) 100%);
+  animation: et-login-orb-g 3.2s cubic-bezier(0.2, 0.85, 0.2, 1) forwards;
+}}
+
+/* Lluvia de estrellas one-shot */
+.et-star-rain-overlay {{
+  position: fixed;
+  inset: 0;
+  z-index: 10022;
+  pointer-events: none;
+  overflow: hidden;
+  animation: et-star-rain-fade 6.4s ease forwards;
+}}
+
+.et-star-rain-core {{
+  position: fixed;
+  left: var(--x0);
+  top: var(--y0);
+  width: 74px;
+  height: 74px;
+  margin-left: -37px;
+  margin-top: -37px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255,255,255,0.96), rgba(255,255,255,0.36) 52%, rgba(255,255,255,0.0) 100%);
+  box-shadow: 0 0 24px rgba(255,255,255,0.22), 0 0 62px rgba(74,144,226,0.20);
+  opacity: 0.0;
+  animation: et-star-rain-core 5.8s ease forwards;
+}}
+
+.et-star-rain-dot {{
+  position: fixed;
+  left: var(--x0);
+  top: var(--y0);
+  width: var(--s);
+  height: var(--s);
+  border-radius: 999px;
+  background: var(--c);
+  box-shadow: 0 0 8px rgba(255,255,255,0.28);
+  opacity: 0;
+  will-change: transform, opacity;
+  animation: et-star-rain-merge var(--dur) cubic-bezier(0.18, 0.82, 0.2, 1) forwards;
+  animation-delay: var(--d);
+}}
+
+@keyframes et-star-rain-merge {{
+  0% {{ transform: translate(var(--sx), var(--sy)) scale(0.90); opacity: 0; }}
+  12% {{ opacity: 0.96; }}
+  58% {{ transform: translate(var(--ex), var(--ey)) scale(1.04); opacity: 0.98; }}
+  76% {{ transform: translate(var(--ex), var(--ey)) scale(1.00); opacity: 0.92; }}
+  100% {{ transform: translate(var(--bx), var(--by)) scale(0.28); opacity: 0.04; }}
+}}
+
+@keyframes et-star-rain-core {{
+  0% {{ opacity: 0.0; transform: scale(0.36); }}
+  46% {{ opacity: 0.84; transform: scale(1.10); }}
+  72% {{ opacity: 0.66; transform: scale(1.00); }}
+  100% {{ opacity: 0.08; transform: scale(0.24); }}
+}}
+
+@keyframes et-star-rain-fade {{
+  0%, 92% {{ opacity: 1; }}
+  100% {{ opacity: 0; }}
+}}
+
+/* Intro login: cae + se reagrupa formando estrella */
+.et-login-starstorm {{
+  position: fixed;
+  inset: 0;
+  z-index: 10020;
+  pointer-events: none;
+  overflow: hidden;
+  animation: et-login-starstorm-fade 7.2s ease forwards;
+}}
+
+.et-login-star-dot {{
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: var(--s);
+  height: var(--s);
+  border-radius: 999px;
+  background: var(--c);
+  box-shadow: 0 0 8px rgba(255,255,255,0.26);
+  opacity: 0;
+  will-change: transform, opacity;
+  animation: et-login-star-merge var(--dur) cubic-bezier(0.16, 0.84, 0.20, 1) forwards;
+  animation-delay: var(--d);
+}}
+
+.et-login-star-core {{
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: 112px;
+  height: 112px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(255,255,255,0.92), rgba(255,255,255,0.34) 52%, rgba(255,255,255,0.0) 100%);
+  box-shadow: 0 0 34px rgba(255,255,255,0.24), 0 0 84px rgba(74,144,226,0.18);
+  opacity: 0.92;
+  animation: et-login-star-core 6.8s ease forwards;
+}}
+
+@keyframes et-login-star-merge {{
+  0% {{ transform: translate(var(--sx), var(--sy)) scale(0.90); opacity: 0; }}
+  12% {{ opacity: 0.94; }}
+  50% {{ transform: translate(var(--ex), var(--ey)) scale(1.04); opacity: 0.98; }}
+  72% {{ transform: translate(var(--ex), var(--ey)) scale(1.0); opacity: 0.95; }}
+  100% {{ transform: translate(var(--bx), var(--by)) scale(0.20); opacity: 0.06; }}
+}}
+
+@keyframes et-login-star-core {{
+  0% {{ opacity: 0.0; transform: translate(-50%, -50%) scale(0.38); }}
+  42% {{ opacity: 0.88; transform: translate(-50%, -50%) scale(1.16); }}
+  68% {{ opacity: 0.72; transform: translate(-50%, -50%) scale(1.00); }}
+  100% {{ opacity: 0.10; transform: translate(-50%, -50%) scale(0.18); }}
+}}
+
+@keyframes et-login-starstorm-fade {{
+  0%, 90% {{ opacity: 1; }}
+  100% {{ opacity: 0; }}
+}}
+
+@keyframes et-galaxy-drift-a {{
+  0%, 100% {{ transform: translate3d(0, 0, 0) scale(1); opacity: 0.24; }}
+  50% {{ transform: translate3d(34px, -18px, 0) scale(1.08); opacity: 0.34; }}
+}}
+
+@keyframes et-galaxy-drift-b {{
+  0%, 100% {{ transform: translate3d(0, 0, 0) scale(1); opacity: 0.18; }}
+  50% {{ transform: translate3d(-36px, 24px, 0) scale(1.10); opacity: 0.30; }}
+}}
+
+@keyframes et-galaxy-drift-c {{
+  0%, 100% {{ transform: translate3d(0, 0, 0) scale(1); opacity: 0.16; }}
+  50% {{ transform: translate3d(18px, -26px, 0) scale(1.06); opacity: 0.26; }}
+}}
+
+@keyframes et-login-intro-out {{
+  0%, 74% {{ opacity: 1; }}
+  100% {{ opacity: 0; }}
+}}
+
+@keyframes et-login-core-pulse {{
+  0% {{ transform: scale(0.38); opacity: 0.96; }}
+  35% {{ transform: scale(1.22); opacity: 0.78; }}
+  74% {{ transform: scale(0.72); opacity: 0.44; }}
+  100% {{ transform: scale(0.62); opacity: 0.0; }}
+}}
+
+@keyframes et-login-orb-r {{
+  0% {{ transform: translate3d(0, 0, 0) scale(0.34); opacity: 0.0; }}
+  18% {{ transform: translate3d(0, 0, 0) scale(0.66); opacity: 0.34; }}
+  78% {{ transform: translate3d(260px, 152px, 0) scale(1.28); opacity: 0.28; }}
+  100% {{ transform: translate3d(300px, 190px, 0) scale(1.36); opacity: 0.0; }}
+}}
+
+@keyframes et-login-orb-b {{
+  0% {{ transform: translate3d(0, 0, 0) scale(0.34); opacity: 0.0; }}
+  18% {{ transform: translate3d(0, 0, 0) scale(0.66); opacity: 0.34; }}
+  78% {{ transform: translate3d(-270px, 140px, 0) scale(1.28); opacity: 0.28; }}
+  100% {{ transform: translate3d(-308px, 176px, 0) scale(1.36); opacity: 0.0; }}
+}}
+
+@keyframes et-login-orb-g {{
+  0% {{ transform: translate3d(0, 0, 0) scale(0.34); opacity: 0.0; }}
+  18% {{ transform: translate3d(0, 0, 0) scale(0.66); opacity: 0.34; }}
+  78% {{ transform: translate3d(0px, -302px, 0) scale(1.28); opacity: 0.28; }}
+  100% {{ transform: translate3d(0px, -344px, 0) scale(1.36); opacity: 0.0; }}
+}}
+
+@media (max-width: 900px) {{
+  .et-galaxy-blob {{
+    width: min(68vw, 380px);
+  }}
+  .et-login-intro-core {{
+    width: 96px;
+    height: 96px;
+    margin-left: -48px;
+    margin-top: -48px;
+  }}
+  .et-login-orb {{
+    width: 132px;
+    height: 132px;
+    margin-left: -66px;
+    margin-top: -66px;
+  }}
+}}
+
+@media (prefers-reduced-motion: reduce) {{
+  .et-galaxy-blob,
+  .et-login-intro,
+  .et-login-intro-core,
+  .et-login-orb,
+  .et-star-rain-overlay,
+  .et-star-rain-core,
+  .et-star-rain-dot,
+  .et-login-star-dot,
+  .et-login-starstorm,
+  .et-login-star-core {{
+    animation: none !important;
+  }}
 }}
 
 /* Texto secundario */
@@ -98,6 +497,70 @@ st.markdown(f"""
   font-weight: 700;
   font-size: 1.02rem;
   margin-bottom: 8px;
+}}
+
+/* Diagnostico premium fijo */
+.et-premium-diag {{
+  background:
+    linear-gradient(180deg, rgba(245,194,107,0.08), rgba(22,26,35,0.96)),
+    {COL_CARD};
+  border: 1px solid rgba(245,194,107,0.34);
+  border-left: 4px solid rgba(245,194,107,0.92);
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin: 10px 0 14px 0;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.28);
+}}
+
+.et-premium-grid {{
+  display: grid;
+  gap: 8px;
+}}
+
+.et-premium-row {{
+  font-size: 0.92rem;
+  line-height: 1.35;
+}}
+
+.et-premium-label {{
+  color: #9AA1B2;
+  font-weight: 600;
+  margin-right: 6px;
+}}
+
+.et-premium-value {{
+  color: #E6E8EE;
+  font-weight: 600;
+}}
+
+.et-premium-value.is-active {{
+  color: #F5C26B;
+}}
+
+.et-premium-value.is-inactive {{
+  color: #7FA7D8;
+}}
+
+.et-premium-value.is-risk {{
+  color: #E26D5A;
+}}
+
+.et-premium-subtitle {{
+  margin-top: 4px;
+  color: #C8CFDA;
+  font-size: 0.9rem;
+  font-weight: 700;
+}}
+
+.et-premium-list {{
+  margin: 4px 0 0 18px;
+  padding: 0;
+  color: #E6E8EE;
+  font-size: 0.9rem;
+}}
+
+.et-premium-list li {{
+  margin: 0 0 4px 0;
 }}
 
 /* Mensaje Estrella con borde por esfera */
@@ -135,7 +598,7 @@ st.markdown(f"""
 /* ===== Panel principal flotante ===== */
 .et-float-panel{{
   position: fixed;
-  top: 86px;           /* ajusta si tu header ocupa m?s/menos */
+  top: 86px;           /* ajusta si tu header ocupa más/menos */
   right: 22px;
   width: 240px;
   z-index: 9999;
@@ -179,7 +642,7 @@ st.markdown(f"""
   height: 1px;
 }}
 
-/* Responsivo: en pantallas peque?as lo pegamos abajo para no tapar todo */
+/* Responsivo: en pantallas pequeñas lo pegamos abajo para no tapar todo */
 @media (max-width: 900px){{
   .et-float-panel{{
     position: fixed;
@@ -253,12 +716,122 @@ st.markdown(f"""
   color: #9AA1B2;
 }}
 
-/* ===== Guia rapida inicial (modal) ===== */
+/* ===== Guía rápida inicial (modal) ===== */
 .et-guide-backdrop {{
   position: fixed;
   inset: 0;
   background: rgba(8, 10, 16, 0.58);
   z-index: 10018;
+}}
+
+/* ===== Boton flotante guia ===== */
+.st-key-quick_guide_fab {{
+  position: fixed !important;
+  right: 18px !important;
+  left: unset !important;
+  bottom: 18px !important;
+  top: unset !important;
+  width: fit-content !important;
+  z-index: 10017 !important;
+}}
+
+.st-key-quick_guide_fab > div {{
+  width: fit-content !important;
+}}
+
+.st-key-quick_guide_fab .stButton > button {{
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.22);
+  background: rgba(17, 24, 39, 0.92);
+  color: #E6E8EE;
+  font-weight: 700;
+  padding: 0.5rem 0.95rem;
+  box-shadow: 0 10px 24px rgba(0,0,0,0.42);
+}}
+
+.st-key-quick_guide_fab .stButton > button:hover {{
+  border-color: rgba(245,194,107,0.55);
+  color: #F5C26B;
+}}
+
+/* ===== Boton flotante actualizar (junto a guia) ===== */
+.st-key-refresh_fab {{
+  position: fixed !important;
+  right: 176px !important;
+  left: unset !important;
+  bottom: 18px !important;
+  top: unset !important;
+  width: fit-content !important;
+  z-index: 10017 !important;
+}}
+
+.st-key-refresh_fab > div {{
+  width: fit-content !important;
+}}
+
+.st-key-refresh_fab .stButton > button {{
+  border-radius: 999px;
+  border: 1px solid #5BE36A;
+  background: linear-gradient(135deg, #7CFF8A 0%, #39D353 100%);
+  color: #0A2610;
+  font-weight: 700;
+  padding: 0.5rem 0.95rem;
+  box-shadow: 0 8px 22px rgba(57, 211, 83, 0.45);
+}}
+
+.st-key-refresh_fab .stButton > button:hover {{
+  filter: brightness(1.04);
+  border-color: #A4FFAF;
+}}
+
+/* ===== Badge estado Live/Fallback ===== */
+.st-key-live_status_badge {{
+  position: fixed !important;
+  right: 18px !important;
+  bottom: 66px !important;
+  top: unset !important;
+  left: unset !important;
+  width: fit-content !important;
+  z-index: 10016 !important;
+}}
+
+.st-key-live_status_badge > div {{
+  width: fit-content !important;
+}}
+
+.et-live-pill {{
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 999px;
+  padding: 0.43rem 0.78rem;
+  background: rgba(17, 24, 39, 0.92);
+  border: 1px solid rgba(255,255,255,0.18);
+  color: #E6E8EE;
+  font-weight: 700;
+  font-size: 0.82rem;
+  box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+}}
+
+.et-live-pill .dot {{
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+}}
+
+.et-live-pill.is-live .dot {{
+  background: #39D353;
+  box-shadow: 0 0 8px rgba(57,211,83,0.7);
+}}
+
+.et-live-pill.is-fallback .dot {{
+  background: #F5C26B;
+  box-shadow: 0 0 8px rgba(245,194,107,0.55);
+}}
+
+.et-live-pill .meta {{
+  font-weight: 500;
+  opacity: 0.9;
 }}
 
 .st-key-onboarding_modal {{
@@ -290,6 +863,20 @@ st.markdown(f"""
 }}
 
 @media (max-width: 900px) {{
+  .st-key-quick_guide_fab {{
+    right: 12px !important;
+    left: unset !important;
+    bottom: 12px !important;
+    top: unset !important;
+  }}
+  .st-key-refresh_fab {{
+    right: 12px !important;
+    bottom: 56px !important;
+  }}
+  .st-key-live_status_badge {{
+    right: 12px !important;
+    bottom: 102px !important;
+  }}
   .st-key-onboarding_modal {{
     top: 4vh;
     left: 50%;
@@ -368,17 +955,21 @@ st.markdown("""
 
 
 # ========= [V1.2-B THEME - FIN] =========
+
+# ============================================================
+# BLOQUE: HELPERS DE PRESENTACION Y TEXTO
+# ============================================================
 # ========= [V1.2-B HELPERS - INICIO] =========
 def color_por_decision(decision: str) -> str:
-    d = (decision or "").upper()
-    if d == "OBSERVAR":
-        return COL_BLUE
-    if d == "NO OPERAR":
-        return COL_RED
-    if d == "OPERAR":
-        return COL_GOLD
-    if d == "MERCADO CERRADO":
+    d = (decision or "").upper().strip()
+    if "MERCADO CERRADO" in d:
         return COL_TEXT
+    if "NO OPERAR" in d or "RIESGO" in d:
+        return COL_RED
+    if "OPERAR" in d:
+        return COL_GOLD
+    if "OBSERVAR" in d or "ESPERAR" in d:
+        return COL_BLUE
     return COL_TEXT_2
 
 
@@ -397,40 +988,73 @@ def normalizar_texto_ui(texto):
     if not isinstance(texto, str) or not texto:
         return texto
     s = texto
-    # Intento 1: latin1 -> utf8 (caso más común de mojibake)
-    try:
-        s = s.encode("latin1").decode("utf-8")
-    except Exception:
-        pass
 
-    # Reemplazos explícitos para residuos frecuentes
     fixes = {
-        "ðŸ§­": "🧭",
-        "GuÃa": "Guía",
+        "Ã°Å¸â€Âµ": "🔵",
+        "Ã°Å¸â€Â´": "🔴",
+        "Ã°Å¸Å¸á": "🟡",
+        "Ã°Å¸Â§Â ": "🧠",
+        "Ã°Å¸Â§Â?": "🧠",
+        "ðŸ§?": "🧠",
+        "Ã‚¿": "¿",
+        "ðŸ‘€": "👀",
+        "ðŸ“£": "📣",
+        "ðŸŸ¡": "🟡",
+        "ðŸ”µ": "🔵",
+        "ðŸ”´": "🔴",
         "Ã¡": "á",
         "Ã©": "é",
         "Ã­": "í",
         "Ã³": "ó",
         "Ãº": "ú",
+        "Ã±": "ñ",
         "Ã": "Á",
         "Ã‰": "É",
         "Ã": "Í",
         "Ã“": "Ó",
         "Ãš": "Ú",
-        "Ã±": "ñ",
         "Ã‘": "Ñ",
-        "â€”": "—",
+        "Ã¢â‚¬â€": "—",
+        "Ã¢â‚¬Å“": "“",
+        "Ã¢â‚¬Â": "”",
         "â€“": "–",
-        "â€œ": "\"",
-        "â€": "\"",
-        "â€™": "'",
+        "â€¢": "•",
+        "âš ï¸": "⚠️",
+        "Ã¢ÅáÂ Ã¯Â¸Â": "⚠️",
+        "Ã¢ÂÂ¸Ã¯Â¸Â": "⏸️",
+        "Gu?a": "Guía",
+        "gu?a": "guía",
+        "r?pida": "rápida",
+        "d?as": "días",
+        "Habr?": "Habrá",
+        "Aqu?": "Aquí",
+        "aqu?": "aquí",
+        "Cercan?a": "Cercanía",
+        "sesi?n": "sesión",
+        "vac?o": "vacío",
+        "l?nea": "línea",
+        "m?nimas": "mínimas",
+        "m?nimo": "mínimo",
+        "t?pico": "típico",
+        "AN\x81LISIS": "ANÁLISIS",
+        "N\x8cCLEO": "NÚCLEO",
+        "GR\x81FICO": "GRÁFICO",
     }
     for bad, good in fixes.items():
         s = s.replace(bad, good)
-
     return s
 
 
+def normalizar_objeto_ui(valor):
+    if isinstance(valor, dict):
+        return {k: normalizar_objeto_ui(v) for k, v in valor.items()}
+    if isinstance(valor, list):
+        return [normalizar_objeto_ui(v) for v in valor]
+    if isinstance(valor, tuple):
+        return tuple(normalizar_objeto_ui(v) for v in valor)
+    if isinstance(valor, str):
+        return normalizar_texto_ui(valor)
+    return valor
 def cargar_guia_rapida_markdown() -> str:
     ruta = os.path.join(os.path.dirname(__file__), "README_RAPIDO.md")
     try:
@@ -453,9 +1077,236 @@ def rerun_app():
         st.experimental_rerun()
 
 
+def _star_burst_origin(panel_pos: str) -> tuple[float, float]:
+    pos = (panel_pos or "").strip()
+    mapping = {
+        "Arriba derecha": (0.93, 0.26),
+        "Arriba izquierda": (0.08, 0.26),
+        "Abajo derecha": (0.93, 0.82),
+        "Abajo izquierda": (0.08, 0.82),
+    }
+    return mapping.get(pos, (0.93, 0.26))
+
+
+def _star_polygon_vertices(outer_r: float = 1.0, inner_r: float = 0.45, points: int = 5):
+    vertices = []
+    step = math.pi / points
+    for i in range(points * 2):
+        r = outer_r if i % 2 == 0 else inner_r
+        ang = i * step - math.pi / 2
+        vertices.append((r * math.cos(ang), r * math.sin(ang)))
+    return vertices
+
+
+def _point_in_polygon(x: float, y: float, poly) -> bool:
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        intersect = ((yi > y) != (yj > y)) and (
+            x < (xj - xi) * (y - yi) / (yj - yi + 1e-9) + xi
+        )
+        if intersect:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _build_star_offsets(total: int, radius_px: float = 165.0, seed: int | None = None):
+    rng = random.Random(seed if seed is not None else int(time.time() * 1000))
+    poly = _star_polygon_vertices()
+    out = []
+    while len(out) < max(1, total):
+        x = rng.uniform(-1.1, 1.1)
+        y = rng.uniform(-1.1, 1.1)
+        if _point_in_polygon(x, y, poly):
+            out.append((x * radius_px, y * radius_px))
+    return out
+
+
+def render_star_rain_overlay(origin_x: float, origin_y: float):
+    ox = min(max(float(origin_x), 0.05), 0.95)
+    oy = min(max(float(origin_y), 0.05), 0.95)
+    seed = int(time.time() * 1000)
+    rng = random.Random(seed)
+    total = 520
+    colors = ["#4A90E2", "#F5C26B", "#E26D5A", "#FFFFFF"]
+    offsets = _build_star_offsets(total=total, radius_px=240.0, seed=seed + 17)
+    stars = []
+    for ex, ey in offsets:
+        color = colors[rng.randrange(len(colors))]
+        sx = rng.uniform(-58.0, 58.0)
+        sy = rng.uniform(-48.0, 48.0)
+        bx = ex * rng.uniform(0.06, 0.16)
+        by = ey * rng.uniform(0.06, 0.16)
+        delay = rng.uniform(0.0, 0.72)
+        dur = rng.uniform(4.4, 6.0)
+        size = rng.uniform(1.0, 3.8)
+        style = (
+            f"--x0:{ox * 100:.2f}vw;--y0:{oy * 100:.2f}vh;"
+            f"--sx:{sx:.2f}vw;--sy:{sy:.2f}vh;"
+            f"--ex:{ex:.1f}px;--ey:{ey:.1f}px;"
+            f"--bx:{bx:.1f}px;--by:{by:.1f}px;"
+            f"--d:{delay:.2f}s;--dur:{dur:.2f}s;"
+            f"--s:{size:.2f}px;--c:{color};"
+        )
+        stars.append(f'<span class="et-star-rain-dot" style="{style}"></span>')
+
+    st.markdown(
+        f"""
+        <div class="et-star-rain-overlay" aria-hidden="true">
+          <div class="et-star-rain-core" style="--x0:{ox * 100:.2f}vw;--y0:{oy * 100:.2f}vh;"></div>
+          {''.join(stars)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_login_star_merge_fx():
+    seed = int(time.time() * 1000)
+    rng = random.Random(seed)
+    colors = ["#4A90E2", "#F5C26B", "#E26D5A", "#FFFFFF"]
+    total = 720
+    offsets = _build_star_offsets(total=total, radius_px=265.0, seed=seed + 11)
+    parts = []
+    for ex, ey in offsets:
+        c = colors[rng.randrange(len(colors))]
+        sx = rng.uniform(-58.0, 58.0)
+        sy = rng.uniform(-48.0, 48.0)
+        bx = ex * rng.uniform(0.05, 0.14)
+        by = ey * rng.uniform(0.05, 0.14)
+        delay = rng.uniform(0.0, 0.9)
+        dur = rng.uniform(5.0, 6.8)
+        size = rng.uniform(1.0, 3.2)
+        style = (
+            f"--sx:{sx:.2f}vw;--sy:{sy:.2f}vh;"
+            f"--ex:{ex:.1f}px;--ey:{ey:.1f}px;"
+            f"--bx:{bx:.1f}px;--by:{by:.1f}px;"
+            f"--d:{delay:.2f}s;--dur:{dur:.2f}s;"
+            f"--s:{size:.2f}px;--c:{c};"
+        )
+        parts.append(f'<span class="et-login-star-dot" style="{style}"></span>')
+
+    st.markdown(
+        f"""
+        <div class="et-login-starstorm" aria-hidden="true">
+          <div class="et-login-star-core"></div>
+          {''.join(parts)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ============================================================
+# BLOQUE: IDLE MODE (PANTALLA EN REPOSO)
+# ============================================================
+IDLE_TIMEOUT_SEC = max(15, int(os.getenv("IDLE_TIMEOUT_SEC", "90")))
+
+
+def _leer_idle_query_flag() -> bool:
+    raw = "0"
+    try:
+        raw = str(st.query_params.get("idle", "0"))
+    except Exception:
+        try:
+            raw = str((st.experimental_get_query_params().get("idle") or ["0"])[0])
+        except Exception:
+            raw = "0"
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+def _render_idle_watchdog(idle_mode: bool, timeout_sec: int):
+    idle_js = "true" if idle_mode else "false"
+    timeout_safe = max(15, int(timeout_sec))
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const p = window.parent;
+          if (!p || !p.location) return;
+
+          const timeoutMs = {timeout_safe} * 1000;
+          const idleMode = {idle_js};
+          const state = p.__etIdleWatchdog || {{}};
+          state.timeoutMs = timeoutMs;
+          state.idleMode = idleMode;
+
+          function setIdleFlag(v) {{
+            try {{
+              const url = new URL(p.location.href);
+              const current = (url.searchParams.get("idle") || "0").toLowerCase();
+              if (current === v) return;
+              url.searchParams.set("idle", v);
+              p.location.href = url.toString();
+            }} catch (e) {{}}
+          }}
+
+          function onActivity() {{
+            if (state.idleMode) {{
+              setIdleFlag("0");
+              return;
+            }}
+            if (state.timer) clearTimeout(state.timer);
+            state.timer = setTimeout(function() {{
+              setIdleFlag("1");
+            }}, state.timeoutMs);
+          }}
+
+          if (!state.bound) {{
+            ["mousemove", "mousedown", "keydown", "scroll", "touchstart", "pointerdown"].forEach(function(evt) {{
+              p.addEventListener(evt, onActivity, {{ passive: true }});
+            }});
+            state.bound = true;
+          }}
+
+          if (state.idleMode && state.timer) {{
+            clearTimeout(state.timer);
+            state.timer = null;
+          }}
+
+          if (!state.idleMode && !state.timer) {{
+            state.timer = setTimeout(function() {{
+              setIdleFlag("1");
+            }}, state.timeoutMs);
+          }}
+
+          p.__etIdleWatchdog = state;
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _color_desde_esfera(esfera_txt: str) -> str:
+    esfera_txt = (esfera_txt or "").lower()
+    if "roj" in esfera_txt:
+        return "rojo"
+    if "dorad" in esfera_txt or "amarill" in esfera_txt:
+        return "dorado"
+    return "azul"
+
+
+# ============================================================
+# BLOQUE: AUTH - CONFIGURACION Y CONSTANTES
+# ============================================================
 USERS_DB_PATH = os.path.join(os.path.dirname(__file__), "usuarios_db.json")
+SCANNER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "scanner_config.json")
+AUTH_CACHE_PATH = os.path.join(os.path.dirname(__file__), "auth_cache.json")
+AUTH_COOKIE_PREFIX = os.getenv("AUTH_COOKIE_PREFIX", "estrella_trader")
+# Cambia esta clave en producción con variable de entorno AUTH_COOKIE_PASSWORD.
+AUTH_COOKIE_PASSWORD = os.getenv("AUTH_COOKIE_PASSWORD", "estrella-trader-change-this")
+AUTH_COOKIE_USER_KEY = "uid"
+PREMIUM_ACCESS_CODE = "980511"
 
 
+# ============================================================
+# BLOQUE: AUTH - HELPERS DE TIEMPO, EMAIL Y SMTP
+# ============================================================
 def _utc_now():
     return datetime.now(pytz.UTC)
 
@@ -480,6 +1331,97 @@ def _es_gmail(email: str) -> bool:
     if "@" not in email:
         return False
     return email.endswith("@gmail.com")
+
+
+def _normalizar_telegram_chat_id(chat_id: str) -> str:
+    return str(chat_id or "").strip()
+
+
+def _chat_id_telegram_valido(chat_id: str) -> bool:
+    cid = _normalizar_telegram_chat_id(chat_id)
+    if not cid:
+        return True
+    if cid.startswith("-"):
+        return cid[1:].isdigit()
+    return cid.isdigit()
+
+
+def _normalizar_telegram_bot_username(username: str) -> str:
+    return str(username or "").strip().lstrip("@")
+
+
+def _bot_username_telegram_valido(username: str) -> bool:
+    u = _normalizar_telegram_bot_username(username)
+    if not u:
+        return False
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+    return all(ch in allowed for ch in u)
+
+
+def _leer_bot_username_telegram_config() -> str:
+    try:
+        with open(SCANNER_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            return ""
+        notif = cfg.get("notification", {})
+        if not isinstance(notif, dict):
+            return ""
+        tg = notif.get("telegram", {})
+        if not isinstance(tg, dict):
+            return ""
+        return _normalizar_telegram_bot_username(tg.get("bot_username", ""))
+    except Exception:
+        return ""
+
+
+def _guardar_bot_username_telegram_config(bot_username: str):
+    u = _normalizar_telegram_bot_username(bot_username)
+    if u and not _bot_username_telegram_valido(u):
+        return False, "Username de bot invalido. Usa solo letras, numeros o guion bajo."
+
+    cfg = {}
+    try:
+        if os.path.exists(SCANNER_CONFIG_PATH):
+            with open(SCANNER_CONFIG_PATH, "r", encoding="utf-8-sig") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                cfg = payload
+    except Exception:
+        cfg = {}
+
+    notif = cfg.get("notification")
+    if not isinstance(notif, dict):
+        notif = {}
+        cfg["notification"] = notif
+    tg = notif.get("telegram")
+    if not isinstance(tg, dict):
+        tg = {}
+        notif["telegram"] = tg
+    tg["bot_username"] = u
+
+    try:
+        with open(SCANNER_CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        if u:
+            return True, "Username del bot guardado."
+        return True, "Username del bot eliminado."
+    except Exception as exc:
+        return False, f"No se pudo guardar scanner_config.json: {exc}"
+
+
+def _telegram_bot_username_actual() -> str:
+    env_user = _normalizar_telegram_bot_username(os.getenv("TELEGRAM_BOT_USERNAME", ""))
+    if env_user:
+        return env_user
+    return _leer_bot_username_telegram_config()
+
+
+def _telegram_bot_url() -> str:
+    bot_username = _telegram_bot_username_actual()
+    if bot_username:
+        return f"https://t.me/{bot_username}"
+    return "https://t.me"
 
 
 def _enviar_correo_bienvenida(username: str, email_to: str):
@@ -531,6 +1473,9 @@ def _hash_password(password: str) -> str:
     return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
 
 
+# ============================================================
+# BLOQUE: AUTH - PERSISTENCIA DE USUARIOS Y COOKIES
+# ============================================================
 def _cargar_usuarios_db() -> dict:
     try:
         with open(USERS_DB_PATH, "r", encoding="utf-8") as f:
@@ -547,6 +1492,100 @@ def _guardar_usuarios_db(payload: dict):
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
+def _cookie_manager():
+    if not _HAS_COOKIE_MANAGER:
+        return None
+    if "_auth_cookie_manager" not in st.session_state:
+        st.session_state["_auth_cookie_manager"] = EncryptedCookieManager(
+            prefix=f"{AUTH_COOKIE_PREFIX}_",
+            password=AUTH_COOKIE_PASSWORD,
+        )
+    return st.session_state["_auth_cookie_manager"]
+
+
+def _cookie_manager_ready(cookie_mgr) -> bool:
+    if cookie_mgr is None:
+        return False
+    try:
+        return bool(cookie_mgr.ready())
+    except Exception:
+        return False
+
+
+def _leer_cookie_uid():
+    cookie_mgr = _cookie_manager()
+    if not _cookie_manager_ready(cookie_mgr):
+        return None
+    try:
+        uid = str(cookie_mgr.get(AUTH_COOKIE_USER_KEY) or "").strip()
+    except Exception:
+        return None
+    return uid or None
+
+
+def _escribir_cookie_uid(uid: str) -> bool:
+    cookie_mgr = _cookie_manager()
+    if not _cookie_manager_ready(cookie_mgr):
+        return False
+    uid = str(uid or "").strip()
+    try:
+        if uid:
+            cookie_mgr[AUTH_COOKIE_USER_KEY] = uid
+        else:
+            try:
+                del cookie_mgr[AUTH_COOKIE_USER_KEY]
+            except Exception:
+                pass
+        cookie_mgr.save()
+        return True
+    except Exception:
+        return False
+
+
+def _escribir_cookie_uid_retry(uid: str, retries: int = 6, delay_sec: float = 0.08) -> bool:
+    for _ in range(max(1, retries)):
+        if _escribir_cookie_uid(uid):
+            return True
+        time.sleep(delay_sec)
+    return False
+
+
+def _leer_auth_cache_uid():
+    try:
+        with open(AUTH_CACHE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    uid = str(payload.get("user_id") or payload.get("uid") or "").strip()
+    return uid or None
+
+
+def _escribir_auth_cache_uid(uid: str) -> bool:
+    uid = str(uid or "").strip()
+    if not uid:
+        try:
+            if os.path.exists(AUTH_CACHE_PATH):
+                os.remove(AUTH_CACHE_PATH)
+        except Exception:
+            return False
+        return True
+    payload = {
+        "user_id": uid,
+        "saved_at": _iso_utc(_utc_now()),
+    }
+    try:
+        with open(AUTH_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# BLOQUE: AUTH - MODELO PUBLICO DE USUARIO
+# ============================================================
 def _premium_activo(record: dict) -> bool:
     if not bool(record.get("es_premium", False)):
         return False
@@ -559,14 +1598,23 @@ def _premium_activo(record: dict) -> bool:
     return _utc_now() <= until_dt
 
 
+def _quick_guide_seen(record: dict) -> bool:
+    # Usuarios antiguos (sin este campo) no deben recibir auto-onboarding.
+    if "quick_guide_seen" not in record:
+        return True
+    return bool(record.get("quick_guide_seen", True))
+
+
 def _usuario_publico(record: dict) -> dict:
     activo = _premium_activo(record)
     return {
         "id": record.get("id"),
         "username": record.get("username", ""),
         "email": record.get("email", ""),
+        "telegram_chat_id": _normalizar_telegram_chat_id(record.get("telegram_chat_id", "")),
         "es_premium": activo,
         "premium_until": record.get("premium_until"),
+        "quick_guide_seen": _quick_guide_seen(record),
         "autenticado": True,
     }
 
@@ -576,16 +1624,22 @@ def _usuario_invitado() -> dict:
         "id": "guest",
         "username": "Invitado",
         "email": "",
+        "telegram_chat_id": "",
         "es_premium": False,
         "premium_until": None,
+        "quick_guide_seen": True,
         "autenticado": False,
     }
 
 
-def registrar_usuario(username: str, email: str, password: str):
+# ============================================================
+# BLOQUE: AUTH - OPERACIONES DE CUENTA Y PREMIUM
+# ============================================================
+def registrar_usuario(username: str, email: str, password: str, telegram_chat_id: str = ""):
     username = (username or "").strip()
     email = _normalizar_email(email)
     password = password or ""
+    telegram_chat_id = _normalizar_telegram_chat_id(telegram_chat_id)
 
     if len(username) < 3:
         return False, "El nombre de usuario debe tener al menos 3 caracteres.", None
@@ -593,6 +1647,8 @@ def registrar_usuario(username: str, email: str, password: str):
         return False, "Usa un correo Gmail valido (ejemplo@gmail.com).", None
     if len(password) < 6:
         return False, "La contraseña debe tener al menos 6 caracteres.", None
+    if not _chat_id_telegram_valido(telegram_chat_id):
+        return False, "El Chat ID de Telegram debe ser numerico.", None
 
     db = _cargar_usuarios_db()
     if any(_normalizar_email(u.get("email")) == email for u in db["users"]):
@@ -603,9 +1659,11 @@ def registrar_usuario(username: str, email: str, password: str):
         "id": str(uuid4()),
         "username": username,
         "email": email,
+        "telegram_chat_id": telegram_chat_id,
         "password_hash": _hash_password(password),
         "es_premium": False,
         "premium_until": None,
+        "quick_guide_seen": False,
         "created_at": now_iso,
         "updated_at": now_iso,
     }
@@ -662,6 +1720,71 @@ def recargar_usuario(user_id: str):
             _guardar_usuarios_db(db)
         return _usuario_publico(u)
     return _usuario_invitado()
+
+
+def guardar_sesion_local(user_id: str):
+    uid = (user_id or "").strip()
+    if not uid:
+        limpiar_sesion_local()
+        return
+    st.session_state["auth_cookie_pending_uid"] = uid
+    _sincronizar_cookie_pendiente()
+    _escribir_auth_cache_uid(uid)
+
+
+def limpiar_sesion_local():
+    st.session_state["auth_cookie_pending_uid"] = ""
+    _sincronizar_cookie_pendiente()
+    _escribir_auth_cache_uid("")
+
+
+def _sincronizar_cookie_pendiente():
+    if "auth_cookie_pending_uid" not in st.session_state:
+        return
+    pending_uid = st.session_state.get("auth_cookie_pending_uid")
+    if pending_uid is None:
+        return
+    if _escribir_cookie_uid_retry(pending_uid):
+        st.session_state["auth_cookie_pending_uid"] = None
+
+
+def recuperar_sesion_local():
+    cookie_mgr = _cookie_manager()
+    if _HAS_COOKIE_MANAGER and not _cookie_manager_ready(cookie_mgr):
+        attempts = int(st.session_state.get("auth_cookie_boot_attempts", 0))
+        if attempts < 8:
+            st.session_state["auth_cookie_boot_attempts"] = attempts + 1
+            rerun_app()
+        return _usuario_invitado()
+    st.session_state["auth_cookie_boot_attempts"] = 0
+
+    _sincronizar_cookie_pendiente()
+    uid = _leer_cookie_uid()
+    if not uid:
+        uid = _leer_auth_cache_uid()
+    if not uid:
+        return _usuario_invitado()
+
+    user_public = recargar_usuario(uid)
+    if not user_public.get("autenticado", False):
+        limpiar_sesion_local()
+    elif _HAS_COOKIE_MANAGER:
+        _escribir_cookie_uid_retry(uid)
+    return user_public
+
+
+def marcar_guia_rapida_vista(user_id: str):
+    db = _cargar_usuarios_db()
+    for u in db["users"]:
+        if u.get("id") != user_id:
+            continue
+        if bool(u.get("quick_guide_seen", False)):
+            return True, _usuario_publico(u)
+        u["quick_guide_seen"] = True
+        u["updated_at"] = _iso_utc(_utc_now())
+        _guardar_usuarios_db(db)
+        return True, _usuario_publico(u)
+    return False, None
 
 
 def comprar_premium_usuario(user_id: str, plan_dias: int):
@@ -721,6 +1844,37 @@ def set_premium_usuario(user_id: str, enabled: bool, plan_dias: int = 30):
     return False, "No se encontró el usuario.", None
 
 
+def activar_premium_por_codigo(user_id: str, codigo: str):
+    code = str(codigo or "").strip()
+    if code != PREMIUM_ACCESS_CODE:
+        return False, "Código inválido.", None
+    ok, _, user_public = comprar_premium_usuario(user_id, 30)
+    if not ok or not user_public:
+        return False, "No se pudo activar Premium por código.", None
+    return True, "Premium activado por código.", user_public
+
+
+def actualizar_telegram_usuario(user_id: str, telegram_chat_id: str):
+    chat_id = _normalizar_telegram_chat_id(telegram_chat_id)
+    if not _chat_id_telegram_valido(chat_id):
+        return False, "El Chat ID de Telegram debe ser numerico.", None
+
+    db = _cargar_usuarios_db()
+    for u in db["users"]:
+        if u.get("id") != user_id:
+            continue
+        u["telegram_chat_id"] = chat_id
+        u["updated_at"] = _iso_utc(_utc_now())
+        _guardar_usuarios_db(db)
+        if chat_id:
+            return True, "Telegram actualizado.", _usuario_publico(u)
+        return True, "Telegram eliminado de tu cuenta.", _usuario_publico(u)
+    return False, "No se encontró el usuario.", None
+
+
+# ============================================================
+# BLOQUE: DATOS - NORMALIZACION HORARIA Y MAPAS
+# ============================================================
 def ajustar_timezone(df, zona_ui):
     tz_map = {
         "UTC": "UTC",
@@ -791,6 +1945,9 @@ CRYPTO_MAP = {
 }
 
 
+# ============================================================
+# BLOQUE: DATOS - FUENTES EXTERNAS Y HORARIO DE MERCADO
+# ============================================================
 def obtener_datos_twelvedata(symbol, interval, outputsize, api_key):
     try:
         params = {
@@ -842,7 +1999,7 @@ def mercado_abierto_ahora(mercado: str) -> bool:
     Regla simple 24/5 para mercados no-crypto usando horario New York.
     Cierre semanal: viernes 17:00 NY -> domingo 17:00 NY.
     """
-    if mercado == "Crypto":
+    if mercado in ("Cripto", "Crypto"):
         return True
 
     ny_now = datetime.now(pytz.timezone("America/New_York"))
@@ -859,6 +2016,9 @@ def mercado_abierto_ahora(mercado: str) -> bool:
     return True
 
 
+# ============================================================
+# BLOQUE: CACHE - PROCESADO Y ESTADO DE ANALISIS
+# ============================================================
 @st.cache_data(ttl=5, show_spinner=False)
 def obtener_datos_procesados_cache(
     ticker: str,
@@ -925,10 +2085,16 @@ def construir_estado_estructural_cache(datos_1d_df, datos_4h_df):
 
 # ========= [V1.2-B HELPERS - FIN] =========
 
+# ============================================================
+# BLOQUE: ESTADO EN MEMORIA (SESSION_STATE)
+# ============================================================
 if "memoria_estrella" not in st.session_state:
     st.session_state.memoria_estrella = []
 
 
+# ============================================================
+# BLOQUE: FILTRADO DE MEMORIA POR ESFERA
+# ============================================================
 def filtrar_por_esfera(recuerdos, esfera):
     return [r for r in recuerdos if r.get("esfera") == esfera]
 
@@ -938,7 +2104,18 @@ if "memoria_estrella" not in st.session_state:
     st.session_state.memoria_estrella = []
 
 
-def estrella_visual(color_lider, n_puntos=600, bubble_shell=True, all_lit=False):
+# ============================================================
+# BLOQUE: RENDER 3D DE LA ESTRELLA (PLOTLY)
+# ============================================================
+def estrella_visual(
+    color_lider,
+    n_puntos=600,
+    bubble_shell=True,
+    all_lit=False,
+    animate=True,
+    size_px=350,
+    camera_eye=None
+):
     colores = {
         "dorado": "#F5C26B",
         "azul": "#4A90E2",
@@ -946,9 +2123,12 @@ def estrella_visual(color_lider, n_puntos=600, bubble_shell=True, all_lit=False)
     }
 
     rng = random.Random(42)
-    t = time.time()
-    pulse = 0.5 + 0.5 * math.sin(t * 2.0)
-    angle = t * 0.2
+    if camera_eye is None:
+        camera_eye = dict(x=1.4, y=1.2, z=0.8)
+
+    t = time.time() if animate else 0.0
+    pulse = 0.5 + 0.5 * math.sin(t * 2.0) if animate else 0.5
+    angle = t * 0.2 if animate else 0.0
 
     def star_vertices(outer_r=1.0, inner_r=0.45, points=5):
         verts = []
@@ -973,16 +2153,31 @@ def estrella_visual(color_lider, n_puntos=600, bubble_shell=True, all_lit=False)
             j = i
         return inside
 
+    def halton(index: int, base: int) -> float:
+        f = 1.0
+        r = 0.0
+        i = index
+        while i > 0:
+            f /= base
+            r += f * (i % base)
+            i //= base
+        return r
+
     star = star_vertices()
-    extra_per_color = 100
-    base_per_color = n_puntos // 3
-    remainder = n_puntos - (base_per_color * 3)
-    total_points = n_puntos + (extra_per_color * 3)
+    palette = ["rojo", "azul", "dorado"]
+    per_color_counts = {
+        "rojo": 200,
+        "azul": 500,
+        "dorado": 500,
+    }
+    total_points = sum(per_color_counts.values())
 
     xs, ys, zs = [], [], []
+    idx = 1
     while len(xs) < total_points:
-        x = rng.uniform(-1.1, 1.1)
-        y = rng.uniform(-1.1, 1.1)
+        x = (halton(idx, 2) * 2.2) - 1.1
+        y = (halton(idx, 3) * 2.2) - 1.1
+        idx += 1
         if point_in_polygon(x, y, star):
             xs.append(x)
             ys.append(y)
@@ -996,24 +2191,22 @@ def estrella_visual(color_lider, n_puntos=600, bubble_shell=True, all_lit=False)
         xs_rot.append(x * cos_a - y * sin_a)
         ys_rot.append(x * sin_a + y * cos_a)
 
-    palette = ["rojo", "azul", "dorado"]
     colors = []
     sizes = []
     is_lider = []
+    color_labels = []
+    for color in palette:
+        color_labels.extend([color] * per_color_counts[color])
+    rng.shuffle(color_labels)
 
-    per_color_counts = [base_per_color + extra_per_color] * 3
-    for i in range(remainder):
-        per_color_counts[i] += 1
-
-    for color, count in zip(palette, per_color_counts):
-        for _ in range(count):
-            colors.append(colores[color])
-            lider = all_lit or (color == color_lider)
-            is_lider.append(lider)
-            if lider:
-                sizes.append(rng.uniform(4.2, 6.2))
-            else:
-                sizes.append(rng.uniform(2.2, 3.8))
+    for color in color_labels:
+        colors.append(colores[color])
+        lider = all_lit or (color == color_lider)
+        is_lider.append(lider)
+        if lider:
+            sizes.append(rng.uniform(4.2, 6.2))
+        else:
+            sizes.append(rng.uniform(2.2, 3.8))
 
     fig = go.Figure()
     total = len(colors)
@@ -1138,8 +2331,8 @@ def estrella_visual(color_lider, n_puntos=600, bubble_shell=True, all_lit=False)
 
 
     fig.update_layout(
-        width=350,
-        height=350,
+        width=size_px,
+        height=size_px,
         margin=dict(l=0, r=0, t=0, b=0),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -1147,7 +2340,7 @@ def estrella_visual(color_lider, n_puntos=600, bubble_shell=True, all_lit=False)
             xaxis=dict(visible=False),
             yaxis=dict(visible=False),
             zaxis=dict(visible=False),
-            camera_eye=dict(x=1.4, y=1.2, z=0.8)
+            camera_eye=camera_eye
         ),
         showlegend=False
     )
@@ -1157,18 +2350,115 @@ def estrella_visual(color_lider, n_puntos=600, bubble_shell=True, all_lit=False)
 
 esfera_visual = estrella_visual
 
+
+# ============================================================
+# BLOQUE: RENDER DE FONDO + FX DE LOGIN
+# ============================================================
+def render_estrella_fondo(color_lider: str, mercado_abierto_local: bool):
+    fig_bg = esfera_visual(
+        color_lider,
+        n_puntos=1200,
+        bubble_shell=True,
+        all_lit=not mercado_abierto_local,
+        animate=False,
+        size_px=BG_STAR_SIZE_PX,
+        camera_eye=dict(x=0.0, y=0.0, z=2.15),
+    )
+    fig_bg.update_layout(autosize=False)
+    with st.container(key="bg_star_full"):
+        st.plotly_chart(
+            fig_bg,
+            use_container_width=False,
+            config={"displayModeBar": False, "responsive": False},
+            key="bg_star_plotly",
+        )
+
+
+def render_login_galaxia_fx(usuario_actual: dict):
+    if not bool((usuario_actual or {}).get("autenticado", False)):
+        return
+
+    st.markdown(
+        """
+        <div class="et-galaxy-ambient" aria-hidden="true">
+          <div class="et-galaxy-blob et-galaxy-b1"></div>
+          <div class="et-galaxy-blob et-galaxy-b2"></div>
+          <div class="et-galaxy-blob et-galaxy-b3"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.session_state.pop("play_login_intro", False):
+        render_login_star_merge_fx()
+
+
+st.markdown('<div class="et-core-watch" aria-hidden="true"></div>', unsafe_allow_html=True)
+
+# Activa/desactiva modo reposo por inactividad en navegador.
+idle_mode = _leer_idle_query_flag()
+_render_idle_watchdog(idle_mode=idle_mode, timeout_sec=IDLE_TIMEOUT_SEC)
+
+if idle_mode:
+    prev_color = st.session_state.get("idle_star_color")
+    if prev_color not in {"rojo", "azul", "dorado"}:
+        payload_prev = st.session_state.get("star_payload") or {}
+        estado_prev = payload_prev.get("estado", {}) if isinstance(payload_prev, dict) else {}
+        prev_color = _color_desde_esfera(estado_prev.get("esfera", ""))
+    if prev_color not in {"rojo", "azul", "dorado"}:
+        prev_color = "azul"
+
+    st.markdown(
+        """
+        <style>
+        header[data-testid="stHeader"] { display: none !important; }
+        [data-testid="stToolbar"] { display: none !important; }
+        [data-testid="stSidebar"] { display: none !important; }
+        .block-container { padding-top: 0 !important; padding-bottom: 0 !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_estrella_fondo(prev_color, mercado_abierto_local=True)
+    st.stop()
+
 # ====== CUENTA + PREMIUM (ANTES DEL ANÁLISIS) ======
+# ============================================================
+# BLOQUE: SIDEBAR DE CUENTA Y PREMIUM
+# ============================================================
 if "usuario" not in st.session_state:
     st.session_state["usuario"] = _usuario_invitado()
+
+# Reintenta guardar cookie pendiente en cada ciclo (cuando el manager ya esté listo).
+_sincronizar_cookie_pendiente()
+
+# Reintenta recuperar sesión guardada (cookie) cuando aún está como invitado.
+if not st.session_state["usuario"].get("autenticado", False):
+    recovered_user = recuperar_sesion_local()
+    if recovered_user.get("autenticado", False):
+        st.session_state["usuario"] = recovered_user
 
 # Sincroniza el estado premium/autenticación desde base local.
 if st.session_state["usuario"].get("autenticado", False):
     st.session_state["usuario"] = recargar_usuario(st.session_state["usuario"]["id"])
+    if st.session_state["usuario"].get("autenticado", False):
+        guardar_sesion_local(st.session_state["usuario"]["id"])
+    else:
+        limpiar_sesion_local()
 
 with st.sidebar.expander("Cuenta", expanded=True):
     usuario_ui = st.session_state["usuario"]
+    if not _HAS_COOKIE_MANAGER:
+        st.caption("Recordarme por navegador desactivado: falta streamlit-cookies-manager. Fallback local activo en este equipo.")
+    elif st.session_state.get("auth_cookie_boot_attempts", 0) >= 2:
+        st.caption("Tu navegador puede estar bloqueando cookies; por eso pide iniciar sesión al refrescar.")
+
     if not usuario_ui.get("autenticado", False):
-        st.caption("Inicia sesion o crea cuenta con correo Gmail para guardar estado y activar Premium.")
+        st.caption("Inicia sesion o crea cuenta.")
+        if hasattr(st, "link_button"):
+            st.link_button("Abrir bot de Telegram", _telegram_bot_url(), use_container_width=True)
+        else:
+            st.markdown(f"[Abrir bot de Telegram]({_telegram_bot_url()})")
         modo_auth = st.radio(
             "Acceso",
             ["Iniciar sesión", "Crear cuenta"],
@@ -1183,6 +2473,8 @@ with st.sidebar.expander("Cuenta", expanded=True):
                 ok, msg, user_public = autenticar_usuario(email_login, pass_login)
                 if ok and user_public:
                     st.session_state["usuario"] = user_public
+                    st.session_state["play_login_intro"] = True
+                    guardar_sesion_local(user_public.get("id"))
                     st.success(msg)
                     rerun_app()
                 else:
@@ -1190,15 +2482,27 @@ with st.sidebar.expander("Cuenta", expanded=True):
         else:
             username_reg = st.text_input("Usuario", key="reg_user_v1")
             email_reg = st.text_input("Correo Gmail", placeholder="tuusuario@gmail.com", key="reg_email_v1")
+            telegram_chat_reg = st.text_input(
+                "Chat ID Telegram (opcional)",
+                placeholder="123456789",
+                key="reg_telegram_chat_id_v1",
+            )
             pass_reg = st.text_input("Contraseña", type="password", key="reg_pass_v1")
             pass_reg2 = st.text_input("Confirmar contraseña", type="password", key="reg_pass2_v1")
             if st.button("Crear cuenta", key="btn_register_v1"):
                 if pass_reg != pass_reg2:
                     st.error("Las contraseñas no coinciden.")
                 else:
-                    ok, msg, user_public = registrar_usuario(username_reg, email_reg, pass_reg)
+                    ok, msg, user_public = registrar_usuario(
+                        username_reg,
+                        email_reg,
+                        pass_reg,
+                        telegram_chat_reg,
+                    )
                     if ok and user_public:
                         st.session_state["usuario"] = user_public
+                        st.session_state["play_login_intro"] = True
+                        guardar_sesion_local(user_public.get("id"))
                         st.success(msg)
                         rerun_app()
                     else:
@@ -1213,6 +2517,28 @@ with st.sidebar.expander("Cuenta", expanded=True):
             until_dt = _parse_iso_utc(until_raw)
             if until_dt:
                 st.caption(f"Vence: {until_dt.strftime('%Y-%m-%d %H:%M UTC')}")
+
+        st.divider()
+        st.markdown("**Telegram**")
+        telegram_chat_id_ui = st.text_input(
+            "Chat ID Telegram",
+            value=str(usuario_ui.get("telegram_chat_id", "") or ""),
+            placeholder="123456789",
+            key="account_telegram_chat_id_v1",
+        )
+        col_tg_save, col_tg_open = st.columns(2)
+        if col_tg_save.button("Guardar bot", key="btn_save_telegram_v1"):
+            ok, msg, user_public = actualizar_telegram_usuario(usuario_ui["id"], telegram_chat_id_ui)
+            if ok and user_public:
+                st.session_state["usuario"] = user_public
+                st.success(msg)
+                rerun_app()
+            else:
+                st.error(msg)
+        if hasattr(st, "link_button"):
+            col_tg_open.link_button("Abrir bot", _telegram_bot_url(), use_container_width=True)
+        else:
+            col_tg_open.markdown(f"[Abrir bot]({_telegram_bot_url()})")
 
         st.divider()
         st.markdown("**Premium**")
@@ -1237,32 +2563,34 @@ with st.sidebar.expander("Cuenta", expanded=True):
             else:
                 st.error(msg)
 
-        st.divider()
-        st.markdown("**Control temporal Premium**")
-        st.caption("Solo para pruebas internas: activar/desactivar sin pago.")
-        c_on, c_off = st.columns(2)
-        if c_on.button("Activar", key="btn_force_premium_on_v1"):
-            ok, msg, user_public = set_premium_usuario(usuario_ui["id"], True, 30)
+        codigo_premium = st.text_input(
+            "Código premium",
+            type="password",
+            key="premium_code_input_v1",
+            placeholder="Ingresa tu código",
+        )
+        if st.button("Activar por código", key="btn_premium_code_v1"):
+            ok, msg, user_public = activar_premium_por_codigo(usuario_ui["id"], codigo_premium)
             if ok and user_public:
                 st.session_state["usuario"] = user_public
                 st.success(msg)
                 rerun_app()
             else:
                 st.error(msg)
-        if c_off.button("Desactivar", key="btn_force_premium_off_v1"):
-            ok, msg, user_public = set_premium_usuario(usuario_ui["id"], False, 0)
-            if ok and user_public:
-                st.session_state["usuario"] = user_public
-                st.warning(msg)
-                rerun_app()
-            else:
-                st.error(msg)
 
         if st.button("Cerrar sesión", key="btn_logout_v1"):
             st.session_state["usuario"] = _usuario_invitado()
+            st.session_state["play_login_intro"] = False
+            limpiar_sesion_local()
             rerun_app()
 
+# ============================================================
+# BLOQUE: ESTADO DE USUARIO ACTUAL + FX POST-LOGIN
+# ============================================================
 usuario = st.session_state["usuario"]
+if "play_login_intro" not in st.session_state:
+    st.session_state["play_login_intro"] = False
+render_login_galaxia_fx(usuario)
 es_premium = bool(usuario.get("es_premium", False))
 
 # Auto-activa diagnostico cuando el usuario pasa de no premium a premium.
@@ -1282,20 +2610,43 @@ if es_premium:
         )
 
 if "show_quick_guide" not in st.session_state:
-    st.session_state["show_quick_guide"] = True
+    st.session_state["show_quick_guide"] = False
+if "quick_guide_auto_open_user_id" not in st.session_state:
+    st.session_state["quick_guide_auto_open_user_id"] = None
 
-with st.sidebar.expander("Ayuda", expanded=False):
-    if st.button("📘 Ver guía rápida", key="btn_open_quick_guide"):
+if (
+    usuario.get("autenticado", False)
+    and not bool(usuario.get("quick_guide_seen", True))
+    and st.session_state.get("quick_guide_auto_open_user_id") != usuario.get("id")
+):
+    st.session_state["show_quick_guide"] = True
+    st.session_state["quick_guide_auto_open_user_id"] = usuario.get("id")
+    ok_guide_seen, user_public = marcar_guia_rapida_vista(usuario.get("id"))
+    if ok_guide_seen and user_public:
+        st.session_state["usuario"] = user_public
+        usuario = user_public
+
+with st.container(key="quick_guide_fab"):
+    if st.button("📘 Guía rápida", key="btn_open_quick_guide_fab"):
         st.session_state["show_quick_guide"] = True
+        rerun_app()
+
+with st.container(key="refresh_fab"):
+    if st.button("Actualizar lectura", key="btn_actualizar_lectura_fab"):
+        st.session_state["star_force_refresh"] = True
+        st.session_state["play_star_rain"] = True
 
 # -----------------------
+# ============================================================
+# BLOQUE: SIDEBAR DE MERCADO (ZONA, MERCADO, TF, MODO)
+# ============================================================
 # SIDEBAR  CONFIGURACION                    #CARGAR DATOS
 # -----------------------
 
 st.sidebar.header("⚙️ Configuración de mercado")
 
 zona = st.sidebar.selectbox(
-    "🌍 Zona horaria",
+    "🕒 Zona horaria",
     ["UTC", "Bogotá", "New York", "Londres", "Madrid"],
     key="zona"
 )
@@ -1306,7 +2657,7 @@ mercados = {
     "Oro (XAU/USD)": "GC=F",
     "NASDAQ 100": "^NDX",
     "S&P 500": "^GSPC",
-    "Crypto": "CRYPTO"
+    "Cripto": "CRYPTO"
 }
 
 mercado_nombre = st.sidebar.selectbox(
@@ -1323,7 +2674,7 @@ crypto_symbol = None
 forex_pair = None
 binance_symbol = None
 td_symbol = None
-if mercado_nombre == "Crypto":
+if mercado_nombre == "Cripto":
     with st.sidebar.expander("Seleccionar cripto", expanded=True):
         if "crypto_symbol_v2" not in st.session_state:
             st.session_state["crypto_symbol_v2"] = st.session_state.get("crypto_symbol", "BTC")
@@ -1379,17 +2730,22 @@ modo_lectura = st.sidebar.selectbox(
 )
 if modo_lectura == "Estructural (1D + 4H)":
     st.sidebar.caption("Dirección base en 1D y ejecución en 4H.")
-auto_refresh = st.sidebar.toggle("Auto refresh (gráficos)", value=st.session_state.get("auto_refresh_charts", True), key="auto_refresh_charts")
-REFRESH_MS = 10000
-STAR_REFRESH_SEC = 30
+auto_refresh = st.sidebar.toggle(
+    "Auto refresh (gráficos, cada 30s)",
+    value=st.session_state.get("auto_refresh_charts", True),
+    key="auto_refresh_charts"
+)
+AUTO_REFRESH_SEC = 30
+REFRESH_MS = AUTO_REFRESH_SEC * 1000
+STAR_REFRESH_SEC = AUTO_REFRESH_SEC
 live_mode_enabled = st.sidebar.toggle(
     "Live Mode con Binance",
     value=st.session_state.get("live_mode_enabled", False),
-    disabled=(mercado_nombre != "Crypto")
+    disabled=(mercado_nombre != "Cripto")
 )
 st.session_state["live_mode_enabled"] = bool(live_mode_enabled)
-if mercado_nombre != "Crypto":
-    st.sidebar.caption("Live Mode solo disponible para Crypto.")
+if mercado_nombre != "Cripto":
+    st.sidebar.caption("Live Mode solo disponible para Cripto.")
 intervalo = timeframes[timeframe_nombre]
 
 if st.sidebar.button("🧹 Limpiar memoria de la Estrella"):
@@ -1399,14 +2755,14 @@ if st.sidebar.button("🧹 Limpiar memoria de la Estrella"):
 if mercado_abierto:
     st.caption(explicacion_horario(zona))
 else:
-    st.caption("Mercado cerrado (fin de semana). Cuando Habra, evalúa la sesión y la calidad del horario.")
+    st.caption("Mercado cerrado (fin de semana). Cuando abra, evalúa la sesión y la calidad del horario.")
 
 if st.session_state.get("show_quick_guide", False):
     st.markdown("<div class='et-guide-backdrop'></div>", unsafe_allow_html=True)
     with st.container(key="onboarding_modal"):
         col_title, col_close = st.columns([4, 2])
         with col_title:
-            st.markdown("### 📘 Guia rapida ")
+            st.markdown("### 📘 Guía rápida ")
         with col_close:
             if st.button("Entendido, cerrar guia", key="btn_close_quick_guide"):
                 st.session_state["show_quick_guide"] = False
@@ -1417,6 +2773,9 @@ if st.session_state.get("show_quick_guide", False):
 # TÍTULO
 # -----------------------
 
+# ============================================================
+# BLOQUE: TITULO PRINCIPAL + LOGO
+# ============================================================
 def _img_to_base64(path: str) -> str:
     try:
         with open(path, "rb") as f:
@@ -1425,26 +2784,7 @@ def _img_to_base64(path: str) -> str:
         return ""
 
 _title_star_path = os.path.join(os.path.dirname(__file__), "assets", "estrella Red.png")
-_bg_star_path = os.path.join(os.path.dirname(__file__), "assets", "estrella trade.png")
 _title_star_b64 = _img_to_base64(_title_star_path)
-_bg_star_b64 = _img_to_base64(_bg_star_path)
-if _bg_star_b64:
-    st.markdown(
-        f"""
-        <style>
-        .stApp {{
-          background-image:
-            linear-gradient(rgba(15,17,23,0.92), rgba(15,17,23,0.92)),
-            url("data:image/png;base64,{_bg_star_b64}");
-          background-size: auto 180%;
-          background-position: center top;
-          background-repeat: no-repeat;
-          background-attachment: scroll;
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True
-    )
 if _title_star_b64:
     st.markdown(
         f"""
@@ -1466,10 +2806,13 @@ st.markdown("<div style='margin-right: 360px;'></div>", unsafe_allow_html=True)
 # -----------------------
 # SESIÓN
 # -----------------------
+# ============================================================
+# BLOQUE: CABECERA OPERATIVA (SESION + CALIDAD)
+# ============================================================
 col1, col2 = st.columns(2)
 
 with col1:
-    st.subheader("⏰ Sesión actual")
+    st.subheader("🕒 Sesión actual")
     sesion = sesion_actual(zona) if mercado_abierto else "Mercado cerrado"
     st.write(sesion)
 
@@ -1477,16 +2820,17 @@ with col2:
     st.subheader("📊 Calidad del horario")
     calidad = calidad_horario(zona) if mercado_abierto else "cerrado"
     calidad_txt = calidad
-    col_calidad, col_guardar = st.columns([3, 1])
-    with col_calidad:
-        st.write(calidad_txt)
-    with col_guardar:
-        guardar_notas = st.button("Guardar notas")
+    st.write(calidad_txt)
+    # Panel de notas y boton "Guardar notas" desactivados temporalmente.
+    guardar_notas = False
 
 # ========= DATOS DE MERCADO =========
 
 mercado = mercado_nombre
 
+# ============================================================
+# BLOQUE: PARAMETROS DE DATOS (INTERVALOS, PERIODOS, MODO)
+# ============================================================
 # 2) Mapear timeframes UI -> yfinance (IMPORTANTE)
 INTERVAL_MAP = {
     "1m": "1m",
@@ -1495,7 +2839,7 @@ INTERVAL_MAP = {
     "1h": "60m",  # yfinance suele ir mejor con 60m que "1h"
 }
 
-# 3) Periodo recomendado según intervalo (para evitar vacíos)
+# 3) Periodo recomendado según intervalo (para evitar vac?os)
 PERIOD_MAP = {
     "1m": "1d",
     "5m": "5d",
@@ -1510,13 +2854,19 @@ modo_estructural = modo_lectura == "Estructural (1D + 4H)"
 datos_1d = None
 datos_4h = None
 
+# ============================================================
+# BLOQUE: PIPELINE DE CARGA DE DATOS (BINANCE / TWELVEDATA)
+# ============================================================
 try:
     TD_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
-    use_binance_live = bool(st.session_state.get("live_mode_enabled")) and mercado == "Crypto" and not modo_estructural
-    if modo_estructural and bool(st.session_state.get("live_mode_enabled")) and mercado == "Crypto":
+    live_mode_requested = bool(st.session_state.get("live_mode_enabled")) and mercado == "Cripto" and not modo_estructural
+    use_binance_live = live_mode_requested
+    live_fallback_reason = ""
+    if modo_estructural and bool(st.session_state.get("live_mode_enabled")) and mercado == "Cripto":
         st.sidebar.caption("Live Mode se desactiva en lectura estructural 1D+4H.")
     if use_binance_live and not WEBSOCKETS_AVAILABLE:
-        st.sidebar.warning("Live Mode requiere el paquete websockets. Instálalo y reinicia.")
+        live_fallback_reason = "Paquete websockets no disponible en este servidor."
+        logger.warning("Live Binance desactivado: %s", live_fallback_reason)
         use_binance_live = False
     if not use_binance_live:
         stop_prev = st.session_state.get("binance_stop")
@@ -1532,29 +2882,47 @@ try:
             binance_symbol = "BTCUSDT"
         binance_interval = intervalo
 
-        if store.symbol != binance_symbol or store.interval != binance_interval or store.get_df().empty:
-            seed = fetch_klines(binance_symbol, binance_interval, limit=500)
-            store.seed(seed, binance_symbol, binance_interval)
+        needs_seed = store.symbol != binance_symbol or store.interval != binance_interval or store.get_df().empty
+        if needs_seed:
+            seed_df, seed_err = fetch_klines(binance_symbol, binance_interval, limit=500)
+            if seed_df is None or seed_df.empty:
+                live_fallback_reason = seed_err or f"Binance REST sin datos para {binance_symbol} {binance_interval}."
+                logger.warning("Live Binance seed fallido: %s", live_fallback_reason)
+                use_binance_live = False
+            else:
+                store.seed(seed_df, binance_symbol, binance_interval)
 
-        current_params = (binance_symbol, binance_interval)
-        needs_thread = (
-            "binance_thread" not in st.session_state
-            or not st.session_state["binance_thread"].is_alive()
-            or st.session_state.get("binance_params") != current_params
-        )
-        if needs_thread:
-            stop_prev = st.session_state.get("binance_stop")
-            if stop_prev:
-                stop_prev.set()
-            thread, stop_event = start_stream(binance_symbol, binance_interval, store)
-            st.session_state["binance_thread"] = thread
-            st.session_state["binance_stop"] = stop_event
-            st.session_state["binance_params"] = current_params
+        if use_binance_live:
+            current_params = (binance_symbol, binance_interval)
+            needs_thread = (
+                "binance_thread" not in st.session_state
+                or not st.session_state["binance_thread"].is_alive()
+                or st.session_state.get("binance_params") != current_params
+            )
+            if needs_thread:
+                stop_prev = st.session_state.get("binance_stop")
+                if stop_prev:
+                    stop_prev.set()
+                thread, stop_event = start_stream(binance_symbol, binance_interval, store)
+                st.session_state["binance_thread"] = thread
+                st.session_state["binance_stop"] = stop_event
+                st.session_state["binance_params"] = current_params
 
-        datos = store.get_df()
-        if datos.empty:
-            raise ValueError("No se pudieron obtener datos live de Binance")
-    else:
+            datos = store.get_df()
+            if datos.empty:
+                retry_df, retry_err = fetch_klines(binance_symbol, binance_interval, limit=500)
+                if retry_df is not None and not retry_df.empty:
+                    store.seed(retry_df, binance_symbol, binance_interval)
+                    datos = store.get_df()
+                else:
+                    ws_err = store.get_last_error() if hasattr(store, "get_last_error") else None
+                    live_fallback_reason = ws_err or retry_err or "No se recibieron velas live desde Binance."
+                    logger.warning("Live Binance sin datos, fallback activado: %s", live_fallback_reason)
+                    use_binance_live = False
+    if not use_binance_live:
+        stop_prev = st.session_state.get("binance_stop")
+        if stop_prev:
+            stop_prev.set()
         td_interval = TD_INTERVAL_MAP.get(intervalo)
         datos = obtener_datos_procesados_cache(
             ticker=ticker,
@@ -1565,6 +2933,24 @@ try:
             td_api_key_value=TD_API_KEY,
             zona_ui=zona,
         )
+        if live_mode_requested:
+            st.sidebar.warning("Live Binance no disponible en este servidor. Usando datos alternos (TwelveData/yfinance).")
+            if live_fallback_reason:
+                st.sidebar.caption(f"Detalle live: {live_fallback_reason[:220]}")
+                st.session_state["binance_live_last_error"] = live_fallback_reason
+    else:
+        st.session_state["binance_live_last_error"] = ""
+
+    live_ws_reconnects = 0
+    store_dbg = st.session_state.get("binance_store")
+    if store_dbg and hasattr(store_dbg, "get_ws_reconnects"):
+        try:
+            live_ws_reconnects = int(store_dbg.get_ws_reconnects())
+        except Exception:
+            live_ws_reconnects = 0
+    st.session_state["binance_ws_reconnects"] = live_ws_reconnects
+    st.session_state["binance_live_effective"] = bool(use_binance_live)
+
     if use_binance_live:
         datos = calcular_indicadores(datos)
         datos["dist_ema200"] = ((datos["Close"] - datos["EMA_200"]) / datos["EMA_200"]) * 100
@@ -1596,14 +2982,43 @@ except Exception as e:
     st.error(f"Error inesperado obteniendo datos de mercado: {e}")
     st.stop()
 
+if (
+    mercado == "Cripto"
+    and not modo_estructural
+    and bool(st.session_state.get("live_mode_enabled"))
+):
+    effective_live = bool(st.session_state.get("binance_live_effective", False))
+    ws_reconnects = int(st.session_state.get("binance_ws_reconnects", 0))
+    pill_class = "is-live" if effective_live else "is-fallback"
+    status_label = "LIVE Binance" if effective_live else "Fallback datos"
+    meta_label = (
+        f"WS reintentos: {ws_reconnects}"
+        if effective_live
+        else f"TwelveData/yfinance | WS reintentos: {ws_reconnects}"
+    )
+    with st.container(key="live_status_badge"):
+        st.markdown(
+            f"""
+            <div class="et-live-pill {pill_class}">
+              <span class="dot"></span>
+              <span>{status_label}</span>
+              <span class="meta">| {meta_label}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
 # -----------------------
 # ANÁLISIS DE CONTEXTO
 # -----------------------
 
+# ============================================================
+# BLOQUE: ANALISIS DE CONTEXTO + NOTAS
+# ============================================================
 tendencia, estado_rsi = contexto_mercado(datos)
 estado_bb = interpretar_bollinger(datos)
 sesion = sesion_actual(zona) if mercado_abierto else "Mercado cerrado"
-col_bb, col_notas = st.columns([1, 1])
+col_bb = st.container()
 with col_bb:
     st.dataframe(
         datos[["BBL", "BBM", "BBU"]].tail(3),
@@ -1611,30 +3026,31 @@ with col_bb:
         width=420,
         height=140
     )
-with col_notas:
-    notas_bollinger = st.text_area(
-        "",
-        key="notas_bollinger",
-        height=70,
-        label_visibility="collapsed",
-        placeholder="Notas"
-    )
-    if guardar_notas:
-        base_dir = os.path.join(os.path.expanduser("~"), "Documents", "Archivos")
-        os.makedirs(base_dir, exist_ok=True)
-        nombre_archivo = f"notas_bollinger_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        ruta_salida = os.path.join(base_dir, nombre_archivo)
-        with open(ruta_salida, "w", encoding="utf-8") as f:
-            f.write(notas_bollinger or "")
-        st.success(f"Notas guardadas en: {ruta_salida}")
+# with col_notas:
+#     notas_bollinger = st.text_area(
+#         "",
+#         key="notas_bollinger",
+#         height=70,
+#         label_visibility="collapsed",
+#         placeholder="Notas"
+#     )
+#     if guardar_notas:
+#         base_dir = os.path.join(os.path.expanduser("~"), "Documents", "Archivos")
+#         os.makedirs(base_dir, exist_ok=True)
+#         nombre_archivo = f"notas_bollinger_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+#         ruta_salida = os.path.join(base_dir, nombre_archivo)
+#         with open(ruta_salida, "w", encoding="utf-8") as f:
+#             f.write(notas_bollinger or "")
+#         st.success(f"Notas guardadas en: {ruta_salida}")
 estado_bb = interpretar_bollinger(datos)
 
-
-
+# ============================================================
+# BLOQUE: MEMORIA - GUARDADO DE RECUERDOS
+# ============================================================
 def guardar_recuerdo(contexto):
     st.session_state.memoria_estrella.append(contexto)
 
-    # límite de memoria (protección)
+    # l?mite de memoria (protección)
     if len(st.session_state.memoria_estrella) > 20:
         st.session_state.memoria_estrella.pop(0)
 
@@ -1642,11 +3058,14 @@ def guardar_recuerdo(contexto):
 # -----------------------
 # ESTADO DE LA ESTRELLA (N?CLEO)
 # -----------------------
+# ============================================================
+# BLOQUE: NUCLEO DE DECISION DE LA ESTRELLA
+# ============================================================
 if "star_last_ts" not in st.session_state:
     st.session_state["star_last_ts"] = 0.0
 if "star_force_refresh" not in st.session_state:
     st.session_state["star_force_refresh"] = True
-if _HAS_AUTOREFRESH:
+if _HAS_AUTOREFRESH and auto_refresh and not hasattr(st, "fragment"):
     st_autorefresh(interval=STAR_REFRESH_SEC * 1000, key="star_autorefresh")
 
 st.subheader("Lectura de la Estrella")
@@ -1688,10 +3107,6 @@ if recalc_estrella:
     else:
         st.session_state["dorado_miss"] += 1
 
-    if st.session_state.get("debug_v13", False):
-        st.caption(f"🧪 Dorado hits: {st.session_state['dorado_hits']} | miss: {st.session_state['dorado_miss']}")
-        st.write("DEBUG DORADO:", dorado)
-
     estado["esfera_v13"] = estado["esfera"]
     estado["frase_pedagogica_v13"] = estado["mensaje"]
 
@@ -1729,6 +3144,7 @@ if recalc_estrella:
         usuario=usuario,
         memoria=memoria_ensenar
     )
+    estado = normalizar_objeto_ui(estado)
     resumen = estado.get("mensaje", "Resumen no disponible.")
     decision_txt = estado.get("decision", "OBSERVAR").upper()
     frase_pedagogica = estado.get("frase_pedagogica", estado.get("mensaje", ""))
@@ -1744,6 +3160,7 @@ if recalc_estrella:
         "razones": razones,
         "nivel_memoria": influencia.get("nivel"),
     }
+    evento_estrella = normalizar_objeto_ui(evento_estrella)
 
     st.session_state["star_payload"] = {
         "estado": estado,
@@ -1758,13 +3175,13 @@ if recalc_estrella:
     st.session_state["star_force_refresh"] = False
     st.session_state["star_signature"] = analysis_signature
 else:
-    estado = payload["estado"]
-    influencia = payload["influencia"]
-    razones = payload["razones"]
-    resumen = payload["resumen"]
-    decision_txt = payload["decision_txt"]
-    frase_pedagogica = payload["frase_pedagogica"]
-    evento_estrella = payload["evento_estrella"]
+    estado = normalizar_objeto_ui(payload["estado"])
+    influencia = normalizar_objeto_ui(payload["influencia"])
+    razones = normalizar_objeto_ui(payload["razones"])
+    resumen = normalizar_texto_ui(payload["resumen"])
+    decision_txt = normalizar_texto_ui(payload["decision_txt"])
+    frase_pedagogica = normalizar_texto_ui(payload["frase_pedagogica"])
+    evento_estrella = normalizar_objeto_ui(payload["evento_estrella"])
 
 if not mercado_abierto:
     estado = estado.copy()
@@ -1781,51 +3198,124 @@ if not mercado_abierto:
     decision_txt = estado["decision"]
     frase_pedagogica = estado["frase_pedagogica"]
 
+estado = normalizar_objeto_ui(estado)
+resumen = normalizar_texto_ui(resumen)
+decision_txt = normalizar_texto_ui(decision_txt)
+frase_pedagogica = normalizar_texto_ui(frase_pedagogica)
+
 if es_premium and st.session_state.get("debug_v13", False):
-    with st.expander("Diagnostico Premium ", expanded=False):
-        debug = resumen_estado_humano(estado, usuario)
+    debug = resumen_estado_humano(estado, usuario)
+    dorado_estado = estado.get("dorado_v13") or {}
+    d = debug.get("direccion", {})
+    dor = debug.get("dorado", {})
+    r = debug.get("rojo", {})
+    e = debug.get("ensenar", {})
+    estructura = estado.get("estructura_1d_4h")
 
-        d = debug["direccion"]
-        st.markdown(f"### 🌟 Dirección dominante: **{d['valor']}** ({d['fortaleza']})")
-        st.caption(
-            f"Score alcista: {d['score_alcista']} | "
-            f"Score bajista: {d['score_bajista']} | "
-            f"Umbral: {d['umbral']}"
+    def _diag_row(label: str, value: str, value_class: str = "") -> str:
+        cls = f"et-premium-value {value_class}".strip()
+        return (
+            f"<div class='et-premium-row'>"
+            f"<span class='et-premium-label'>{html.escape(label)}:</span>"
+            f"<span class='{cls}'>{html.escape(value)}</span>"
+            f"</div>"
         )
-        estructura = estado.get("estructura_1d_4h")
-        if isinstance(estructura, dict):
-            st.caption(
-                f"1D: {estructura.get('direccion_1d', 'NEUTRAL')} | "
-                f"4H: {estructura.get('direccion_4h', 'NEUTRAL')} | "
-                f"Alineación: {estructura.get('alineacion', 'N/A')}"
+
+    rows = []
+    rows.append(
+        _diag_row(
+            "Dorado hits",
+            f"{st.session_state.get('dorado_hits', 0)} | miss: {st.session_state.get('dorado_miss', 0)}",
+        )
+    )
+    rows.append(
+        _diag_row(
+            "Direccion dominante",
+            f"{d.get('valor', 'N/A')} ({d.get('fortaleza', 'N/A')})",
+        )
+    )
+    rows.append(
+        _diag_row(
+            "Scores",
+            f"alcista {d.get('score_alcista', 'N/A')} | "
+            f"bajista {d.get('score_bajista', 'N/A')} | "
+            f"umbral {d.get('umbral', 'N/A')}",
+        )
+    )
+
+    if isinstance(estructura, dict):
+        rows.append(
+            _diag_row(
+                "Estructura",
+                f"1D {estructura.get('direccion_1d', 'NEUTRAL')} | "
+                f"4H {estructura.get('direccion_4h', 'NEUTRAL')} | "
+                f"{estructura.get('alineacion', 'N/A')}",
             )
+        )
 
-        dor = debug["dorado"]
-        if dor["activo"]:
-            st.markdown("### 🟡 Dorado: **ACTIVO**")
-            if dor["micro_score"] is not None and dor["umbral"] is not None:
-                st.caption(f"Micro-score: {dor['micro_score']} | Umbral: {dor['umbral']}")
-            if dor["razones"]:
-                st.write("• " + "\n• ".join(dor["razones"]))
-        else:
-            st.markdown("### 🟡 Dorado: **NO ACTIVO**")
-            st.caption("No hay ventaja suficiente.")
+    dorado_activo = bool(dor.get("activo", False))
+    rows.append(
+        _diag_row(
+            "Dorado",
+            "ACTIVO" if dorado_activo else "NO ACTIVO",
+            "is-active" if dorado_activo else "is-inactive",
+        )
+    )
 
-        r = debug["rojo"]
-        if r["nivel"]:
-            st.markdown(f"### 🔴 Rojo (riesgo): **{r['nivel']}**")
-            if r["razones"]:
-                st.write("• " + "\n• ".join(r["razones"]))
-        else:
-            st.markdown("### 🔴 Rojo (riesgo)")
-            st.caption("Rojo aparece cuando hay evaluación de riesgo disponible.")
+    if dorado_activo:
+        micro = dor.get("micro_score")
+        umbral = dor.get("umbral")
+        if micro is not None and umbral is not None:
+            rows.append(_diag_row("Micro-score", f"{micro} | Umbral {umbral}"))
 
-        e = debug["ensenar"]
-        if e["premium"]:
-            st.markdown("### 🧭 Enseñar")
-            st.caption("Disponible para tu cuenta.")
+        rr_estimado = dorado_estado.get("rr_estimado")
+        if rr_estimado is not None:
+            rows.append(_diag_row("RR estimado", str(rr_estimado)))
 
+        accion_dorado = dorado_estado.get("accion", estado.get("accion", ""))
+        resumen_dorado = dorado_estado.get("resumen", estado.get("mensaje", ""))
+        if accion_dorado:
+            rows.append(_diag_row("Accion", str(accion_dorado)))
+        if resumen_dorado:
+            rows.append(_diag_row("Resumen", str(resumen_dorado)))
 
+    nivel_riesgo = str(r.get("nivel") or "sin evaluacion activa")
+    risk_class = "is-risk" if nivel_riesgo.lower() in ("alto", "muy alto") else ""
+    rows.append(_diag_row("Rojo (riesgo)", nivel_riesgo, risk_class))
+
+    if bool(e.get("premium", False)):
+        rows.append(_diag_row("Ensenar", "Disponible para tu cuenta"))
+
+    razones_dorado = dorado_estado.get("razones") or dor.get("razones") or []
+    razones_riesgo = r.get("razones") or []
+
+    dorado_list_html = ""
+    if dorado_activo and razones_dorado:
+        items = "".join(f"<li>{html.escape(str(x))}</li>" for x in razones_dorado)
+        dorado_list_html = (
+            "<div class='et-premium-subtitle'>Razones Dorado</div>"
+            f"<ul class='et-premium-list'>{items}</ul>"
+        )
+
+    riesgo_list_html = ""
+    if razones_riesgo:
+        items = "".join(f"<li>{html.escape(str(x))}</li>" for x in razones_riesgo)
+        riesgo_list_html = (
+            "<div class='et-premium-subtitle'>Razones de Riesgo</div>"
+            f"<ul class='et-premium-list'>{items}</ul>"
+        )
+
+    diag_html = (
+        "<div class='et-premium-diag'>"
+        "<div class='et-title'>Diagnostico Premium</div>"
+        f"<div class='et-premium-grid'>{''.join(rows)}{dorado_list_html}{riesgo_list_html}</div>"
+        "</div>"
+    )
+    st.markdown(diag_html, unsafe_allow_html=True)
+
+# ============================================================
+# BLOQUE: PANEL PRINCIPAL FLOTANTE (DECISION + CTA)
+# ============================================================
 # ========= [PANEL PRINCIPAL FLOTANTE - INICIO] =========
 decision = estado.get("decision", "OBSERVAR")
 frase = estado.get("frase_pedagogica", "Estructura válida, intención no clara.")
@@ -1837,13 +3327,6 @@ pos_map = {
     "Abajo izquierda": "pos-bl"
 }
 pos_class = pos_map.get(st.session_state.get("panel_pos", "Arriba derecha"), "pos-tr")
-btn_style_map = {
-    "Arriba derecha": "top: 224px; right: 6px;",
-    "Arriba izquierda": "top: 224px; left: 36px;",
-    "Abajo derecha": "bottom: 154px; right: 6px;",
-    "Abajo izquierda": "bottom: 154px; left: 36px;",
-}
-btn_style = btn_style_map.get(st.session_state.get("panel_pos", "Arriba derecha"), "top: 224px; right: 6px;")
 
 panel_placeholder = st.empty()
 last_panel = st.session_state.get("last_panel_html")
@@ -1867,6 +3350,14 @@ if st.session_state.get("debug_v13", False):
         else:
             debug_line = "<div class='small-muted' style=\"font-family: 'Georgia', 'Times New Roman', serif; font-style: italic;\">Azul - Recomienda observar.</div>"
 
+if debug_line:
+    debug_color = COL_TEXT_2 if not mercado_abierto else color_por_esfera(estado.get("esfera", ""))
+    debug_line = debug_line.replace(
+        'style="',
+        f'style="color:{debug_color}; ',
+        1,
+    )
+
 decision_icon = "👀"
 if (decision or "").upper() == "MERCADO CERRADO":
     decision_icon = "⏸️"
@@ -1884,76 +3375,71 @@ if panel_html != last_panel:
     panel_placeholder.markdown(panel_html, unsafe_allow_html=True)
     st.session_state["last_panel_html"] = panel_html
 
-st.markdown(f"""
-<style>
-.st-key-refresh_float_panel {{
-  position: fixed;
-  z-index: 10001;
-  width: 212px;
-  {btn_style}
-}}
-.st-key-refresh_float_panel .stButton>button {{
-  width: 100%;
-  border-radius: 12px;
-  border: 1px solid #5BE36A;
-  background: linear-gradient(135deg, #7CFF8A 0%, #39D353 100%);
-  color: #0A2610;
-  font-weight: 700;
-  font-family: "Segoe UI", Tahoma, Arial, sans-serif;
-  letter-spacing: 0.2px;
-  box-shadow: 0 8px 22px rgba(57, 211, 83, 0.45);
-}}
-.st-key-refresh_float_panel .stButton>button:hover {{
-  filter: brightness(1.04);
-  border-color: #A4FFAF;
-}}
-@media (max-width: 900px){{
-  .st-key-refresh_float_panel {{
-    left: 28px !important;
-    right: 28px !important;
-    top: auto !important;
-    bottom: 132px !important;
-    width: auto !important;
-  }}
-}}
-</style>
-""", unsafe_allow_html=True)
-
-with st.container(key="refresh_float_panel"):
-    if st.button("Actualizar lectura", key="btn_actualizar_lectura_panel"):
-        st.session_state["star_force_refresh"] = True
+if st.session_state.pop("play_star_rain", False):
+    _ox, _oy = _star_burst_origin(st.session_state.get("panel_pos", "Arriba derecha"))
+    render_star_rain_overlay(_ox, _oy)
 # ========= [PANEL PRINCIPAL FLOTANTE - FIN] =========
+
+dorado_estado = estado.get("dorado_v13", estado.get("dorado"))
+rojo_estado = estado.get("rojo_v13", estado.get("rojo"))
+esfera_actual_txt = str(estado.get("esfera", "")).lower()
+
+dorado_activo = False
+if isinstance(dorado_estado, dict):
+    dorado_activo = bool(dorado_estado) and bool(dorado_estado.get("activo", True))
+else:
+    dorado_activo = bool(dorado_estado)
+if not dorado_activo and ("dorad" in esfera_actual_txt or "🟡" in esfera_actual_txt):
+    dorado_activo = True
 
 if not mercado_abierto:
     st.subheader("⏸️ Mercado cerrado")
     st.write("La lectura operativa queda en pausa hasta la apertura del mercado.")
-elif estado.get("dorado"):
+elif dorado_activo:
     st.subheader("🟡 Ventaja detectada (Dorado)")
-    st.write(estado["dorado"]["resumen"])
-    st.write("Acción:", estado["dorado"]["accion"])
-    st.write("RR estimado:", estado["dorado"]["rr_estimado"])
-    st.write("Razones:")
-    for r in estado["dorado"]["razones"]:
-        st.write("•", r)
+    if isinstance(dorado_estado, dict):
+        resumen_dorado = dorado_estado.get("resumen", estado.get("mensaje", "Ventaja detectada."))
+        accion_dorado = dorado_estado.get("accion", estado.get("accion", "OPERAR CON DISCIPLINA"))
+        rr_estimado = dorado_estado.get("rr_estimado")
+        razones_dorado = dorado_estado.get("razones") or []
+    else:
+        resumen_dorado = estado.get("mensaje", "Ventaja detectada.")
+        accion_dorado = estado.get("accion", "OPERAR CON DISCIPLINA")
+        rr_estimado = None
+        razones_dorado = []
+
+    st.write(resumen_dorado)
+    st.write("Acción:", accion_dorado)
+    if rr_estimado is not None:
+        st.write("RR estimado:", rr_estimado)
+    if razones_dorado:
+        st.write("Razones:")
+        for r in razones_dorado:
+            st.write("•", r)
 else:
     st.subheader("🔵 Azul")
     st.write(estado.get("mensaje", "No hay ventaja suficiente ahora."))
 
-if estado.get("dorado") and estado.get("rojo"):
+if isinstance(rojo_estado, dict) and rojo_estado:
     st.subheader("🔴 Riesgo (Rojo)")
-    st.write(f"Nivel: **{estado['rojo']['nivel']}**")
-    if estado["rojo"]["razones"]:
+    st.write(f"Nivel: **{rojo_estado.get('nivel', estado.get('riesgo', 'N/A'))}**")
+    razones_rojo = rojo_estado.get("razones") or []
+    if razones_rojo:
         st.write("Razones:")
-        for r in estado["rojo"]["razones"]:
+        for r in razones_rojo:
             st.write("•", r)
 
 if recalc_estrella and mercado_abierto:
     guardar_recuerdo(evento_estrella)
 
+# ============================================================
+# BLOQUE: MENSAJE PRINCIPAL DE LA ESTRELLA
+# ============================================================
 # ========= [MENSAJE ESTRELLA - INICIO] =========
 esfera = estado.get("esfera", "🔵 Azul (análisis)")
 mensaje = estado.get("mensaje", "")
 mensaje = "\n".join([line for line in mensaje.splitlines() if line.strip()])
+modo_mensaje = "Estructural (1D+4H)" if modo_estructural else "Tendencial"
 
 accent = color_por_esfera(esfera)
 msg_placeholder = st.empty()
@@ -1961,6 +3447,7 @@ last_msg = st.session_state.get("last_star_msg_html")
 msg_html = f"""
 <div class="et-star-msg" style="--accent:{accent};">
   <div class="et-title">📣 Mensaje de la Estrella</div>
+  <div class="et-mini">Modo: {html.escape(modo_mensaje)}</div>
   <div style="white-space: pre-line;">{mensaje}</div>
 </div>
 """
@@ -1992,6 +3479,9 @@ st.session_state["memoria_eventos"] = st.session_state["memoria_eventos"][-200:]
 
 # RAZONES + TRAZABILIDAD (EN FRENTE)
 # -----------------------
+# ============================================================
+# BLOQUE: RAZONES / TRAZABILIDAD / RECUERDOS RELEVANTES
+# ============================================================
 col_razones, col_traza = st.columns(2)
 
 with col_razones:
@@ -2111,13 +3601,16 @@ st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
 # -----------------------
 # ENSEÑAR (DESPUÉS DE RECUERDOS)
 # -----------------------
+# ============================================================
+# BLOQUE: ENSENAR + EVENTOS PREMIUM + ADVERTENCIAS
+# ============================================================
 ens = estado.get("ensenar")
-if es_premium and (ens or ("🔴" in esfera_actual or "🟡" in esfera_actual)):
+if es_premium and (ens or ("🔴" in esfera_actual or "🔵" in esfera_actual)):
     st.markdown("<div class='et-title'>🧠 Enseñar</div>", unsafe_allow_html=True)
 
-    if "🔴" in esfera_actual or "🟡" in esfera_actual:
+    if "🔴" in esfera_actual or "🔵" in esfera_actual:
         razon_usuario = st.text_input("¿Por qué NO operar aquí?", key="razon_usuario")
-        if st.button("📚 Enseñar Estrella") and razon_usuario.strip():
+        if st.button("🧠 Enseñar Estrella") and razon_usuario.strip():
             guardar_recuerdo({
                 "fecha": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "sesion": sesion,
@@ -2150,7 +3643,7 @@ if st.session_state["usuario"].get("es_premium", False):
     if eventos:
         st.markdown("<div class='small-muted'>Eventos de mercado recientes:</div>", unsafe_allow_html=True)
         for ev in reversed(eventos):
-            st.markdown(f"- {ev.get('fecha', '')} — {ev.get('titulo', '')} ({ev.get('sesion', '')})")
+            st.markdown(f"- {ev.get('fecha', '')} • {ev.get('titulo', '')} ({ev.get('sesion', '')})")
 
 # -----------------------
 # ADVERTENCIAS POR MEMORIA
@@ -2172,9 +3665,11 @@ else:
 
 debug_placeholder = st.empty()
 debug_placeholder.empty()
-# -----------------------
-# ESTRELLA (VISUAL)
-# -----------------------
+
+
+# ============================================================
+# BLOQUE: RENDER VISUAL DE ESTRELLA (FONDO) + ESTADO
+# ============================================================
 dir_v13 = (estado.get("direccion_v13") or "").upper()
 esfera_estado = estado.get("esfera", "")
 if "🔴" in esfera_estado:
@@ -2190,26 +3685,35 @@ if esfera_visual_txt == "🔴":
 elif esfera_visual_txt == "🔵":
     color_estado = "azul"
 
-st.plotly_chart(
-    esfera_visual(color_estado, all_lit=not mercado_abierto),
-    use_container_width=False,
-    key="esfera_visual"
-)
+st.session_state["idle_star_color"] = color_estado
+render_estrella_fondo(color_estado, mercado_abierto)
+
+# Oculto el gráfico frontal de la estrella para dejar solo el render de fondo.
+SHOW_FOREGROUND_STAR = False
+if SHOW_FOREGROUND_STAR:
+    st.plotly_chart(
+        esfera_visual(color_estado, all_lit=not mercado_abierto),
+        use_container_width=False,
+        key="esfera_visual"
+    )
 if esfera_visual_txt == "🔴":
-    st.error("🔴 ESTRELLA EN MODO RIESGO — Riesgo sobre la ventaja")
+    st.error("🔴 ESTRELLA EN MODO RIESGO • Riesgo sobre la ventaja")
 elif esfera_visual_txt == "🟡":
     if dir_v13 == "ALCISTA":
-        st.warning("🟡 ESTRELLA EN MODO TENDENCIA — Alcista")
+        st.warning("🟡 ESTRELLA EN MODO TENDENCIA • Alcista")
     elif dir_v13 == "BAJISTA":
-        st.warning("🟡 ESTRELLA EN MODO TENDENCIA — Bajista")
+        st.warning("🟡 ESTRELLA EN MODO TENDENCIA • Bajista")
     else:
-        st.warning("🟡 ESTRELLA EN MODO TENDENCIA — Ventaja detectada")
+        st.warning("🟡 ESTRELLA EN MODO TENDENCIA • Ventaja detectada")
 else:
-    st.info("🔵 ESTRELLA EN MODO NEUTRAL — Observa")
+    st.info("🔵 ESTRELLA EN MODO NEUTRAL • Observa")
 
 # -----------------------
 # GRÁFICO
 # -----------------------
+# ============================================================
+# BLOQUE: RENDER DE GRAFICOS DE MERCADO
+# ============================================================
 def _render_main_chart(datos, use_binance_live, ticker, chart_placeholder, mercado_abierto):
     if datos.empty:
         st.warning("No hay datos para el gráfico.")
@@ -2330,6 +3834,9 @@ def _render_main_chart(datos, use_binance_live, ticker, chart_placeholder, merca
 # -----------------------
 # RSI
 # -----------------------
+# ============================================================
+# BLOQUE: WRAPPERS DE RENDER (FRAGMENT/AUTOREFRESH)
+# ============================================================
 def _render_rsi_chart(datos):
     return
 
@@ -2338,8 +3845,8 @@ def _render_fragment(fn, *args):
     if hasattr(st, "fragment") and auto_refresh:
         st.fragment(run_every=REFRESH_MS / 1000)(fn)(*args)
     else:
-        if auto_refresh and not hasattr(st, "fragment"):
-            st.sidebar.warning("Auto refresh requiere Streamlit con st.fragment.")
+        if auto_refresh and (not hasattr(st, "fragment")) and (not _HAS_AUTOREFRESH):
+            st.sidebar.warning("Auto refresh requiere st.fragment o streamlit-autorefresh.")
         fn(*args)
 
 
@@ -2347,11 +3854,13 @@ def _render_star_section():
     pass
 
 
+# ============================================================
+# BLOQUE: EJECUCION FINAL DE RENDERS
+# ============================================================
 _render_fragment(_render_star_section)
 main_chart_placeholder = st.empty()
 _render_fragment(_render_main_chart, datos, use_binance_live, ticker, main_chart_placeholder, mercado_abierto)
 _render_fragment(_render_rsi_chart, datos)
-
 
 
 

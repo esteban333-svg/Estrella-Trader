@@ -1,9 +1,0 @@
-streamlit
-streamlit-autorefresh
-pandas
-numpy
-yfinance
-pandas-ta
-plotly
-pytz
-websockets

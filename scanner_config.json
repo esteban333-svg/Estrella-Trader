@@ -1,0 +1,45 @@
+{
+  "enabled": true,
+  "poll_interval_sec": 60,
+  "analysis_mode": "tendencial",
+  "period": "5d",
+  "interval": "15m",
+  "cooldown_minutes": 60,
+  "scan_forex": true,
+  "scan_crypto": true,
+  "forex_pairs": [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "AUD/USD",
+    "USD/CAD",
+    "NZD/USD"
+  ],
+  "crypto_symbols": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "BNB",
+    "XRP",
+    "ADA",
+    "DOGE",
+    "WLD"
+  ],
+  "notification": {
+    "subject_prefix": "[Estrella Trader]",
+    "email": {
+      "enabled": true,
+      "to": []
+    },
+    "telegram": {
+      "enabled": true,
+      "chat_ids": [],
+      "parse_mode": "",
+      "bot_username": "Estrella_TraderBot"
+    },
+    "windows": {
+      "enabled": true
+    }
+  }
+}

@@ -1,0 +1,17 @@
+# IDE / local
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local runtime/state
+auth_cache.json
+analysis_cache.json
+scanner.log
+scanner_state.json
+usuarios_db.json
+
+# Streamlit local secrets
+.streamlit/secrets.toml

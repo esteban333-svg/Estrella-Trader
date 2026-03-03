@@ -1,4 +1,5 @@
 streamlit
+streamlit-cookies-manager
 streamlit-autorefresh
 pandas
 numpy

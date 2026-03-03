@@ -1,12 +1,16 @@
 import asyncio
 import json
+import logging
 import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional, Tuple
+import urllib.error
 import urllib.request
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 WEBSOCKETS_AVAILABLE = False
 try:
@@ -24,6 +28,8 @@ class BinanceLiveStore:
         self.last_update_utc: Optional[datetime] = None
         self.symbol: Optional[str] = None
         self.interval: Optional[str] = None
+        self.last_error: Optional[str] = None
+        self.ws_reconnects: int = 0
 
     def seed(self, df: pd.DataFrame, symbol: str, interval: str) -> None:
         with self._lock:
@@ -31,6 +37,8 @@ class BinanceLiveStore:
             self.symbol = symbol
             self.interval = interval
             self.last_update_utc = datetime.now(timezone.utc)
+            self.last_error = None
+            self.ws_reconnects = 0
 
     def update_from_kline(self, k: dict) -> None:
         try:
@@ -61,13 +69,30 @@ class BinanceLiveStore:
                 self._df = self._df.tail(500)
 
             self.last_update_utc = datetime.now(timezone.utc)
+            self.last_error = None
 
     def get_df(self) -> pd.DataFrame:
         with self._lock:
             return self._df.copy()
 
+    def set_error(self, message: str) -> None:
+        with self._lock:
+            self.last_error = message
 
-def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    def get_last_error(self) -> Optional[str]:
+        with self._lock:
+            return self.last_error
+
+    def register_ws_reconnect(self) -> None:
+        with self._lock:
+            self.ws_reconnects += 1
+
+    def get_ws_reconnects(self) -> int:
+        with self._lock:
+            return int(self.ws_reconnects)
+
+
+def fetch_klines(symbol: str, interval: str, limit: int = 500) -> Tuple[pd.DataFrame, Optional[str]]:
     try:
         url = (
             "https://api.binance.com/api/v3/klines"
@@ -92,9 +117,26 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
             )
 
         df = pd.DataFrame(rows).set_index("ts")
-        return df
-    except Exception:
-        return pd.DataFrame()
+        return df, None
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        err = f"Binance REST HTTP {exc.code} {exc.reason}"
+        if body:
+            err += f" | {body[:220]}"
+        logger.warning(err)
+        return pd.DataFrame(), err
+    except urllib.error.URLError as exc:
+        err = f"Binance REST URL error: {exc}"
+        logger.warning(err)
+        return pd.DataFrame(), err
+    except Exception as exc:
+        err = f"Binance REST unexpected error: {exc}"
+        logger.exception(err)
+        return pd.DataFrame(), err
 
 
 async def _ws_consume(symbol: str, interval: str, store: BinanceLiveStore, stop_event: threading.Event) -> None:
@@ -112,7 +154,11 @@ async def _ws_consume(symbol: str, interval: str, store: BinanceLiveStore, stop_
                     k = payload.get("k")
                     if k:
                         store.update_from_kline(k)
-        except Exception:
+        except Exception as exc:
+            err = f"Binance WS error ({symbol}@{interval}): {exc}"
+            logger.warning(err)
+            store.set_error(err)
+            store.register_ws_reconnect()
             await asyncio.sleep(2)
 
 
