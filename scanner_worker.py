@@ -39,6 +39,7 @@ TD_INTERVAL_MAP = {
     "1m": "1min",
     "5m": "5min",
     "15m": "15min",
+    "30m": "30min",
     "1h": "1h",
     "4h": "4h",
     "1d": "1day",
@@ -572,17 +573,29 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     decision = estado.get("decision", "")
     resumen = estado.get("mensaje", dorado.get("resumen", "Dorado activado."))
     direction = estado.get("direccion_v13", "")
+    temporalidad = str(estado.get("temporalidad_alerta", "")).strip()
     modo = str(estado.get("modo_alerta", "Tendencial")).strip() or "Tendencial"
-    modo_lower = modo.lower()
-    if "estructural" in modo_lower:
+    if not temporalidad:
+        temporalidad = "1D + 4H" if "1d+4h" in modo.lower().replace(" ", "") else str(cfg.get("interval", "15m"))
+
+    temporalidad_norm = temporalidad.lower().replace(" ", "")
+    if temporalidad_norm in {"5m", "15m", "30m"}:
         modo_label = "Estructural"
-    elif "tendencial" in modo_lower:
+    elif temporalidad_norm in {"1d+4h", "1d_4h"}:
         modo_label = "Tendencial"
     else:
-        modo_label = modo
-    temporalidad = str(estado.get("temporalidad_alerta", "")).strip()
-    if not temporalidad:
-        temporalidad = "1D + 4H" if "estructural" in modo.lower() else str(cfg.get("interval", "15m"))
+        modo_lower = modo.lower()
+        if "estructural" in modo_lower:
+            modo_label = "Estructural"
+        elif "tendencial" in modo_lower:
+            modo_label = "Tendencial"
+        else:
+            modo_label = modo
+
+    rr_text = str(rr).strip() if rr is not None else "N/A"
+    resumen_text = str(resumen).strip()
+    if not resumen_text:
+        resumen_text = "Dorado activado."
 
     prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
     subject = f"{prefix} DORADO ACTIVADO | {item.market} {item.label} | {item.ticker}"
@@ -600,7 +613,7 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
         f"RR estimado: {rr}\n"
         f"Fuente de datos: {source}\n"
         f"Hora UTC: {_now_iso_utc()}\n\n"
-        f"Resumen:\n{resumen}\n"
+        f"Resumen:\n{resumen_text}\nR:R: {rr_text}\n"
     )
     return subject, body
 
@@ -632,7 +645,7 @@ def _compute_estado(item: MarketItem, cfg: Dict[str, Any]) -> Tuple[Dict[str, An
 
         if not isinstance(estado, dict):
             return None, "", "Estado estructural invalido."
-        estado["modo_alerta"] = "Estructural (1D+4H)"
+        estado["modo_alerta"] = "Tendencial (1D+4H)"
         estado["temporalidad_alerta"] = "1D + 4H"
         return estado, f"1D:{source_1d} | 4H:{source_4h}", ""
 
@@ -650,7 +663,10 @@ def _compute_estado(item: MarketItem, cfg: Dict[str, Any]) -> Tuple[Dict[str, An
 
     if not isinstance(estado, dict):
         return None, "", "Estado tendencial invalido."
-    estado["modo_alerta"] = "Tendencial"
+    if interval in {"5m", "15m", "30m"}:
+        estado["modo_alerta"] = "Estructural"
+    else:
+        estado["modo_alerta"] = "Tendencial"
     estado["temporalidad_alerta"] = interval
     return estado, source, ""
 

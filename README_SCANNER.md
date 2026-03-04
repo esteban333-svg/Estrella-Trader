@@ -64,7 +64,7 @@ Edita `scanner_config.json`:
   - `tendencial`: usa `period` + `interval` de config.
   - `estructural`: usa 1D + 4H y en alerta mostrara `Modo: Estructural (1D+4H)`.
 - `poll_interval_sec`: cada cuantos segundos escanea
-- `interval`: temporalidad de velas (`1m`, `5m`, `15m`, `1h`, `4h`, `1d`)
+- `interval`: temporalidad de velas (`1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`)
 - `scan_forex` / `scan_crypto`
 - `forex_pairs` / `crypto_symbols`
 - `cooldown_minutes`: evita spam de alertas repetidas

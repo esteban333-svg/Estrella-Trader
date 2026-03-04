@@ -1912,6 +1912,7 @@ TD_INTERVAL_MAP = {
     "1m": "1min",
     "5m": "5min",
     "15m": "15min",
+    "30m": "30min",
     "1h": "1h",
     "4h": "4h",
     "1d": "1day",
@@ -2711,6 +2712,7 @@ else:
 timeframes = {
     "5 minutos": "5m",
     "15 minutos": "15m",
+    "30 minutos": "30m",
     "1 hora": "1h",
     "4 horas": "4h",
     "1 día": "1d"
@@ -2731,11 +2733,11 @@ modo_lectura = st.sidebar.selectbox(
 if modo_lectura == "Estructural (1D + 4H)":
     st.sidebar.caption("Dirección base en 1D y ejecución en 4H.")
 auto_refresh = st.sidebar.toggle(
-    "Auto refresh (gráficos, cada 30s)",
+    "Auto refresh (gráficos)",
     value=st.session_state.get("auto_refresh_charts", True),
     key="auto_refresh_charts"
 )
-AUTO_REFRESH_SEC = 30
+AUTO_REFRESH_SEC = 60
 REFRESH_MS = AUTO_REFRESH_SEC * 1000
 STAR_REFRESH_SEC = AUTO_REFRESH_SEC
 live_mode_enabled = st.sidebar.toggle(
@@ -2836,6 +2838,7 @@ INTERVAL_MAP = {
     "1m": "1m",
     "5m": "5m",
     "15m": "15m",
+    "30m": "30m",
     "1h": "60m",  # yfinance suele ir mejor con 60m que "1h"
 }
 
@@ -2844,6 +2847,7 @@ PERIOD_MAP = {
     "1m": "1d",
     "5m": "5d",
     "15m": "5d",
+    "30m": "1mo",
     "1h": "3mo",
     "60m": "3mo",
     "4h": "12mo",
