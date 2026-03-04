@@ -1301,6 +1301,7 @@ AUTH_COOKIE_PREFIX = os.getenv("AUTH_COOKIE_PREFIX", "estrella_trader")
 # Cambia esta clave en producción con variable de entorno AUTH_COOKIE_PASSWORD.
 AUTH_COOKIE_PASSWORD = os.getenv("AUTH_COOKIE_PASSWORD", "estrella-trader-change-this")
 AUTH_COOKIE_USER_KEY = "uid"
+AUTH_COOKIE_CONSENT_KEY = "cookies_consent_v1"
 PREMIUM_ACCESS_CODE = "980511"
 
 
@@ -1663,6 +1664,73 @@ def _escribir_cookie_uid_retry(uid: str, retries: int = 6, delay_sec: float = 0.
             return True
         time.sleep(delay_sec)
     return False
+
+
+def _leer_cookie_consent() -> bool:
+    if "cookie_consent_accepted" in st.session_state:
+        return bool(st.session_state.get("cookie_consent_accepted", False))
+
+    cookie_mgr = _cookie_manager()
+    if _HAS_COOKIE_MANAGER and _cookie_manager_ready(cookie_mgr):
+        try:
+            raw = str(cookie_mgr.get(AUTH_COOKIE_CONSENT_KEY) or "").strip().lower()
+        except Exception:
+            raw = ""
+        accepted = raw in {"1", "true", "yes", "si", "accepted"}
+    else:
+        accepted = False
+
+    st.session_state["cookie_consent_accepted"] = accepted
+    return accepted
+
+
+def _guardar_cookie_consent(accepted: bool) -> bool:
+    accepted = bool(accepted)
+    st.session_state["cookie_consent_accepted"] = accepted
+    cookie_mgr = _cookie_manager()
+
+    if not _HAS_COOKIE_MANAGER:
+        return True
+    if not _cookie_manager_ready(cookie_mgr):
+        return False
+
+    try:
+        if accepted:
+            cookie_mgr[AUTH_COOKIE_CONSENT_KEY] = "1"
+        else:
+            try:
+                del cookie_mgr[AUTH_COOKIE_CONSENT_KEY]
+            except Exception:
+                pass
+        cookie_mgr.save()
+        return True
+    except Exception:
+        return False
+
+
+def _guardar_cookie_consent_retry(accepted: bool, retries: int = 6, delay_sec: float = 0.08) -> bool:
+    for _ in range(max(1, retries)):
+        if _guardar_cookie_consent(accepted):
+            return True
+        time.sleep(delay_sec)
+    return False
+
+
+def _render_cookie_consent_banner():
+    if _leer_cookie_consent():
+        return
+
+    st.warning(
+        "Usamos cookies para mantener tu sesion iniciada y recordar preferencias. "
+        "Pulsa Aceptar cookies para continuar."
+    )
+    col_accept, col_note = st.columns([1, 2])
+    if col_accept.button("Aceptar cookies", key="btn_cookie_accept_v1", use_container_width=True):
+        _guardar_cookie_consent_retry(True)
+        rerun_app()
+
+    if not _HAS_COOKIE_MANAGER:
+        col_note.caption("No se detecto streamlit-cookies-manager. El consentimiento se guarda solo en esta sesion.")
 
 
 def _leer_auth_cache_uid():
@@ -2561,6 +2629,8 @@ if st.session_state["usuario"].get("autenticado", False):
         guardar_sesion_local(st.session_state["usuario"]["id"])
     else:
         limpiar_sesion_local()
+
+_render_cookie_consent_banner()
 
 with st.sidebar.expander("Cuenta", expanded=True):
     usuario_ui = st.session_state["usuario"]

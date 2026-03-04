@@ -43,6 +43,8 @@ Variables y config:
 - Cada usuario debe guardar su `Chat ID Telegram` en la seccion `Cuenta` de la app.
 - `scanner_config.json` -> `notification.telegram.chat_ids`
   - Opcional como fallback/admin si no hay usuarios con chat id configurado.
+- `scanner_config.json` -> `notification.telegram.send_coin_image` (`true/false`, default `true`).
+- `scanner_config.json` -> `notification.telegram.coin_image_urls` (dict opcional por simbolo, ej: `"BTC": "https://..."`).
 - Opcional: `ALERT_TELEGRAM_CHAT_IDS` (ids separados por coma).
 
 ### Limites por plan (automatico)

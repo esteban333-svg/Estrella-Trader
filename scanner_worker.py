@@ -66,6 +66,17 @@ CRYPTO_MAP = {
     "WLD": {"ticker": "WLD-USD", "td": "WLD/USD"},
 }
 
+CRYPTO_COINMARKETCAP_IDS = {
+    "BTC": 1,
+    "ETH": 1027,
+    "SOL": 5426,
+    "BNB": 1839,
+    "XRP": 52,
+    "ADA": 2010,
+    "DOGE": 74,
+    "WLD": 24091,
+}
+
 
 @dataclass(frozen=True)
 class MarketItem:
@@ -102,6 +113,8 @@ def _default_config() -> Dict[str, Any]:
                 "enabled": True,
                 "chat_ids": [],
                 "parse_mode": "",
+                "send_coin_image": True,
+                "coin_image_urls": {},
             },
             "windows": {
                 "enabled": True,
@@ -254,6 +267,30 @@ def _dedupe_chat_ids(chat_ids: List[str]) -> List[str]:
         seen.add(cid)
         clean.append(cid)
     return clean
+
+
+def _coin_image_url_for_telegram(cfg: Dict[str, Any], item: MarketItem | None) -> str:
+    if item is None or str(item.kind).lower() != "crypto":
+        return ""
+
+    notif = cfg.get("notification", {}) if isinstance(cfg.get("notification", {}), dict) else {}
+    tg_cfg_raw = notif.get("telegram", {})
+    tg_cfg = tg_cfg_raw if isinstance(tg_cfg_raw, dict) else {}
+
+    if not bool(tg_cfg.get("send_coin_image", True)):
+        return ""
+
+    symbol = str(item.label or "").strip().upper()
+    custom_urls = tg_cfg.get("coin_image_urls", {})
+    if isinstance(custom_urls, dict):
+        custom = str(custom_urls.get(symbol, "") or custom_urls.get(symbol.lower(), "")).strip()
+        if custom:
+            return custom
+
+    cmc_id = CRYPTO_COINMARKETCAP_IDS.get(symbol)
+    if not cmc_id:
+        return ""
+    return f"https://s2.coinmarketcap.com/static/img/coins/64x64/{cmc_id}.png"
 
 
 def _extract_chat_ids_from_update(update: Dict[str, Any]) -> List[str]:
@@ -500,6 +537,28 @@ def _now_iso_utc() -> str:
     return datetime.now(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _index_to_iso_utc(value: Any) -> str:
+    try:
+        ts = pd.Timestamp(value)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return ""
+
+
+def _format_price(value: Any) -> str:
+    try:
+        price = float(value)
+        if pd.isna(price):
+            return "N/A"
+        return f"{price:.10f}".rstrip("0").rstrip(".")
+    except Exception:
+        return "N/A"
+
+
 def _parse_iso_utc(value: str) -> datetime | None:
     try:
         return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=pytz.UTC)
@@ -593,6 +652,10 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
             modo_label = modo
 
     rr_text = str(rr).strip() if rr is not None else "N/A"
+    score_text = str(score).strip() if score is not None else "N/A"
+    umbral_text = str(umbral).strip() if umbral is not None else "N/A"
+    precio_alerta_text = _format_price(estado.get("precio_alerta"))
+    indice_alerta_utc = str(estado.get("indice_alerta_utc", "")).strip() or "N/A"
     resumen_text = str(resumen).strip()
     if not resumen_text:
         resumen_text = "Dorado activado."
@@ -608,12 +671,13 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
         f"Direccion: {direction}\n"
         f"Decision: {decision}\n"
         f"Riesgo: {riesgo}\n"
-        f"Micro score: {score}\n"
-        f"Umbral: {umbral}\n"
+        f"Precio exacto (disparo): {precio_alerta_text}\n"
+        f"Indice vela UTC: {indice_alerta_utc}\n"
         f"RR estimado: {rr}\n"
         f"Fuente de datos: {source}\n"
-        f"Hora UTC: {_now_iso_utc()}\n\n"
+        f"Hora envio UTC: {_now_iso_utc()}\n\n"
         f"Resumen:\n{resumen_text}\nR:R: {rr_text}\n"
+        f"Micro score/Umbral: {score_text}/{umbral_text}\n"
     )
     return subject, body
 
@@ -647,6 +711,11 @@ def _compute_estado(item: MarketItem, cfg: Dict[str, Any]) -> Tuple[Dict[str, An
             return None, "", "Estado estructural invalido."
         estado["modo_alerta"] = "Tendencial (1D+4H)"
         estado["temporalidad_alerta"] = "1D + 4H"
+        try:
+            estado["precio_alerta"] = float(df_4h_ind["Close"].iloc[-1])
+        except Exception:
+            estado["precio_alerta"] = None
+        estado["indice_alerta_utc"] = _index_to_iso_utc(df_4h_ind.index[-1]) if len(df_4h_ind.index) else ""
         return estado, f"1D:{source_1d} | 4H:{source_4h}", ""
 
     interval = str(cfg.get("interval", "15m"))
@@ -668,6 +737,11 @@ def _compute_estado(item: MarketItem, cfg: Dict[str, Any]) -> Tuple[Dict[str, An
     else:
         estado["modo_alerta"] = "Tendencial"
     estado["temporalidad_alerta"] = interval
+    try:
+        estado["precio_alerta"] = float(df_ind["Close"].iloc[-1])
+    except Exception:
+        estado["precio_alerta"] = None
+    estado["indice_alerta_utc"] = _index_to_iso_utc(df_ind.index[-1]) if len(df_ind.index) else ""
     return estado, source, ""
 
 
@@ -716,7 +790,13 @@ def _send_email_alert(
         return False, str(exc)
 
 
-def _send_telegram_alert(cfg: Dict[str, Any], subject: str, body: str, chat_ids_override: List[str] | None = None) -> Tuple[bool, str]:
+def _send_telegram_alert(
+    cfg: Dict[str, Any],
+    subject: str,
+    body: str,
+    chat_ids_override: List[str] | None = None,
+    item: MarketItem | None = None,
+) -> Tuple[bool, str]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         return False, "TELEGRAM_BOT_TOKEN no configurado."
@@ -729,11 +809,32 @@ def _send_telegram_alert(cfg: Dict[str, Any], subject: str, body: str, chat_ids_
 
     parse_mode = str((cfg.get("notification", {}).get("telegram", {}) or {}).get("parse_mode", "")).strip()
     message = f"{subject}\n\n{body}"
+    caption = message if len(message) <= 1024 else f"{message[:1000]}..."
+    photo_url = _coin_image_url_for_telegram(cfg, item)
 
     errors = []
     sent_any = False
     for chat_id in chat_ids:
         try:
+            photo_error = ""
+            if photo_url:
+                photo_payload: Dict[str, Any] = {"chat_id": chat_id, "photo": photo_url, "caption": caption}
+                if parse_mode:
+                    photo_payload["parse_mode"] = parse_mode
+                photo_resp = requests.post(
+                    f"https://api.telegram.org/bot{token}/sendPhoto",
+                    data=photo_payload,
+                    timeout=20,
+                )
+                if photo_resp.status_code < 400:
+                    photo_data = photo_resp.json()
+                    if photo_data.get("ok", False):
+                        sent_any = True
+                        continue
+                    photo_error = str(photo_data.get("description", "Error Telegram sin descripcion"))
+                else:
+                    photo_error = f"HTTP {photo_resp.status_code}"
+
             payload: Dict[str, Any] = {"chat_id": chat_id, "text": message}
             if parse_mode:
                 payload["parse_mode"] = parse_mode
@@ -743,11 +844,18 @@ def _send_telegram_alert(cfg: Dict[str, Any], subject: str, body: str, chat_ids_
                 timeout=20,
             )
             if resp.status_code >= 400:
-                errors.append(f"{chat_id}: HTTP {resp.status_code}")
+                if photo_error:
+                    errors.append(f"{chat_id}: foto({photo_error}) | mensaje(HTTP {resp.status_code})")
+                else:
+                    errors.append(f"{chat_id}: HTTP {resp.status_code}")
                 continue
             data = resp.json()
             if not data.get("ok", False):
-                errors.append(f"{chat_id}: {data.get('description', 'Error Telegram sin descripcion')}")
+                msg_err = str(data.get("description", "Error Telegram sin descripcion"))
+                if photo_error:
+                    errors.append(f"{chat_id}: foto({photo_error}) | mensaje({msg_err})")
+                else:
+                    errors.append(f"{chat_id}: {msg_err}")
                 continue
             sent_any = True
         except Exception as exc:
@@ -891,7 +999,13 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                     user_errors: List[str] = []
 
                     if telegram_enabled:
-                        sent_ok, sent_err = _send_telegram_alert(cfg, subject, body, chat_ids_override=[chat_id])
+                        sent_ok, sent_err = _send_telegram_alert(
+                            cfg,
+                            subject,
+                            body,
+                            chat_ids_override=[chat_id],
+                            item=item,
+                        )
                         if sent_ok:
                             user_notified = True
                             sent_any = True
@@ -938,6 +1052,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                         subject,
                         body,
                         chat_ids_override=broadcast_extra_chat_ids,
+                        item=item,
                     )
                     notify_status["telegram_broadcast"] = {
                         "ok": sent_ok,
@@ -982,6 +1097,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                         subject,
                         body,
                         chat_ids_override=telegram_broadcast_ids or None,
+                        item=item,
                     )
                     notify_status["telegram"] = {"ok": sent_ok, "error": sent_err}
                     if sent_ok:
