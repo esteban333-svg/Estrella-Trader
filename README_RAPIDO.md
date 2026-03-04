@@ -8,6 +8,18 @@
    - Rojo alto = `NO OPERAR`
 3. Pulsa `Actualizar lectura` para refrescar.
 
+## Conectar Telegram (Sin Chat ID Manual)
+1. Inicia sesion en la app.
+2. En `Cuenta > Telegram`, pulsa `Abrir bot`.
+3. En Telegram, toca `Iniciar` (o envia `/start`).
+4. Regresa a la app y pulsa `Conectar Telegram`.
+5. Si todo sale bien, veras `Telegram conectado`.
+
+Notas:
+- Ya no necesitas escribir el `chat_id` manualmente.
+- Si falla la conexion, repite `Abrir bot` -> `Iniciar` -> `Conectar Telegram`.
+- El bot usado por defecto es `@Estrella_TraderBot`.
+
 ## Como Leer Señales
 - `Panel principal`: decision actual (`observar` / `operar` / `no operar`).
 - `Mensaje Estrella`: explicacion breve del contexto.
