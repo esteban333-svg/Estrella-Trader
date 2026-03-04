@@ -34,7 +34,9 @@
     },
     "telegram": {
       "enabled": true,
-      "chat_ids": [],
+      "chat_ids": [
+        "6751045178"
+      ],
       "parse_mode": "",
       "bot_username": "Estrella_TraderBot"
     },

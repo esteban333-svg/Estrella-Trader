@@ -30,6 +30,8 @@ DEFAULT_CONFIG_PATH = ROOT / "scanner_config.json"
 DEFAULT_STATE_PATH = ROOT / "scanner_state.json"
 DEFAULT_LOG_PATH = ROOT / "scanner.log"
 USERS_DB_PATH = ROOT / "usuarios_db.json"
+TELEGRAM_AUTO_CHAT_IDS_KEY = "telegram_auto_chat_ids"
+TELEGRAM_LAST_UPDATE_ID_KEY = "telegram_last_update_id"
 
 NY_TZ = pytz.timezone("America/New_York")
 
@@ -162,6 +164,12 @@ def load_state(state_path: Path) -> Dict[str, Any]:
         state["symbols"] = {}
     if not isinstance(state.get("free_daily_market_alerts"), dict):
         state["free_daily_market_alerts"] = {}
+    if not isinstance(state.get(TELEGRAM_AUTO_CHAT_IDS_KEY), list):
+        state[TELEGRAM_AUTO_CHAT_IDS_KEY] = []
+    try:
+        state[TELEGRAM_LAST_UPDATE_ID_KEY] = int(state.get(TELEGRAM_LAST_UPDATE_ID_KEY, 0) or 0)
+    except Exception:
+        state[TELEGRAM_LAST_UPDATE_ID_KEY] = 0
     return state
 
 
@@ -231,6 +239,112 @@ def _chat_id_telegram_valido(chat_id: str) -> bool:
     if cid.startswith("-"):
         return cid[1:].isdigit()
     return cid.isdigit()
+
+
+def _dedupe_chat_ids(chat_ids: List[str]) -> List[str]:
+    seen = set()
+    clean: List[str] = []
+    for raw in chat_ids:
+        cid = _normalizar_telegram_chat_id(raw)
+        if not _chat_id_telegram_valido(cid):
+            continue
+        if cid in seen:
+            continue
+        seen.add(cid)
+        clean.append(cid)
+    return clean
+
+
+def _extract_chat_ids_from_update(update: Dict[str, Any]) -> List[str]:
+    ids: List[str] = []
+    if not isinstance(update, dict):
+        return ids
+
+    def _push_chat_id(value: Any):
+        cid = _normalizar_telegram_chat_id(str(value or ""))
+        if _chat_id_telegram_valido(cid):
+            ids.append(cid)
+
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post", "my_chat_member", "chat_member"):
+        payload = update.get(key, {})
+        if isinstance(payload, dict):
+            chat = payload.get("chat", {})
+            if isinstance(chat, dict):
+                _push_chat_id(chat.get("id"))
+
+    callback = update.get("callback_query", {})
+    if isinstance(callback, dict):
+        msg = callback.get("message", {})
+        if isinstance(msg, dict):
+            chat = msg.get("chat", {})
+            if isinstance(chat, dict):
+                _push_chat_id(chat.get("id"))
+
+    return _dedupe_chat_ids(ids)
+
+
+def _discover_telegram_chats_from_updates(state: Dict[str, Any]) -> Tuple[List[str], str]:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    known_ids = _dedupe_chat_ids(state.get(TELEGRAM_AUTO_CHAT_IDS_KEY, []))
+    if not token:
+        state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
+        return known_ids, "TELEGRAM_BOT_TOKEN no configurado."
+
+    try:
+        last_update_id = int(state.get(TELEGRAM_LAST_UPDATE_ID_KEY, 0) or 0)
+    except Exception:
+        last_update_id = 0
+
+    params: Dict[str, Any] = {"timeout": 0}
+    if last_update_id > 0:
+        params["offset"] = last_update_id + 1
+
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params=params,
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
+            return known_ids, f"HTTP {resp.status_code} al consultar getUpdates."
+        payload = resp.json()
+        if not payload.get("ok", False):
+            state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
+            return known_ids, payload.get("description", "Error getUpdates sin descripcion.")
+        updates = payload.get("result", [])
+        if not isinstance(updates, list):
+            updates = []
+    except Exception as exc:
+        state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
+        return known_ids, str(exc)
+
+    max_update_id = last_update_id
+    merged = list(known_ids)
+    seen = set(merged)
+    added = 0
+    for upd in updates:
+        if not isinstance(upd, dict):
+            continue
+        try:
+            upd_id = int(upd.get("update_id", 0) or 0)
+        except Exception:
+            upd_id = 0
+        if upd_id > max_update_id:
+            max_update_id = upd_id
+
+        for cid in _extract_chat_ids_from_update(upd):
+            if cid in seen:
+                continue
+            seen.add(cid)
+            merged.append(cid)
+            added += 1
+
+    state[TELEGRAM_AUTO_CHAT_IDS_KEY] = merged
+    state[TELEGRAM_LAST_UPDATE_ID_KEY] = max_update_id
+    if added > 0:
+        logging.info("Telegram: %s chat(s) nuevos detectados via getUpdates.", added)
+    return merged, ""
 
 
 def _premium_activo_usuario(record: Dict[str, Any]) -> bool:
@@ -691,6 +805,13 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
         return state
 
     symbols_state: Dict[str, Any] = state.setdefault("symbols", {})
+    configured_telegram_chat_ids = _dedupe_chat_ids(_parse_telegram_chat_ids(cfg))
+    auto_telegram_chat_ids: List[str] = []
+    if _channel_enabled(cfg, "telegram", default=True):
+        auto_telegram_chat_ids, discover_err = _discover_telegram_chats_from_updates(state)
+        if discover_err:
+            logging.warning("Telegram getUpdates: %s", discover_err)
+    telegram_broadcast_ids = _dedupe_chat_ids(configured_telegram_chat_ids + auto_telegram_chat_ids)
 
     for item in watchlist:
         record = symbols_state.get(item.state_key, {})
@@ -793,6 +914,24 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                         errors.append(f"{user_id}: {'; '.join(user_errors)}")
 
                 notify_status["users"] = user_results
+                known_user_chat_ids = _dedupe_chat_ids([t.get("chat_id", "") for t in user_targets])
+                broadcast_extra_chat_ids = [cid for cid in telegram_broadcast_ids if cid not in set(known_user_chat_ids)]
+                if telegram_enabled and broadcast_extra_chat_ids:
+                    sent_ok, sent_err = _send_telegram_alert(
+                        cfg,
+                        subject,
+                        body,
+                        chat_ids_override=broadcast_extra_chat_ids,
+                    )
+                    notify_status["telegram_broadcast"] = {
+                        "ok": sent_ok,
+                        "error": sent_err,
+                        "sent_to": len(broadcast_extra_chat_ids),
+                    }
+                    if sent_ok:
+                        sent_any = True
+                    else:
+                        errors.append(f"telegram_broadcast: {sent_err}")
 
                 if eligible_users == 0:
                     errors.append("Sin usuarios elegibles con Telegram para esta alerta.")
@@ -822,7 +961,12 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
 
                 if _channel_enabled(cfg, "telegram", default=True):
                     enabled_any = True
-                    sent_ok, sent_err = _send_telegram_alert(cfg, subject, body)
+                    sent_ok, sent_err = _send_telegram_alert(
+                        cfg,
+                        subject,
+                        body,
+                        chat_ids_override=telegram_broadcast_ids or None,
+                    )
                     notify_status["telegram"] = {"ok": sent_ok, "error": sent_err}
                     if sent_ok:
                         sent_any = True
