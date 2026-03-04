@@ -1424,6 +1424,121 @@ def _telegram_bot_url() -> str:
     return "https://t.me"
 
 
+def _telegram_start_code_usuario(user_id: str) -> str:
+    uid = str(user_id or "").strip().lower()
+    if not uid:
+        return ""
+    raw = f"{uid}|{AUTH_COOKIE_PASSWORD}|telegram-link"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"et{digest[:16]}"
+
+
+def _telegram_bot_start_url(user_id: str = "") -> str:
+    bot_username = _telegram_bot_username_actual()
+    if not bot_username:
+        return "https://t.me"
+    base = f"https://t.me/{bot_username}"
+    start_code = _telegram_start_code_usuario(user_id)
+    if not start_code:
+        return base
+    return f"{base}?start={start_code}"
+
+
+def _extraer_chat_id_update_por_start(update: dict, start_code: str) -> str:
+    if not isinstance(update, dict):
+        return ""
+    expected = str(start_code or "").strip().lower()
+    if not expected:
+        return ""
+
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        payload = update.get(key, {})
+        if not isinstance(payload, dict):
+            continue
+        chat = payload.get("chat", {})
+        if not isinstance(chat, dict):
+            continue
+
+        text = str(payload.get("text", "") or payload.get("caption", "")).strip().lower()
+        if not text:
+            continue
+
+        match = False
+        if text.startswith("/start"):
+            parts = text.split()
+            if len(parts) >= 2 and parts[1].strip() == expected:
+                match = True
+        if expected in text:
+            match = True
+
+        if not match:
+            continue
+
+        chat_id = _normalizar_telegram_chat_id(chat.get("id", ""))
+        if _chat_id_telegram_valido(chat_id):
+            return chat_id
+    return ""
+
+
+def _detectar_chat_id_telegram_desde_start(user_id: str):
+    start_code = _telegram_start_code_usuario(user_id)
+    if not start_code:
+        return False, "Usuario invalido para conectar Telegram.", ""
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not token:
+        return False, "TELEGRAM_BOT_TOKEN no esta configurado en el servidor.", ""
+
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"timeout": 0},
+            timeout=20,
+        )
+    except Exception as exc:
+        return False, f"No se pudo consultar Telegram: {exc}", ""
+
+    if resp.status_code >= 400:
+        return False, f"Telegram getUpdates HTTP {resp.status_code}.", ""
+
+    try:
+        payload = resp.json()
+    except Exception:
+        return False, "Respuesta invalida de Telegram.", ""
+
+    if not payload.get("ok", False):
+        return False, payload.get("description", "Error Telegram sin descripcion."), ""
+
+    updates = payload.get("result", [])
+    if not isinstance(updates, list):
+        updates = []
+
+    best_update_id = -1
+    best_chat_id = ""
+    for upd in updates:
+        chat_id = _extraer_chat_id_update_por_start(upd, start_code)
+        if not chat_id:
+            continue
+        try:
+            upd_id = int(upd.get("update_id", 0) or 0)
+        except Exception:
+            upd_id = 0
+        if upd_id >= best_update_id:
+            best_update_id = upd_id
+            best_chat_id = chat_id
+
+    if not best_chat_id:
+        return False, "No encontramos tu chat. Abre el bot, toca Iniciar y vuelve a intentar.", ""
+    return True, "", best_chat_id
+
+
+def conectar_telegram_usuario_desde_bot(user_id: str):
+    ok, msg, detected_chat_id = _detectar_chat_id_telegram_desde_start(user_id)
+    if not ok:
+        return False, msg, None
+    return actualizar_telegram_usuario(user_id, detected_chat_id)
+
+
 def _enviar_correo_bienvenida(username: str, email_to: str):
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
     smtp_port_raw = os.getenv("SMTP_PORT", "587")
@@ -2483,11 +2598,7 @@ with st.sidebar.expander("Cuenta", expanded=True):
         else:
             username_reg = st.text_input("Usuario", key="reg_user_v1")
             email_reg = st.text_input("Correo Gmail", placeholder="tuusuario@gmail.com", key="reg_email_v1")
-            telegram_chat_reg = st.text_input(
-                "Chat ID Telegram (opcional)",
-                placeholder="123456789",
-                key="reg_telegram_chat_id_v1",
-            )
+            st.caption("Telegram se conecta despues con el boton Conectar Telegram.")
             pass_reg = st.text_input("Contraseña", type="password", key="reg_pass_v1")
             pass_reg2 = st.text_input("Confirmar contraseña", type="password", key="reg_pass2_v1")
             if st.button("Crear cuenta", key="btn_register_v1"):
@@ -2498,7 +2609,7 @@ with st.sidebar.expander("Cuenta", expanded=True):
                         username_reg,
                         email_reg,
                         pass_reg,
-                        telegram_chat_reg,
+                        "",
                     )
                     if ok and user_public:
                         st.session_state["usuario"] = user_public
@@ -2521,25 +2632,37 @@ with st.sidebar.expander("Cuenta", expanded=True):
 
         st.divider()
         st.markdown("**Telegram**")
-        telegram_chat_id_ui = st.text_input(
-            "Chat ID Telegram",
-            value=str(usuario_ui.get("telegram_chat_id", "") or ""),
-            placeholder="123456789",
-            key="account_telegram_chat_id_v1",
-        )
-        col_tg_save, col_tg_open = st.columns(2)
-        if col_tg_save.button("Guardar bot", key="btn_save_telegram_v1"):
-            ok, msg, user_public = actualizar_telegram_usuario(usuario_ui["id"], telegram_chat_id_ui)
+        chat_guardado = str(usuario_ui.get("telegram_chat_id", "") or "").strip()
+        if chat_guardado:
+            st.success("Telegram conectado.")
+        else:
+            st.info("Telegram no conectado.")
+        st.caption("1) Abre el bot. 2) Toca Iniciar. 3) Pulsa Conectar Telegram aqui.")
+
+        tg_start_url = _telegram_bot_start_url(usuario_ui.get("id", ""))
+        col_tg_open, col_tg_connect, col_tg_clear = st.columns(3)
+        if hasattr(st, "link_button"):
+            col_tg_open.link_button("Abrir bot", tg_start_url, use_container_width=True)
+        else:
+            col_tg_open.markdown(f"[Abrir bot]({tg_start_url})")
+
+        if col_tg_connect.button("Conectar Telegram", key="btn_connect_telegram_v1"):
+            ok, msg, user_public = conectar_telegram_usuario_desde_bot(usuario_ui["id"])
             if ok and user_public:
                 st.session_state["usuario"] = user_public
                 st.success(msg)
                 rerun_app()
             else:
                 st.error(msg)
-        if hasattr(st, "link_button"):
-            col_tg_open.link_button("Abrir bot", _telegram_bot_url(), use_container_width=True)
-        else:
-            col_tg_open.markdown(f"[Abrir bot]({_telegram_bot_url()})")
+
+        if col_tg_clear.button("Desconectar", key="btn_clear_telegram_v1"):
+            ok, msg, user_public = actualizar_telegram_usuario(usuario_ui["id"], "")
+            if ok and user_public:
+                st.session_state["usuario"] = user_public
+                st.success(msg)
+                rerun_app()
+            else:
+                st.error(msg)
 
         st.divider()
         st.markdown("**Premium**")
