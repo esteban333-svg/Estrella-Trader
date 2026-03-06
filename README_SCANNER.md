@@ -65,12 +65,35 @@ Edita `scanner_config.json`:
 - `analysis_mode`: `tendencial` o `estructural`
   - `tendencial`: usa `period` + `interval` de config.
   - `estructural`: usa 1D + 4H y en alerta mostrara `Modo: Estructural (1D+4H)`.
+- `auto_multi_interval`:
+  - `true`: escanea automaticamente multiples temporalidades (por defecto `15m`, `30m`, `1h`, `4h`) sin cambiar `interval` manualmente.
+  - `false`: vuelve al modo clasico de una sola temporalidad (`interval`) + opcional estructural.
+- `scan_intervals`: lista de temporalidades a escanear cuando `auto_multi_interval=true`.
+- `scan_structural_1d_4h`: si `true`, agrega tambien alertas estructurales `1D + 4H`.
 - `poll_interval_sec`: cada cuantos segundos escanea
 - `interval`: temporalidad de velas (`1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`)
-- `scan_forex` / `scan_crypto`
-- `forex_pairs` / `crypto_symbols`
+- `scan_forex` / `scan_crypto` / `scan_gold`
+- `forex_pairs` / `crypto_symbols` / `gold_symbols`
+  - Oro default: `XAU/USD` (`GC=F` en yfinance, `XAU/USD` en TwelveData)
 - `cooldown_minutes`: evita spam de alertas repetidas
 - `notification.*.enabled`: activa/desactiva cada canal
+- `precision_filters.*` (modo precision alta):
+  - `require_closed_candle`: solo analiza velas cerradas (si hay vela en formacion, la descarta).
+  - `persistence_bars`: exige n velas consecutivas con senal valida antes de alertar.
+  - `multi_timeframe_filter`: valida alineacion multi-timeframe (15m/30m -> 1h/4h/1d).
+  - `require_price_action_confirmation`: exige patron de vela a favor (envolvente/rechazo).
+  - `min_confidence_score` y `min_rr`: umbrales minimos para alertar.
+  - `adaptive_threshold` y `adaptive_cooldown`: ajustan exigencia/cooldown por volatilidad.
+  - `max_alerts_per_symbol_day`: tope diario por simbolo para evitar sobre-alerta.
+  - `quality_window_bars` / `quality_window_bars_by_interval`: ventana para medir acierto de alerta
+    con regla `+1R antes de -1R`.
+
+### Seguimiento de precision por alerta
+
+- El scanner guarda una alerta "abierta" por simbolo (`open_alert`) con TP/SL a 1R (ATR14).
+- Resultado posible: `win`, `loss`, `timeout` o `replaced`.
+- Se almacena historial en `quality_history` y estadisticas en `quality_stats` dentro de `scanner_state.json`.
+- La alerta enviada incluye `Precision historica (+1R antes de -1R)`.
 
 ## 3) Probar un ciclo
 

@@ -8,7 +8,7 @@ import smtplib
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -66,6 +66,10 @@ CRYPTO_MAP = {
     "WLD": {"ticker": "WLD-USD", "td": "WLD/USD"},
 }
 
+GOLD_MAP = {
+    "XAU/USD": {"ticker": "GC=F", "td": "XAU/USD"},
+}
+
 CRYPTO_COINMARKETCAP_IDS = {
     "BTC": 1,
     "ETH": 1027,
@@ -98,11 +102,52 @@ def _default_config() -> Dict[str, Any]:
         "analysis_mode": "tendencial",
         "period": "5d",
         "interval": "15m",
+        "auto_multi_interval": True,
+        "scan_intervals": ["15m", "30m", "1h", "4h"],
+        "scan_structural_1d_4h": True,
         "cooldown_minutes": 60,
         "scan_forex": True,
         "scan_crypto": True,
+        "scan_gold": True,
+        "precision_filters": {
+            "enabled": True,
+            "require_closed_candle": True,
+            "closed_candle_grace_sec": 10,
+            "persistence_bars": 2,
+            "multi_timeframe_filter": True,
+            "require_price_action_confirmation": True,
+            "min_confidence_score": 85,
+            "min_rr": 1.8,
+            "adaptive_threshold": True,
+            "adaptive_cooldown": True,
+            "max_alerts_per_symbol_day": 2,
+            "min_mtf_confirmations": 2,
+            "quality_window_bars": 12,
+            "quality_window_bars_by_interval": {
+                "5m": 16,
+                "15m": 12,
+                "30m": 10,
+                "1h": 8,
+                "4h": 6,
+                "1d": 5,
+            },
+            "mtf_intervals": {
+                "15m": ["30m", "1h", "4h", "1d"],
+                "30m": ["1h", "4h", "1d"],
+                "1h": ["4h", "1d"],
+            },
+            "base_cooldown_by_interval": {
+                "5m": 35,
+                "15m": 45,
+                "30m": 60,
+                "1h": 90,
+                "4h": 180,
+                "1d": 720,
+            },
+        },
         "forex_pairs": list(FOREX_MAP.keys()),
         "crypto_symbols": list(CRYPTO_MAP.keys()),
+        "gold_symbols": list(GOLD_MAP.keys()),
         "notification": {
             "subject_prefix": "[Estrella Trader]",
             "email": {
@@ -566,12 +611,693 @@ def _parse_iso_utc(value: str) -> datetime | None:
         return None
 
 
-def _should_alert(record: Dict[str, Any], dorado_now: bool, cooldown_minutes: int) -> bool:
-    if not dorado_now:
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        val = float(value)
+        if pd.isna(val):
+            return default
+        return val
+    except Exception:
+        return default
+
+
+def _interval_to_timedelta(interval: str) -> timedelta | None:
+    interval = str(interval or "").strip().lower()
+    mapping = {
+        "1m": timedelta(minutes=1),
+        "5m": timedelta(minutes=5),
+        "15m": timedelta(minutes=15),
+        "30m": timedelta(minutes=30),
+        "1h": timedelta(hours=1),
+        "4h": timedelta(hours=4),
+        "1d": timedelta(days=1),
+    }
+    return mapping.get(interval)
+
+
+def _period_for_interval(interval: str) -> str:
+    interval = str(interval or "").strip().lower()
+    period_map = {
+        "1m": "1d",
+        "5m": "5d",
+        "15m": "5d",
+        "30m": "1mo",
+        "1h": "3mo",
+        "4h": "12mo",
+        "1d": "3y",
+    }
+    return period_map.get(interval, "5d")
+
+
+def _atr_ratio_from_df(df: pd.DataFrame) -> float:
+    if df is None or df.empty or len(df) < 15:
+        return 1.0
+    try:
+        tr = (df["High"] - df["Low"]).abs()
+        atr14 = _safe_float(tr.rolling(14).mean().iloc[-1], default=0.0)
+        atr50 = _safe_float(tr.rolling(50).mean().iloc[-1], default=0.0) if len(df) >= 50 else _safe_float(tr.mean(), 0.0)
+        if atr14 <= 0 or atr50 <= 0:
+            return 1.0
+        return max(0.01, atr14 / atr50)
+    except Exception:
+        return 1.0
+
+
+def _atr14_from_df(df: pd.DataFrame) -> float:
+    if df is None or df.empty:
+        return 0.0
+    try:
+        tr = (df["High"] - df["Low"]).abs()
+        if len(df) >= 14:
+            val = _safe_float(tr.rolling(14).mean().iloc[-1], 0.0)
+        else:
+            val = _safe_float(tr.mean(), 0.0)
+        return max(0.0, val)
+    except Exception:
+        return 0.0
+
+
+def _is_last_candle_closed(df: pd.DataFrame, interval: str, grace_seconds: int = 10) -> bool:
+    if df is None or df.empty:
+        return False
+    delta = _interval_to_timedelta(interval)
+    if delta is None:
+        return True
+    try:
+        ts = pd.Timestamp(df.index[-1])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        close_at = ts + delta + timedelta(seconds=max(0, int(grace_seconds)))
+        return datetime.now(pytz.UTC) >= close_at.to_pydatetime()
+    except Exception:
+        return True
+
+
+def _prepare_df_for_closed_candle(
+    df: pd.DataFrame,
+    interval: str,
+    require_closed_candle: bool,
+    grace_seconds: int,
+) -> Tuple[pd.DataFrame, bool, bool]:
+    if df is None or df.empty:
+        return pd.DataFrame(), False, False
+    if not require_closed_candle:
+        return df, True, False
+    is_closed = _is_last_candle_closed(df, interval=interval, grace_seconds=grace_seconds)
+    if is_closed:
+        return df, True, False
+    if len(df) < 3:
+        return pd.DataFrame(), False, False
+    # Descarta la vela en formación y analiza solo velas cerradas.
+    return df.iloc[:-1], True, True
+
+
+def _candle_metrics(row: pd.Series) -> Dict[str, float]:
+    high = _safe_float(row.get("High"))
+    low = _safe_float(row.get("Low"))
+    open_ = _safe_float(row.get("Open"))
+    close = _safe_float(row.get("Close"))
+    total_range = max(1e-9, high - low)
+    body = abs(close - open_)
+    upper_wick = max(0.0, high - max(open_, close))
+    lower_wick = max(0.0, min(open_, close) - low)
+    return {
+        "range": total_range,
+        "body": body,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "open": open_,
+        "close": close,
+    }
+
+
+def _detect_price_action(df: pd.DataFrame, direction: str) -> Dict[str, Any]:
+    if df is None or df.empty or len(df) < 3:
+        return {
+            "pattern": "sin_patron",
+            "bias": "NEUTRAL",
+            "score": 0,
+            "aligned": False,
+            "description": "Sin suficientes velas para confirmar price action.",
+        }
+    prev = df.iloc[-2]
+    last = df.iloc[-1]
+    prev_m = _candle_metrics(prev)
+    last_m = _candle_metrics(last)
+
+    prev_bull = prev_m["close"] > prev_m["open"]
+    prev_bear = prev_m["close"] < prev_m["open"]
+    last_bull = last_m["close"] > last_m["open"]
+    last_bear = last_m["close"] < last_m["open"]
+
+    bullish_engulfing = (
+        last_bull
+        and prev_bear
+        and last_m["open"] <= prev_m["close"]
+        and last_m["close"] >= prev_m["open"]
+    )
+    bearish_engulfing = (
+        last_bear
+        and prev_bull
+        and last_m["open"] >= prev_m["close"]
+        and last_m["close"] <= prev_m["open"]
+    )
+
+    bullish_rejection = (
+        last_m["lower_wick"] >= (last_m["body"] * 2.0)
+        and (last_m["upper_wick"] <= last_m["body"] * 1.2)
+        and last_m["close"] >= (last_m["open"] - 1e-9)
+    )
+    bearish_rejection = (
+        last_m["upper_wick"] >= (last_m["body"] * 2.0)
+        and (last_m["lower_wick"] <= last_m["body"] * 1.2)
+        and last_m["close"] <= (last_m["open"] + 1e-9)
+    )
+
+    pattern = "sin_patron"
+    bias = "NEUTRAL"
+    description = "Sin patron de confirmacion fuerte."
+    score = 2
+    if bullish_engulfing:
+        pattern = "envolvente_alcista"
+        bias = "ALCISTA"
+        score = 10
+        description = "Vela envolvente alcista detectada."
+    elif bearish_engulfing:
+        pattern = "envolvente_bajista"
+        bias = "BAJISTA"
+        score = 10
+        description = "Vela envolvente bajista detectada."
+    elif bullish_rejection:
+        pattern = "rechazo_alcista"
+        bias = "ALCISTA"
+        score = 8
+        description = "Vela de rechazo alcista (mecha inferior dominante)."
+    elif bearish_rejection:
+        pattern = "rechazo_bajista"
+        bias = "BAJISTA"
+        score = 8
+        description = "Vela de rechazo bajista (mecha superior dominante)."
+
+    direction_norm = str(direction or "").upper().strip()
+    aligned = bias == direction_norm and bias in {"ALCISTA", "BAJISTA"}
+    if bias in {"ALCISTA", "BAJISTA"} and not aligned:
+        score = 0
+
+    return {
+        "pattern": pattern,
+        "bias": bias,
+        "score": score,
+        "aligned": aligned,
+        "description": description,
+    }
+
+
+def _opposite_direction(direction: str) -> str:
+    direction = str(direction or "").upper().strip()
+    if direction == "ALCISTA":
+        return "BAJISTA"
+    if direction == "BAJISTA":
+        return "ALCISTA"
+    return "NEUTRAL"
+
+
+def _resolve_precision_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    raw = cfg.get("precision_filters", {})
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
+def _resolve_mtf_intervals(base_interval: str, precision_cfg: Dict[str, Any]) -> List[str]:
+    mapping = precision_cfg.get("mtf_intervals", {})
+    if isinstance(mapping, dict):
+        raw = mapping.get(base_interval, [])
+        if isinstance(raw, list):
+            values = [str(x).strip().lower() for x in raw if str(x).strip()]
+            if values:
+                return values
+    if base_interval in {"15m", "30m"}:
+        return ["1h", "4h", "1d"]
+    if base_interval == "1h":
+        return ["4h", "1d"]
+    return []
+
+
+def _compute_interval_direction(
+    item: MarketItem,
+    interval: str,
+    cache: Dict[str, Dict[str, Any]],
+    require_closed_candle: bool = True,
+    grace_seconds: int = 10,
+) -> Dict[str, Any]:
+    cache_key = f"{item.state_key}|{interval}"
+    if cache_key in cache:
+        return cache[cache_key]
+
+    period = _period_for_interval(interval)
+    df, source, err = _fetch_data(item, period=period, interval=interval)
+    if df is None or df.empty:
+        payload = {
+            "ok": False,
+            "interval": interval,
+            "source": source,
+            "error": err or "sin datos",
+            "direction": "NEUTRAL",
+        }
+        cache[cache_key] = payload
+        return payload
+
+    df_ready, ready_ok, _ = _prepare_df_for_closed_candle(
+        df,
+        interval=interval,
+        require_closed_candle=require_closed_candle,
+        grace_seconds=grace_seconds,
+    )
+    if not ready_ok or df_ready.empty:
+        payload = {
+            "ok": False,
+            "interval": interval,
+            "source": source,
+            "error": "sin velas cerradas",
+            "direction": "NEUTRAL",
+        }
+        cache[cache_key] = payload
+        return payload
+
+    try:
+        df_ind = calcular_indicadores(df_ready)
+        estado = construir_estado_final(df_ind, impacto_memoria=0)
+        direction = str(estado.get("direccion_v13", "NEUTRAL")).upper().strip() or "NEUTRAL"
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "interval": interval,
+            "source": source,
+            "error": str(exc),
+            "direction": "NEUTRAL",
+        }
+        cache[cache_key] = payload
+        return payload
+
+    payload = {
+        "ok": True,
+        "interval": interval,
+        "source": source,
+        "error": "",
+        "direction": direction,
+    }
+    cache[cache_key] = payload
+    return payload
+
+
+def _evaluate_mtf_alignment(
+    item: MarketItem,
+    base_interval: str,
+    base_direction: str,
+    precision_cfg: Dict[str, Any],
+    cache: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    base_direction = str(base_direction or "").upper().strip()
+    if base_direction not in {"ALCISTA", "BAJISTA"}:
+        return {
+            "ok": False,
+            "score": 0,
+            "details": [],
+            "summary": "Direccion base neutral, sin alineacion MTF.",
+            "confirmations": 0,
+            "opposites": 0,
+        }
+
+    intervals = _resolve_mtf_intervals(base_interval, precision_cfg)
+    if not intervals:
+        return {
+            "ok": True,
+            "score": 12,
+            "details": [],
+            "summary": "Sin filtros MTF requeridos para este timeframe.",
+            "confirmations": 0,
+            "opposites": 0,
+        }
+
+    opposite = _opposite_direction(base_direction)
+    confirmations = 0
+    opposites = 0
+    neutrals = 0
+    details: List[str] = []
+    mandatory_map = {
+        "15m": ["1h", "4h"],
+        "30m": ["1h", "4h"],
+        "1h": ["4h", "1d"],
+    }
+    mandatory = [x for x in mandatory_map.get(base_interval, []) if x in intervals]
+    mandatory_ok = True
+    require_closed_candle = bool(precision_cfg.get("require_closed_candle", True))
+    grace_seconds = int(precision_cfg.get("closed_candle_grace_sec", 10))
+
+    for tf in intervals:
+        res = _compute_interval_direction(
+            item=item,
+            interval=tf,
+            cache=cache,
+            require_closed_candle=require_closed_candle,
+            grace_seconds=grace_seconds,
+        )
+        if not res.get("ok", False):
+            details.append(f"{tf}: error({res.get('error', 'sin detalle')})")
+            if tf in mandatory:
+                mandatory_ok = False
+            continue
+        direction = str(res.get("direction", "NEUTRAL")).upper().strip()
+        details.append(f"{tf}:{direction}")
+        if direction == base_direction:
+            confirmations += 1
+        elif direction == opposite:
+            opposites += 1
+            if tf in mandatory:
+                mandatory_ok = False
+        else:
+            neutrals += 1
+            if tf in mandatory:
+                mandatory_ok = False
+
+    min_confirms = max(1, int(precision_cfg.get("min_mtf_confirmations", 2)))
+    ok = mandatory_ok and opposites == 0 and confirmations >= min_confirms
+    score = 0
+    if ok:
+        score = 20 if neutrals == 0 else 16
+    elif opposites == 0 and confirmations >= 1:
+        score = 10
+
+    return {
+        "ok": ok,
+        "score": score,
+        "details": details,
+        "summary": f"confirmaciones={confirmations}, opuestos={opposites}, neutrales={neutrals}",
+        "confirmations": confirmations,
+        "opposites": opposites,
+    }
+
+
+def _compute_dynamic_min_confidence(
+    base_interval: str,
+    vol_ratio: float,
+    precision_cfg: Dict[str, Any],
+) -> int:
+    base = int(precision_cfg.get("min_confidence_score", 85))
+    if not bool(precision_cfg.get("adaptive_threshold", True)):
+        return max(40, min(99, base))
+
+    adjust = 0
+    if vol_ratio >= 1.5:
+        adjust += 5
+    elif vol_ratio >= 1.3:
+        adjust += 3
+    elif vol_ratio <= 0.8:
+        adjust -= 2
+
+    tf_adjust = {"5m": 4, "15m": 3, "30m": 2, "1h": 1, "4h": 0, "1d": 0}
+    adjust += tf_adjust.get(base_interval, 0)
+    return max(40, min(99, base + adjust))
+
+
+def _compute_adaptive_cooldown_minutes(
+    cfg: Dict[str, Any],
+    base_interval: str,
+    vol_ratio: float,
+    precision_cfg: Dict[str, Any],
+) -> int:
+    fallback = max(1, int(cfg.get("cooldown_minutes", 60)))
+    base_map = precision_cfg.get("base_cooldown_by_interval", {})
+    if isinstance(base_map, dict):
+        base = int(base_map.get(base_interval, fallback))
+    else:
+        base = fallback
+
+    if not bool(precision_cfg.get("adaptive_cooldown", True)):
+        return max(1, base)
+
+    factor = 1.0
+    if vol_ratio >= 1.8:
+        factor = 1.8
+    elif vol_ratio >= 1.5:
+        factor = 1.5
+    elif vol_ratio >= 1.3:
+        factor = 1.3
+    elif vol_ratio <= 0.75:
+        factor = 0.8
+    elif vol_ratio <= 0.9:
+        factor = 0.9
+
+    return max(1, int(round(base * factor)))
+
+
+def _compute_signal_confidence(
+    estado: Dict[str, Any],
+    mtf_info: Dict[str, Any],
+    candle_info: Dict[str, Any],
+) -> int:
+    dorado = estado.get("dorado_v13") or {}
+    micro_score = _safe_float(dorado.get("micro_score"), 0.0)
+    umbral = _safe_float(dorado.get("umbral"), 1.0)
+    rr = _safe_float(dorado.get("rr_estimado"), 0.0)
+
+    score_component = min(1.0, micro_score / max(umbral + 2.0, 1.0)) * 45.0
+    rr_component = min(1.0, rr / 2.5) * 25.0
+    mtf_component = _safe_float(mtf_info.get("score"), 0.0)
+    candle_component = _safe_float(candle_info.get("score"), 0.0)
+
+    raw = score_component + rr_component + mtf_component + candle_component
+    return max(0, min(100, int(round(raw))))
+
+
+def _daily_alert_count(record: Dict[str, Any]) -> int:
+    day_key = _utc_day_key()
+    per_day = record.get("daily_alert_counts", {})
+    if not isinstance(per_day, dict):
+        return 0
+    try:
+        return int(per_day.get(day_key, 0) or 0)
+    except Exception:
+        return 0
+
+
+def _increment_daily_alert_count(record: Dict[str, Any]) -> None:
+    day_key = _utc_day_key()
+    per_day = record.get("daily_alert_counts", {})
+    if not isinstance(per_day, dict):
+        per_day = {}
+    # Limpieza simple: conservar solo hoy y ayer para no crecer infinito.
+    keep: Dict[str, Any] = {}
+    for k, v in per_day.items():
+        if k == day_key:
+            keep[k] = v
+            continue
+        try:
+            dt = datetime.strptime(k, "%Y-%m-%d").replace(tzinfo=pytz.UTC)
+            if (datetime.now(pytz.UTC) - dt).days <= 1:
+                keep[k] = v
+        except Exception:
+            continue
+    keep[day_key] = int(keep.get(day_key, 0) or 0) + 1
+    record["daily_alert_counts"] = keep
+
+
+def _quality_window_bars(interval: str, precision_cfg: Dict[str, Any]) -> int:
+    default_bars = max(1, int(precision_cfg.get("quality_window_bars", 12)))
+    raw = precision_cfg.get("quality_window_bars_by_interval", {})
+    if isinstance(raw, dict):
+        try:
+            return max(1, int(raw.get(interval, default_bars)))
+        except Exception:
+            return default_bars
+    return default_bars
+
+
+def _append_quality_event(record: Dict[str, Any], event: Dict[str, Any]) -> None:
+    history = record.get("quality_history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append(event)
+    record["quality_history"] = history[-120:]
+
+
+def _update_quality_stats(record: Dict[str, Any], outcome: str) -> None:
+    stats = record.get("quality_stats", {})
+    if not isinstance(stats, dict):
+        stats = {}
+    total = int(stats.get("total", 0) or 0) + 1
+    wins = int(stats.get("wins", 0) or 0)
+    losses = int(stats.get("losses", 0) or 0)
+    timeouts = int(stats.get("timeouts", 0) or 0)
+    replaced = int(stats.get("replaced", 0) or 0)
+
+    if outcome == "win":
+        wins += 1
+    elif outcome == "loss":
+        losses += 1
+    elif outcome == "timeout":
+        timeouts += 1
+    elif outcome == "replaced":
+        replaced += 1
+
+    resolved = wins + losses + timeouts
+    accuracy = (wins / resolved * 100.0) if resolved > 0 else 0.0
+    stats.update(
+        {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "timeouts": timeouts,
+            "replaced": replaced,
+            "resolved": resolved,
+            "accuracy_pct": round(accuracy, 2),
+            "updated_utc": _now_iso_utc(),
+        }
+    )
+    record["quality_stats"] = stats
+
+
+def _open_alert_snapshot(
+    estado: Dict[str, Any],
+    precision: Dict[str, Any],
+    compute_ctx: Dict[str, Any],
+    precision_cfg: Dict[str, Any],
+) -> Dict[str, Any] | None:
+    direction = str(estado.get("direccion_v13", "")).upper().strip()
+    entry_price = _safe_float(estado.get("precio_alerta"), 0.0)
+    interval = str(precision.get("interval", compute_ctx.get("interval", ""))).strip() or "15m"
+    if direction not in {"ALCISTA", "BAJISTA"} or entry_price <= 0:
+        return None
+
+    df_ind = compute_ctx.get("df_ind")
+    atr14 = _atr14_from_df(df_ind) if isinstance(df_ind, pd.DataFrame) else 0.0
+    if atr14 <= 0:
+        atr14 = max(entry_price * 0.002, 1e-6)
+
+    risk_1r = atr14
+    if direction == "ALCISTA":
+        tp_price = entry_price + risk_1r
+        sl_price = entry_price - risk_1r
+    else:
+        tp_price = entry_price - risk_1r
+        sl_price = entry_price + risk_1r
+
+    return {
+        "status": "open",
+        "opened_utc": _now_iso_utc(),
+        "opened_bar_utc": str(estado.get("indice_alerta_utc", "")).strip(),
+        "last_bar_utc": str(estado.get("indice_alerta_utc", "")).strip(),
+        "bars_elapsed": 0,
+        "max_bars": _quality_window_bars(interval, precision_cfg),
+        "interval": interval,
+        "direction": direction,
+        "entry_price": round(entry_price, 10),
+        "risk_1r": round(risk_1r, 10),
+        "tp_price": round(tp_price, 10),
+        "sl_price": round(sl_price, 10),
+        "confidence_score": int(precision.get("confidence_score", 0) or 0),
+        "rr_estimado": _safe_float(precision.get("rr"), 0.0),
+        "reasons": list(precision.get("reasons", [])),
+    }
+
+
+def _evaluate_open_alert_outcome(
+    record: Dict[str, Any],
+    estado: Dict[str, Any],
+    compute_ctx: Dict[str, Any],
+) -> None:
+    open_alert = record.get("open_alert")
+    if not isinstance(open_alert, dict):
+        return
+    if str(open_alert.get("status", "")).strip().lower() != "open":
+        return
+
+    df_ind = compute_ctx.get("df_ind")
+    if not isinstance(df_ind, pd.DataFrame) or df_ind.empty:
+        return
+
+    last_row = df_ind.iloc[-1]
+    high = _safe_float(last_row.get("High"), 0.0)
+    low = _safe_float(last_row.get("Low"), 0.0)
+    close = _safe_float(last_row.get("Close"), 0.0)
+    bar_utc = str(estado.get("indice_alerta_utc", "")).strip()
+    last_bar = str(open_alert.get("last_bar_utc", "")).strip()
+    bars_elapsed = int(open_alert.get("bars_elapsed", 0) or 0)
+
+    if bar_utc and bar_utc != last_bar:
+        bars_elapsed += 1
+        open_alert["last_bar_utc"] = bar_utc
+    open_alert["bars_elapsed"] = bars_elapsed
+    open_alert["last_price"] = round(close, 10)
+
+    direction = str(open_alert.get("direction", "")).upper().strip()
+    tp_price = _safe_float(open_alert.get("tp_price"), 0.0)
+    sl_price = _safe_float(open_alert.get("sl_price"), 0.0)
+    max_bars = max(1, int(open_alert.get("max_bars", 12) or 12))
+
+    win_hit = False
+    loss_hit = False
+    if direction == "ALCISTA":
+        win_hit = high >= tp_price > 0
+        loss_hit = low <= sl_price < tp_price
+    elif direction == "BAJISTA":
+        win_hit = low <= tp_price > 0
+        loss_hit = high >= sl_price > tp_price
+
+    outcome = ""
+    note = ""
+    if win_hit and loss_hit:
+        # Conservador: si en la misma vela toca TP y SL, lo marcamos como loss.
+        outcome = "loss"
+        note = "tp_y_sl_misma_vela"
+    elif win_hit:
+        outcome = "win"
+        note = "tp_alcanzado"
+    elif loss_hit:
+        outcome = "loss"
+        note = "sl_alcanzado"
+    elif bars_elapsed >= max_bars:
+        outcome = "timeout"
+        note = "ventana_expirada"
+
+    if not outcome:
+        record["open_alert"] = open_alert
+        return
+
+    open_alert["status"] = outcome
+    open_alert["closed_utc"] = _now_iso_utc()
+    open_alert["bars_elapsed"] = bars_elapsed
+    open_alert["close_price"] = round(close, 10)
+    open_alert["outcome_note"] = note
+
+    _append_quality_event(record, dict(open_alert))
+    _update_quality_stats(record, outcome)
+    record["last_quality_outcome"] = outcome
+    record["open_alert"] = None
+
+
+def _should_alert(
+    record: Dict[str, Any],
+    signal_ready: bool,
+    cooldown_minutes: int,
+    persistence_bars: int,
+    max_alerts_per_symbol_day: int,
+) -> bool:
+    if not signal_ready:
+        return False
+
+    streak = int(record.get("dorado_streak", 0) or 0)
+    if streak < max(1, int(persistence_bars)):
         return False
 
     was_dorado = bool(record.get("dorado_active", False))
     if was_dorado:
+        return False
+
+    if max_alerts_per_symbol_day > 0 and _daily_alert_count(record) >= max_alerts_per_symbol_day:
         return False
 
     last_alert_iso = str(record.get("last_alert_utc", "")).strip()
@@ -620,7 +1346,55 @@ def _build_watchlist(cfg: Dict[str, Any]) -> List[MarketItem]:
                 )
             )
 
+    if bool(cfg.get("scan_gold", True)):
+        selected_gold = cfg.get("gold_symbols", list(GOLD_MAP.keys()))
+        for symbol in selected_gold:
+            row = GOLD_MAP.get(symbol)
+            if not row:
+                logging.warning("Instrumento de oro desconocido en config: %s", symbol)
+                continue
+            watchlist.append(
+                MarketItem(
+                    market="Oro",
+                    label=symbol,
+                    ticker=row["ticker"],
+                    td_symbol=row.get("td", ""),
+                    kind="gold",
+                )
+            )
+
     return watchlist
+
+
+def _confirmation_hint(direction: str, pattern: str) -> str:
+    direction = str(direction or "").upper().strip()
+    pattern = str(pattern or "").strip().lower()
+
+    if direction == "ALCISTA":
+        if pattern in {"envolvente_alcista", "rechazo_alcista"}:
+            return "continuidad alcista o retesteo con rechazo alcista."
+        return "vela alcista de continuidad o retesteo con rechazo."
+    if direction == "BAJISTA":
+        if pattern in {"envolvente_bajista", "rechazo_bajista"}:
+            return "continuidad bajista o retesteo con rechazo bajista."
+        return "vela bajista de continuidad o retesteo con rechazo."
+    return "confirmacion clara de direccion antes de operar."
+
+
+def _mentor_line(direction: str, riesgo: str, confidence: Any) -> str:
+    direction = str(direction or "").upper().strip()
+    riesgo_norm = str(riesgo or "").strip().lower()
+    conf = int(_safe_float(confidence, 0))
+
+    if riesgo_norm in {"alto", "muy alto"}:
+        return "Mentor: Riesgo elevado, prioriza proteger capital y reduce tamaño."
+    if conf and conf < 85:
+        return "Mentor: Señal valida, pero sin prisa; opera solo con confirmacion limpia."
+    if direction == "ALCISTA":
+        return "Mentor: No persigas precio; si no confirma alcista, no hay operacion."
+    if direction == "BAJISTA":
+        return "Mentor: No persigas precio; si no confirma bajista, no hay operacion."
+    return "Mentor: Contexto mixto; espera mejor estructura."
 
 
 def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str, Any], source: str) -> Tuple[str, str]:
@@ -637,47 +1411,30 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     if not temporalidad:
         temporalidad = "1D + 4H" if "1d+4h" in modo.lower().replace(" ", "") else str(cfg.get("interval", "15m"))
 
-    temporalidad_norm = temporalidad.lower().replace(" ", "")
-    if temporalidad_norm in {"5m", "15m", "30m"}:
-        modo_label = "Estructural"
-    elif temporalidad_norm in {"1d+4h", "1d_4h"}:
-        modo_label = "Tendencial"
-    else:
-        modo_lower = modo.lower()
-        if "estructural" in modo_lower:
-            modo_label = "Estructural"
-        elif "tendencial" in modo_lower:
-            modo_label = "Tendencial"
-        else:
-            modo_label = modo
-
     rr_text = str(rr).strip() if rr is not None else "N/A"
     score_text = str(score).strip() if score is not None else "N/A"
     umbral_text = str(umbral).strip() if umbral is not None else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
     indice_alerta_utc = str(estado.get("indice_alerta_utc", "")).strip() or "N/A"
-    resumen_text = str(resumen).strip()
-    if not resumen_text:
-        resumen_text = "Dorado activado."
+    confidence_text = str(estado.get("confidence_score", "N/A")).strip() or "N/A"
+    pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
+    confirmation_hint = _confirmation_hint(direction=direction, pattern=pattern_text)
+    mentor_text = _mentor_line(direction=direction, riesgo=riesgo, confidence=confidence_text)
 
     prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
-    subject = f"{prefix} DORADO ACTIVADO | {item.market} {item.label} | {item.ticker}"
+    subject = f"{prefix} DORADO | {item.ticker} | {temporalidad}"
 
     body = (
-        f"Dorado activado en {item.market} ({item.label})\n"
-        f"Ticker: {item.ticker}\n"
-        f"Modo: {modo_label}\n"
-        f"Timeframe: {temporalidad}\n"
         f"Direccion: {direction}\n"
-        f"Decision: {decision}\n"
-        f"Riesgo: {riesgo}\n"
-        f"Precio exacto (disparo): {precio_alerta_text}\n"
-        f"Indice vela UTC: {indice_alerta_utc}\n"
-        f"RR estimado: {rr}\n"
-        f"Fuente de datos: {source}\n"
-        f"Hora envio UTC: {_now_iso_utc()}\n\n"
-        f"Resumen:\n{resumen_text}\nR:R: {rr_text}\n"
-        f"Micro score/Umbral: {score_text}/{umbral_text}\n"
+        f"Accion: {decision}\n"
+        f"Entrada: {precio_alerta_text}\n"
+        f"R:R: {rr_text}\n"
+        f"Score: {score_text}/{umbral_text}\n"
+        f"Confianza: {confidence_text}%\n"
+        f"Vela UTC: {indice_alerta_utc}\n"
+        f"Patron: {pattern_text}\n\n"
+        f"Confirmacion: esperar {confirmation_hint}\n"
+        f"{mentor_text}"
     )
     return subject, body
 
@@ -689,60 +1446,114 @@ def _analysis_mode(cfg: Dict[str, Any]) -> str:
     return "tendencial"
 
 
-def _compute_estado(item: MarketItem, cfg: Dict[str, Any]) -> Tuple[Dict[str, Any] | None, str, str]:
-    mode = _analysis_mode(cfg)
+def _compute_estado(
+    item: MarketItem,
+    cfg: Dict[str, Any],
+    forced_mode: str | None = None,
+    forced_interval: str | None = None,
+) -> Tuple[Dict[str, Any] | None, str, str, Dict[str, Any]]:
+    precision_cfg = _resolve_precision_cfg(cfg)
+    require_closed_candle = bool(precision_cfg.get("require_closed_candle", True))
+    grace_seconds = int(precision_cfg.get("closed_candle_grace_sec", 10))
+    mode = str(forced_mode or _analysis_mode(cfg)).strip().lower()
     if mode == "estructural":
         df_1d, source_1d, err_1d = _fetch_data(item, period="3y", interval="1d")
         if df_1d is None or df_1d.empty:
-            return None, "", f"1D: {err_1d or 'sin datos'}"
+            return None, "", f"1D: {err_1d or 'sin datos'}", {}
 
         df_4h, source_4h, err_4h = _fetch_data(item, period="12mo", interval="4h")
         if df_4h is None or df_4h.empty:
-            return None, "", f"4H: {err_4h or 'sin datos'}"
+            return None, "", f"4H: {err_4h or 'sin datos'}", {}
+
+        df_1d_ready, ok_1d, _ = _prepare_df_for_closed_candle(
+            df_1d,
+            interval="1d",
+            require_closed_candle=require_closed_candle,
+            grace_seconds=grace_seconds,
+        )
+        if not ok_1d or df_1d_ready.empty:
+            return None, "", "1D sin velas cerradas suficientes.", {}
+
+        df_4h_ready, ok_4h, trimmed_4h = _prepare_df_for_closed_candle(
+            df_4h,
+            interval="4h",
+            require_closed_candle=require_closed_candle,
+            grace_seconds=grace_seconds,
+        )
+        if not ok_4h or df_4h_ready.empty:
+            return None, "", "4H sin velas cerradas suficientes.", {}
 
         try:
-            df_1d_ind = calcular_indicadores(df_1d)
-            df_4h_ind = calcular_indicadores(df_4h)
+            df_1d_ind = calcular_indicadores(df_1d_ready)
+            df_4h_ind = calcular_indicadores(df_4h_ready)
             estado = construir_estado_final_estructural(df_1d_ind, df_4h_ind, impacto_memoria=0)
         except Exception as exc:
-            return None, "", f"Error estructural: {exc}"
+            return None, "", f"Error estructural: {exc}", {}
 
         if not isinstance(estado, dict):
-            return None, "", "Estado estructural invalido."
-        estado["modo_alerta"] = "Tendencial (1D+4H)"
+            return None, "", "Estado estructural invalido.", {}
+        estado["modo_alerta"] = "Estructural (1D+4H)"
         estado["temporalidad_alerta"] = "1D + 4H"
         try:
             estado["precio_alerta"] = float(df_4h_ind["Close"].iloc[-1])
         except Exception:
             estado["precio_alerta"] = None
         estado["indice_alerta_utc"] = _index_to_iso_utc(df_4h_ind.index[-1]) if len(df_4h_ind.index) else ""
-        return estado, f"1D:{source_1d} | 4H:{source_4h}", ""
+        vol_ratio = _atr_ratio_from_df(df_4h_ind)
+        estado["vol_ratio"] = round(vol_ratio, 4)
+        estado["analysis_interval"] = "4h"
+        estado["open_candle_trimmed"] = bool(trimmed_4h)
+        ctx = {
+            "interval": "4h",
+            "df_ind": df_4h_ind,
+            "vol_ratio": vol_ratio,
+            "open_candle_trimmed": bool(trimmed_4h),
+        }
+        return estado, f"1D:{source_1d} | 4H:{source_4h}", "", ctx
 
-    interval = str(cfg.get("interval", "15m"))
+    interval = str(forced_interval or cfg.get("interval", "15m")).strip().lower()
+    if interval not in TD_INTERVAL_MAP:
+        interval = "15m"
     period = str(cfg.get("period", "5d"))
     df, source, fetch_err = _fetch_data(item, period=period, interval=interval)
     if df is None or df.empty:
-        return None, "", fetch_err or "No se pudieron descargar velas."
+        return None, "", fetch_err or "No se pudieron descargar velas.", {}
+
+    df_ready, ready_ok, trimmed_open = _prepare_df_for_closed_candle(
+        df,
+        interval=interval,
+        require_closed_candle=require_closed_candle,
+        grace_seconds=grace_seconds,
+    )
+    if not ready_ok or df_ready.empty:
+        return None, "", "Sin velas cerradas suficientes para analisis.", {}
 
     try:
-        df_ind = calcular_indicadores(df)
+        df_ind = calcular_indicadores(df_ready)
         estado = construir_estado_final(df_ind, impacto_memoria=0)
     except Exception as exc:
-        return None, "", f"Error calculando estado: {exc}"
+        return None, "", f"Error calculando estado: {exc}", {}
 
     if not isinstance(estado, dict):
-        return None, "", "Estado tendencial invalido."
-    if interval in {"5m", "15m", "30m"}:
-        estado["modo_alerta"] = "Estructural"
-    else:
-        estado["modo_alerta"] = "Tendencial"
+        return None, "", "Estado tendencial invalido.", {}
+    estado["modo_alerta"] = "Tendencial"
     estado["temporalidad_alerta"] = interval
     try:
         estado["precio_alerta"] = float(df_ind["Close"].iloc[-1])
     except Exception:
         estado["precio_alerta"] = None
     estado["indice_alerta_utc"] = _index_to_iso_utc(df_ind.index[-1]) if len(df_ind.index) else ""
-    return estado, source, ""
+    vol_ratio = _atr_ratio_from_df(df_ind)
+    estado["vol_ratio"] = round(vol_ratio, 4)
+    estado["analysis_interval"] = interval
+    estado["open_candle_trimmed"] = bool(trimmed_open)
+    ctx = {
+        "interval": interval,
+        "df_ind": df_ind,
+        "vol_ratio": vol_ratio,
+        "open_candle_trimmed": bool(trimmed_open),
+    }
+    return estado, source, "", ctx
 
 
 def _send_email_alert(
@@ -920,9 +1731,177 @@ def _channel_enabled(cfg: Dict[str, Any], channel: str, default: bool = True) ->
     return bool(raw)
 
 
+def _apply_precision_filters(
+    item: MarketItem,
+    cfg: Dict[str, Any],
+    estado: Dict[str, Any],
+    compute_ctx: Dict[str, Any],
+    mtf_cache: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    precision_cfg = _resolve_precision_cfg(cfg)
+    enabled = bool(precision_cfg.get("enabled", True))
+
+    dorado = estado.get("dorado_v13") or {}
+    dorado_now = bool(dorado)
+    direction = str(estado.get("direccion_v13", "NEUTRAL")).upper().strip() or "NEUTRAL"
+    interval = str(compute_ctx.get("interval") or estado.get("analysis_interval") or cfg.get("interval", "15m")).strip()
+    vol_ratio = _safe_float(compute_ctx.get("vol_ratio", estado.get("vol_ratio", 1.0)), 1.0)
+    df_ind = compute_ctx.get("df_ind")
+    rr = _safe_float(dorado.get("rr_estimado"), 0.0)
+
+    mtf_enabled = enabled and bool(precision_cfg.get("multi_timeframe_filter", True))
+    if mtf_enabled:
+        mtf_info = _evaluate_mtf_alignment(
+            item=item,
+            base_interval=interval,
+            base_direction=direction,
+            precision_cfg=precision_cfg,
+            cache=mtf_cache,
+        )
+    else:
+        mtf_info = {
+            "ok": True,
+            "score": 12,
+            "details": [],
+            "summary": "Filtro MTF deshabilitado.",
+            "confirmations": 0,
+            "opposites": 0,
+        }
+
+    candle_info = _detect_price_action(df_ind, direction)
+    require_price_action = enabled and bool(precision_cfg.get("require_price_action_confirmation", True))
+    candle_ok = bool(candle_info.get("aligned", False)) if require_price_action else (str(candle_info.get("bias")) != _opposite_direction(direction))
+
+    rr_min = _safe_float(precision_cfg.get("min_rr", 1.8), 1.8) if enabled else 0.0
+    rr_ok = rr >= rr_min
+
+    confidence_score = _compute_signal_confidence(estado=estado, mtf_info=mtf_info, candle_info=candle_info)
+    min_confidence = _compute_dynamic_min_confidence(
+        base_interval=interval,
+        vol_ratio=vol_ratio,
+        precision_cfg=precision_cfg,
+    ) if enabled else 0
+    confidence_ok = confidence_score >= min_confidence
+
+    cooldown_effective = _compute_adaptive_cooldown_minutes(
+        cfg=cfg,
+        base_interval=interval,
+        vol_ratio=vol_ratio,
+        precision_cfg=precision_cfg,
+    ) if enabled else max(1, int(cfg.get("cooldown_minutes", 60)))
+
+    mtf_ok = bool(mtf_info.get("ok", True))
+    signal_ready = dorado_now and (not enabled or (mtf_ok and candle_ok and rr_ok and confidence_ok))
+
+    reasons: List[str] = []
+    if not dorado_now:
+        reasons.append("dorado_inactivo")
+    if enabled and not mtf_ok:
+        reasons.append("mtf_no_alineado")
+    if enabled and not candle_ok:
+        reasons.append("vela_sin_confirmacion")
+    if enabled and not rr_ok:
+        reasons.append(f"rr_bajo(<{rr_min})")
+    if enabled and not confidence_ok:
+        reasons.append(f"confianza_baja(<{min_confidence})")
+    if not reasons:
+        reasons.append("filtros_ok")
+
+    return {
+        "enabled": enabled,
+        "signal_ready": signal_ready,
+        "dorado_now": dorado_now,
+        "confidence_score": confidence_score,
+        "min_confidence": min_confidence,
+        "rr": rr,
+        "min_rr": rr_min,
+        "rr_ok": rr_ok,
+        "mtf": mtf_info,
+        "candle": candle_info,
+        "cooldown_minutes": cooldown_effective,
+        "reasons": reasons,
+        "interval": interval,
+        "vol_ratio": vol_ratio,
+    }
+
+
+def _resolve_scan_targets(cfg: Dict[str, Any]) -> List[Dict[str, str]]:
+    targets: List[Dict[str, str]] = []
+    auto_multi = bool(cfg.get("auto_multi_interval", True))
+
+    if auto_multi:
+        raw_intervals = cfg.get("scan_intervals", ["15m", "30m", "1h", "4h"])
+        if not isinstance(raw_intervals, list):
+            raw_intervals = ["15m", "30m", "1h", "4h"]
+        seen = set()
+        for raw in raw_intervals:
+            iv = str(raw).strip().lower()
+            if iv not in TD_INTERVAL_MAP:
+                continue
+            if iv in seen:
+                continue
+            seen.add(iv)
+            targets.append(
+                {
+                    "mode": "tendencial",
+                    "interval": iv,
+                    "key": iv,
+                    "label": iv,
+                }
+            )
+    else:
+        mode = _analysis_mode(cfg)
+        if mode == "estructural":
+            targets.append(
+                {
+                    "mode": "estructural",
+                    "interval": "1D + 4H",
+                    "key": "1d_4h",
+                    "label": "1D + 4H",
+                }
+            )
+        else:
+            iv = str(cfg.get("interval", "15m")).strip().lower()
+            if iv not in TD_INTERVAL_MAP:
+                iv = "15m"
+            targets.append(
+                {
+                    "mode": "tendencial",
+                    "interval": iv,
+                    "key": iv,
+                    "label": iv,
+                }
+            )
+
+    if bool(cfg.get("scan_structural_1d_4h", True)):
+        if not any(str(t.get("mode", "")).lower() == "estructural" for t in targets):
+            targets.append(
+                {
+                    "mode": "estructural",
+                    "interval": "1D + 4H",
+                    "key": "1d_4h",
+                    "label": "1D + 4H",
+                }
+            )
+
+    if not targets:
+        targets.append(
+            {
+                "mode": "tendencial",
+                "interval": "15m",
+                "key": "15m",
+                "label": "15m",
+            }
+        )
+    return targets
+
+
 def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
-    cooldown = int(cfg.get("cooldown_minutes", 60))
+    precision_cfg = _resolve_precision_cfg(cfg)
+    persistence_bars = max(1, int(precision_cfg.get("persistence_bars", 1)))
+    max_alerts_per_symbol_day = max(0, int(precision_cfg.get("max_alerts_per_symbol_day", 0)))
     watchlist = _build_watchlist(cfg)
+    scan_targets = _resolve_scan_targets(cfg)
 
     if not watchlist:
         logging.warning("Watchlist vacia. Revisa scanner_config.json")
@@ -936,203 +1915,288 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
         if discover_err:
             logging.warning("Telegram getUpdates: %s", discover_err)
     telegram_broadcast_ids = _dedupe_chat_ids(configured_telegram_chat_ids + auto_telegram_chat_ids)
+    mtf_cache: Dict[str, Dict[str, Any]] = {}
 
     for item in watchlist:
-        record = symbols_state.get(item.state_key, {})
-        record["last_checked_utc"] = _now_iso_utc()
-
         if not _market_open(item.kind):
-            record["market_open"] = False
-            record["last_error"] = ""
-            symbols_state[item.state_key] = record
             logging.debug("[%s] Mercado cerrado, se omite ciclo.", item.state_key)
+            for target in scan_targets:
+                record_key = f"{item.state_key}|{target['key']}"
+                record = symbols_state.get(record_key, {})
+                record["last_checked_utc"] = _now_iso_utc()
+                record["market_open"] = False
+                record["scan_target"] = target.get("label", target.get("interval", ""))
+                record["last_error"] = ""
+                symbols_state[record_key] = record
             continue
 
-        record["market_open"] = True
+        for target in scan_targets:
+            target_mode = str(target.get("mode", "tendencial")).strip().lower()
+            target_interval = str(target.get("interval", "15m")).strip()
+            target_key = str(target.get("key", target_interval)).strip().lower() or target_interval.lower()
+            record_key = f"{item.state_key}|{target_key}"
 
-        estado, source, compute_err = _compute_estado(item, cfg)
-        if estado is None:
-            record["last_error"] = compute_err or "No se pudo calcular estado."
-            symbols_state[item.state_key] = record
-            logging.warning("[%s] Error de datos/estado: %s", item.state_key, record["last_error"])
-            continue
+            record = symbols_state.get(record_key, {})
+            record["last_checked_utc"] = _now_iso_utc()
+            record["market_open"] = True
+            record["scan_target"] = target.get("label", target_interval)
 
-        dorado = estado.get("dorado_v13")
-        dorado_now = bool(dorado)
+            estado, source, compute_err, compute_ctx = _compute_estado(
+                item=item,
+                cfg=cfg,
+                forced_mode=target_mode,
+                forced_interval=target_interval if target_mode != "estructural" else None,
+            )
+            if estado is None:
+                record["last_error"] = compute_err or "No se pudo calcular estado."
+                symbols_state[record_key] = record
+                logging.warning("[%s|%s] Error de datos/estado: %s", item.state_key, target_key, record["last_error"])
+                continue
 
-        if _should_alert(record, dorado_now, cooldown_minutes=cooldown):
-            subject, body = _build_alert_payload(cfg, item, estado, source)
-            notify_status: Dict[str, Any] = {}
-            sent_any = False
-            errors: List[str] = []
-            enabled_any = False
-            user_targets = _load_user_targets()
-            market_key = f"{item.market}|{item.label}"
+            precision = _apply_precision_filters(
+                item=item,
+                cfg=cfg,
+                estado=estado,
+                compute_ctx=compute_ctx,
+                mtf_cache=mtf_cache,
+            )
+            _evaluate_open_alert_outcome(record=record, estado=estado, compute_ctx=compute_ctx)
+            signal_ready = bool(precision.get("signal_ready", False))
+            signal_bar_utc = str(estado.get("indice_alerta_utc", "")).strip()
+            prev_gate_bar = str(record.get("last_gate_bar_utc", "")).strip()
+            prev_streak = int(record.get("dorado_streak", 0) or 0)
 
-            if user_targets:
-                user_results: List[Dict[str, Any]] = []
-                premium_users_alerted = False
-                eligible_users = 0
+            if signal_ready:
+                if signal_bar_utc and signal_bar_utc != prev_gate_bar:
+                    current_streak = prev_streak + 1
+                elif signal_bar_utc and signal_bar_utc == prev_gate_bar:
+                    current_streak = prev_streak
+                else:
+                    current_streak = prev_streak + 1
+            else:
+                current_streak = 0
 
-                telegram_enabled = _channel_enabled(cfg, "telegram", default=True)
-                email_enabled = _channel_enabled(cfg, "email", default=True)
-                windows_enabled = _channel_enabled(cfg, "windows", default=True)
+            record["dorado_streak"] = current_streak
+            if signal_bar_utc:
+                record["last_gate_bar_utc"] = signal_bar_utc
 
-                if telegram_enabled:
-                    enabled_any = True
-                if email_enabled:
-                    enabled_any = True
-                if windows_enabled:
-                    enabled_any = True
+            estado["confidence_score"] = precision.get("confidence_score")
+            estado["min_confidence_required"] = precision.get("min_confidence")
+            estado["mtf_summary"] = precision.get("mtf", {}).get("summary", "")
+            estado["mtf_details"] = precision.get("mtf", {}).get("details", [])
+            estado["candle_pattern"] = precision.get("candle", {}).get("pattern", "sin_patron")
+            estado["candle_pattern_desc"] = precision.get("candle", {}).get("description", "")
+            estado["cooldown_minutes_effective"] = precision.get("cooldown_minutes")
+            estado["vol_ratio"] = round(_safe_float(precision.get("vol_ratio", estado.get("vol_ratio", 1.0)), 1.0), 4)
+            estado["filtros_precision"] = precision.get("reasons", [])
+            record["last_gate_reasons"] = precision.get("reasons", [])
+            record["last_confidence_score"] = precision.get("confidence_score")
+            record["last_rr"] = precision.get("rr")
+            record["last_candle_pattern"] = precision.get("candle", {}).get("pattern", "sin_patron")
+            record["last_mtf_summary"] = precision.get("mtf", {}).get("summary", "")
+            quality_stats = record.get("quality_stats", {}) if isinstance(record.get("quality_stats", {}), dict) else {}
+            estado["quality_accuracy_pct"] = quality_stats.get("accuracy_pct", 0.0)
+            estado["quality_resolved_alerts"] = int(quality_stats.get("resolved", 0) or 0)
 
-                for target in user_targets:
-                    user_id = target["id"]
-                    chat_id = target["chat_id"]
-                    email = target.get("email", "")
-                    is_premium = bool(target.get("es_premium", False))
+            if _should_alert(
+                record=record,
+                signal_ready=signal_ready,
+                cooldown_minutes=int(precision.get("cooldown_minutes", cfg.get("cooldown_minutes", 60))),
+                persistence_bars=persistence_bars,
+                max_alerts_per_symbol_day=max_alerts_per_symbol_day,
+            ):
+                subject, body = _build_alert_payload(cfg, item, estado, source)
+                notify_status: Dict[str, Any] = {}
+                sent_any = False
+                errors: List[str] = []
+                enabled_any = False
+                user_targets = _load_user_targets()
+                temporalidad = str(estado.get("temporalidad_alerta", target_interval)).strip()
+                market_key = f"{item.market}|{item.label}|{temporalidad}"
 
-                    if not is_premium and not _free_user_can_receive_market_alert(state, user_id, market_key):
-                        continue
+                if user_targets:
+                    user_results: List[Dict[str, Any]] = []
+                    premium_users_alerted = False
+                    eligible_users = 0
 
-                    eligible_users += 1
-                    user_notified = False
-                    user_errors: List[str] = []
+                    telegram_enabled = _channel_enabled(cfg, "telegram", default=True)
+                    email_enabled = _channel_enabled(cfg, "email", default=True)
+                    windows_enabled = _channel_enabled(cfg, "windows", default=True)
 
                     if telegram_enabled:
+                        enabled_any = True
+                    if email_enabled:
+                        enabled_any = True
+                    if windows_enabled:
+                        enabled_any = True
+
+                    for target_user in user_targets:
+                        user_id = target_user["id"]
+                        chat_id = target_user["chat_id"]
+                        email = target_user.get("email", "")
+                        is_premium = bool(target_user.get("es_premium", False))
+
+                        if not is_premium and not _free_user_can_receive_market_alert(state, user_id, market_key):
+                            continue
+
+                        eligible_users += 1
+                        user_notified = False
+                        user_errors: List[str] = []
+
+                        if telegram_enabled:
+                            sent_ok, sent_err = _send_telegram_alert(
+                                cfg,
+                                subject,
+                                body,
+                                chat_ids_override=[chat_id],
+                                item=item,
+                            )
+                            if sent_ok:
+                                user_notified = True
+                                sent_any = True
+                            else:
+                                user_errors.append(f"telegram: {sent_err}")
+
+                        if is_premium and email_enabled and email:
+                            sent_ok, sent_err = _send_email_alert(
+                                cfg,
+                                item,
+                                subject,
+                                body,
+                                recipients_override=[email],
+                            )
+                            if sent_ok:
+                                user_notified = True
+                                sent_any = True
+                            else:
+                                user_errors.append(f"email: {sent_err}")
+
+                        if user_notified and is_premium:
+                            premium_users_alerted = True
+
+                        if user_notified and not is_premium:
+                            _mark_free_user_market_alert(state, user_id, market_key)
+
+                        user_results.append(
+                            {
+                                "user_id": user_id,
+                                "premium": is_premium,
+                                "ok": user_notified,
+                                "error": "; ".join(user_errors),
+                            }
+                        )
+                        if user_errors and not user_notified:
+                            errors.append(f"{user_id}: {'; '.join(user_errors)}")
+
+                    notify_status["users"] = user_results
+                    known_user_chat_ids = _dedupe_chat_ids([t.get("chat_id", "") for t in user_targets])
+                    broadcast_extra_chat_ids = [cid for cid in telegram_broadcast_ids if cid not in set(known_user_chat_ids)]
+                    if telegram_enabled and broadcast_extra_chat_ids:
                         sent_ok, sent_err = _send_telegram_alert(
                             cfg,
                             subject,
                             body,
-                            chat_ids_override=[chat_id],
+                            chat_ids_override=broadcast_extra_chat_ids,
                             item=item,
                         )
+                        notify_status["telegram_broadcast"] = {
+                            "ok": sent_ok,
+                            "error": sent_err,
+                            "sent_to": len(broadcast_extra_chat_ids),
+                        }
                         if sent_ok:
-                            user_notified = True
                             sent_any = True
                         else:
-                            user_errors.append(f"telegram: {sent_err}")
+                            errors.append(f"telegram_broadcast: {sent_err}")
 
-                    if is_premium and email_enabled and email:
-                        sent_ok, sent_err = _send_email_alert(
+                    if eligible_users == 0:
+                        errors.append("Sin usuarios elegibles con Telegram para esta alerta.")
+
+                    if windows_enabled:
+                        if premium_users_alerted:
+                            sent_ok, sent_err = _send_windows_toast(subject, body)
+                            notify_status["windows"] = {"ok": sent_ok, "error": sent_err}
+                            if sent_ok:
+                                sent_any = True
+                            else:
+                                errors.append(f"windows: {sent_err}")
+                        else:
+                            notify_status["windows"] = {
+                                "ok": False,
+                                "error": "Sin usuarios premium alertados en este evento.",
+                            }
+                else:
+                    if _channel_enabled(cfg, "email", default=True):
+                        enabled_any = True
+                        sent_ok, sent_err = _send_email_alert(cfg, item, subject, body)
+                        notify_status["email"] = {"ok": sent_ok, "error": sent_err}
+                        if sent_ok:
+                            sent_any = True
+                        else:
+                            errors.append(f"email: {sent_err}")
+
+                    if _channel_enabled(cfg, "telegram", default=True):
+                        enabled_any = True
+                        sent_ok, sent_err = _send_telegram_alert(
                             cfg,
-                            item,
                             subject,
                             body,
-                            recipients_override=[email],
+                            chat_ids_override=telegram_broadcast_ids or None,
+                            item=item,
                         )
+                        notify_status["telegram"] = {"ok": sent_ok, "error": sent_err}
                         if sent_ok:
-                            user_notified = True
                             sent_any = True
                         else:
-                            user_errors.append(f"email: {sent_err}")
+                            errors.append(f"telegram: {sent_err}")
 
-                    if user_notified and is_premium:
-                        premium_users_alerted = True
-
-                    if user_notified and not is_premium:
-                        _mark_free_user_market_alert(state, user_id, market_key)
-
-                    user_results.append(
-                        {
-                            "user_id": user_id,
-                            "premium": is_premium,
-                            "ok": user_notified,
-                            "error": "; ".join(user_errors),
-                        }
-                    )
-                    if user_errors and not user_notified:
-                        errors.append(f"{user_id}: {'; '.join(user_errors)}")
-
-                notify_status["users"] = user_results
-                known_user_chat_ids = _dedupe_chat_ids([t.get("chat_id", "") for t in user_targets])
-                broadcast_extra_chat_ids = [cid for cid in telegram_broadcast_ids if cid not in set(known_user_chat_ids)]
-                if telegram_enabled and broadcast_extra_chat_ids:
-                    sent_ok, sent_err = _send_telegram_alert(
-                        cfg,
-                        subject,
-                        body,
-                        chat_ids_override=broadcast_extra_chat_ids,
-                        item=item,
-                    )
-                    notify_status["telegram_broadcast"] = {
-                        "ok": sent_ok,
-                        "error": sent_err,
-                        "sent_to": len(broadcast_extra_chat_ids),
-                    }
-                    if sent_ok:
-                        sent_any = True
-                    else:
-                        errors.append(f"telegram_broadcast: {sent_err}")
-
-                if eligible_users == 0:
-                    errors.append("Sin usuarios elegibles con Telegram para esta alerta.")
-
-                if windows_enabled:
-                    if premium_users_alerted:
+                    if _channel_enabled(cfg, "windows", default=True):
+                        enabled_any = True
                         sent_ok, sent_err = _send_windows_toast(subject, body)
                         notify_status["windows"] = {"ok": sent_ok, "error": sent_err}
                         if sent_ok:
                             sent_any = True
                         else:
                             errors.append(f"windows: {sent_err}")
-                    else:
-                        notify_status["windows"] = {
-                            "ok": False,
-                            "error": "Sin usuarios premium alertados en este evento.",
-                        }
-            else:
-                if _channel_enabled(cfg, "email", default=True):
-                    enabled_any = True
-                    sent_ok, sent_err = _send_email_alert(cfg, item, subject, body)
-                    notify_status["email"] = {"ok": sent_ok, "error": sent_err}
-                    if sent_ok:
-                        sent_any = True
-                    else:
-                        errors.append(f"email: {sent_err}")
 
-                if _channel_enabled(cfg, "telegram", default=True):
-                    enabled_any = True
-                    sent_ok, sent_err = _send_telegram_alert(
-                        cfg,
-                        subject,
-                        body,
-                        chat_ids_override=telegram_broadcast_ids or None,
-                        item=item,
+                    if not enabled_any:
+                        errors.append("No hay canales habilitados en notification.")
+
+                record["last_notify"] = notify_status
+                if sent_any:
+                    record["last_alert_utc"] = _now_iso_utc()
+                    _increment_daily_alert_count(record)
+                    snapshot = _open_alert_snapshot(
+                        estado=estado,
+                        precision=precision,
+                        compute_ctx=compute_ctx,
+                        precision_cfg=precision_cfg,
                     )
-                    notify_status["telegram"] = {"ok": sent_ok, "error": sent_err}
-                    if sent_ok:
-                        sent_any = True
-                    else:
-                        errors.append(f"telegram: {sent_err}")
+                    if snapshot is not None:
+                        existing_open = record.get("open_alert")
+                        if isinstance(existing_open, dict) and str(existing_open.get("status", "")).strip().lower() == "open":
+                            existing_open["status"] = "replaced"
+                            existing_open["closed_utc"] = _now_iso_utc()
+                            existing_open["outcome_note"] = "reemplazada_por_nueva_alerta"
+                            _append_quality_event(record, dict(existing_open))
+                            _update_quality_stats(record, "replaced")
+                        record["open_alert"] = snapshot
+                    logging.info("[%s|%s] Alerta enviada (multicanal).", item.state_key, target_key)
+                else:
+                    record["last_error"] = "; ".join(errors)
+                    logging.error("[%s|%s] Fallo envio alerta: %s", item.state_key, target_key, record["last_error"])
 
-                if _channel_enabled(cfg, "windows", default=True):
-                    enabled_any = True
-                    sent_ok, sent_err = _send_windows_toast(subject, body)
-                    notify_status["windows"] = {"ok": sent_ok, "error": sent_err}
-                    if sent_ok:
-                        sent_any = True
-                    else:
-                        errors.append(f"windows: {sent_err}")
-
-                if not enabled_any:
-                    errors.append("No hay canales habilitados en notification.")
-
-            record["last_notify"] = notify_status
-            if sent_any:
-                record["last_alert_utc"] = _now_iso_utc()
-                logging.info("[%s] Alerta enviada (multicanal).", item.state_key)
-            else:
-                record["last_error"] = "; ".join(errors)
-                logging.error("[%s] Fallo envio alerta: %s", item.state_key, record["last_error"])
-
-        record["dorado_active"] = dorado_now
-        record["last_source"] = source
-        record["decision"] = estado.get("decision", "")
-        record["riesgo"] = estado.get("riesgo", "")
-        record["direccion"] = estado.get("direccion_v13", "")
-        if not record.get("last_error"):
-            record["last_error"] = ""
-        symbols_state[item.state_key] = record
+            record["dorado_active"] = signal_ready
+            record["last_source"] = source
+            record["decision"] = estado.get("decision", "")
+            record["riesgo"] = estado.get("riesgo", "")
+            record["direccion"] = estado.get("direccion_v13", "")
+            record["analysis_interval"] = precision.get("interval")
+            record["cooldown_minutes_effective"] = precision.get("cooldown_minutes")
+            record["daily_alert_count"] = _daily_alert_count(record)
+            if not record.get("last_error"):
+                record["last_error"] = ""
+            symbols_state[record_key] = record
 
     return state
 
