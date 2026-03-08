@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
+import re
 import smtplib
 import subprocess
 import time
+from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.message import EmailMessage
@@ -29,7 +32,9 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = ROOT / "scanner_config.json"
 DEFAULT_STATE_PATH = ROOT / "scanner_state.json"
 DEFAULT_LOG_PATH = ROOT / "scanner.log"
+DEFAULT_HEALTH_PATH = ROOT / "scanner_health.json"
 USERS_DB_PATH = ROOT / "usuarios_db.json"
+LOCK_PATH = ROOT / "scanner_worker.lock"
 TELEGRAM_AUTO_CHAT_IDS_KEY = "telegram_auto_chat_ids"
 TELEGRAM_LAST_UPDATE_ID_KEY = "telegram_last_update_id"
 
@@ -81,6 +86,19 @@ CRYPTO_COINMARKETCAP_IDS = {
     "WLD": 24091,
 }
 
+SENSITIVE_ENV_KEYS = [
+    "TELEGRAM_BOT_TOKEN",
+    "SMTP_PASSWORD",
+    "SMTP_USER",
+    "SMTP_FROM",
+    "AUTH_COOKIE_PASSWORD",
+    "PREMIUM_ACCESS_CODE",
+]
+
+TOKEN_PATTERN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+CHAT_ID_PATTERN = re.compile(r"(?:(?<=^)|(?<=[\s,;]))-?\d{8,}(?=\s*:)")
+
 
 @dataclass(frozen=True)
 class MarketItem:
@@ -93,6 +111,175 @@ class MarketItem:
     @property
     def state_key(self) -> str:
         return f"{self.market}|{self.label}|{self.ticker}"
+
+
+def _sensitive_env_values() -> List[str]:
+    values: List[str] = []
+    for key in SENSITIVE_ENV_KEYS:
+        raw = str(os.getenv(key, "")).strip()
+        if len(raw) >= 4:
+            values.append(raw)
+    return values
+
+
+def _redact_text(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return text
+
+    for secret in _sensitive_env_values():
+        if secret and secret in text:
+            text = text.replace(secret, "***REDACTED***")
+
+    text = TOKEN_PATTERN.sub("<redacted-token>", text)
+    text = CHAT_ID_PATTERN.sub("<redacted-chat-id>", text)
+    text = EMAIL_PATTERN.sub("<redacted-email>", text)
+    return text
+
+
+class _SecretRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str):
+                record.msg = _redact_text(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(_redact_text(arg) if isinstance(arg, str) else arg for arg in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: (_redact_text(v) if isinstance(v, str) else v) for k, v in record.args.items()}
+        except Exception:
+            return True
+        return True
+
+
+def _resolve_resource_profile(cfg: Dict[str, Any]) -> str:
+    env_profile = str(os.getenv("SCANNER_RESOURCE_PROFILE", "")).strip().lower()
+    if env_profile:
+        return env_profile
+    cfg_profile = str(cfg.get("resource_profile", "")).strip().lower()
+    if cfg_profile:
+        return cfg_profile
+    if os.getenv("RENDER", "").strip().lower() in {"1", "true", "yes"}:
+        return "render_512mb"
+    return "default"
+
+
+def _resource_profile_active(cfg: Dict[str, Any], profile_name: str) -> bool:
+    return _resolve_resource_profile(cfg) == profile_name
+
+
+def _current_process_rss_mb() -> float:
+    try:
+        if os.name == "nt":
+            # Windows: psapi via tasklist fallback avoids extra dependencies.
+            pid = os.getpid()
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=4,
+                check=False,
+            )
+            out = (proc.stdout or "").strip()
+            if not out or out.startswith("INFO:"):
+                return 0.0
+            parts = [p.strip().strip('"') for p in out.split(",")]
+            # Mem usage field e.g. "123,456 K"
+            if len(parts) >= 5:
+                mem_text = parts[4].replace(".", "").replace(",", "").replace("K", "").strip()
+                kb = float(mem_text)
+                return round(kb / 1024.0, 2)
+            return 0.0
+
+        # Linux/macOS
+        statm = Path("/proc/self/statm")
+        if statm.exists():
+            raw = statm.read_text(encoding="utf-8").strip().split()
+            if len(raw) >= 2:
+                rss_pages = float(raw[1])
+                page_size = float(os.sysconf("SC_PAGE_SIZE"))
+                return round((rss_pages * page_size) / (1024.0 * 1024.0), 2)
+    except Exception:
+        return 0.0
+    return 0.0
+
+
+def _trim_df_for_interval(df: pd.DataFrame | None, interval: str, cfg: Dict[str, Any]) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return df
+
+    max_rows_default = 720
+    max_rows_map = {
+        "1m": 900,
+        "5m": 800,
+        "15m": 720,
+        "30m": 640,
+        "1h": 560,
+        "4h": 520,
+        "1d": 500,
+    }
+    max_rows = max_rows_map.get(str(interval).strip().lower(), max_rows_default)
+
+    raw_cfg = cfg.get("runtime_limits", {})
+    if isinstance(raw_cfg, dict):
+        try:
+            max_rows = int(raw_cfg.get("max_rows_default", max_rows))
+        except Exception:
+            pass
+        interval_map = raw_cfg.get("max_rows_by_interval", {})
+        if isinstance(interval_map, dict):
+            try:
+                max_rows = int(interval_map.get(str(interval).strip().lower(), max_rows))
+            except Exception:
+                pass
+
+    if _resource_profile_active(cfg, "render_512mb"):
+        max_rows = min(max_rows, 540)
+
+    if max_rows <= 0:
+        return df
+    if len(df) <= max_rows:
+        return df
+    return df.tail(max_rows).copy()
+
+
+def _apply_resource_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    profile = _resolve_resource_profile(cfg)
+    if profile != "render_512mb":
+        return cfg
+
+    tuned = dict(cfg)
+    tuned["resource_profile"] = "render_512mb"
+    # In 512MB, structural + many intervals aumentan RAM/latencia.
+    tuned["scan_structural_1d_4h"] = False
+    tuned["auto_multi_interval"] = True
+    tuned["scan_intervals"] = ["15m", "1h"]
+    tuned["poll_interval_sec"] = max(90, int(tuned.get("poll_interval_sec", 60)))
+
+    forex = tuned.get("forex_pairs", [])
+    if isinstance(forex, list) and len(forex) > 4:
+        tuned["forex_pairs"] = forex[:4]
+    crypto = tuned.get("crypto_symbols", [])
+    if isinstance(crypto, list) and len(crypto) > 4:
+        tuned["crypto_symbols"] = crypto[:4]
+    gold = tuned.get("gold_symbols", [])
+    if isinstance(gold, list) and len(gold) > 1:
+        tuned["gold_symbols"] = gold[:1]
+
+    runtime_limits = tuned.get("runtime_limits", {})
+    if not isinstance(runtime_limits, dict):
+        runtime_limits = {}
+    runtime_limits["max_rows_default"] = min(540, int(runtime_limits.get("max_rows_default", 720)))
+    runtime_limits["max_rows_by_interval"] = {
+        "1m": 600,
+        "5m": 560,
+        "15m": 540,
+        "30m": 520,
+        "1h": 500,
+        "4h": 420,
+        "1d": 360,
+    }
+    tuned["runtime_limits"] = runtime_limits
+    return tuned
 
 
 def _default_config() -> Dict[str, Any]:
@@ -109,8 +296,22 @@ def _default_config() -> Dict[str, Any]:
         "scan_forex": True,
         "scan_crypto": True,
         "scan_gold": True,
+        "resource_profile": "default",
+        "runtime_limits": {
+            "max_rows_default": 720,
+            "max_rows_by_interval": {
+                "1m": 900,
+                "5m": 800,
+                "15m": 720,
+                "30m": 640,
+                "1h": 560,
+                "4h": 520,
+                "1d": 500,
+            },
+        },
         "precision_filters": {
             "enabled": True,
+            "alert_profile": "balanceado",
             "require_closed_candle": True,
             "closed_candle_grace_sec": 10,
             "persistence_bars": 2,
@@ -120,6 +321,11 @@ def _default_config() -> Dict[str, Any]:
             "min_rr": 1.8,
             "adaptive_threshold": True,
             "adaptive_cooldown": True,
+            "quality_calibration_enabled": True,
+            "quality_calibration_min_resolved": 20,
+            "quality_calibration_scope": "global_and_record",
+            "quality_calibration_record_enabled": True,
+            "quality_calibration_record_min_resolved": 8,
             "max_alerts_per_symbol_day": 2,
             "min_mtf_confirmations": 2,
             "quality_window_bars": 12,
@@ -170,14 +376,113 @@ def _default_config() -> Dict[str, Any]:
 
 def _setup_logging(log_path: Path, debug: bool) -> None:
     log_level = logging.DEBUG if debug else logging.INFO
+    try:
+        max_mb = max(1, int(os.getenv("SCANNER_LOG_MAX_MB", "20")))
+    except Exception:
+        max_mb = 20
+    try:
+        backup_count = max(1, int(os.getenv("SCANNER_LOG_BACKUP_COUNT", "5")))
+    except Exception:
+        backup_count = 5
+    secret_filter = _SecretRedactionFilter()
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=max_mb * 1024 * 1024,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    file_handler.addFilter(secret_filter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.addFilter(secret_filter)
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(),
+            file_handler,
+            stream_handler,
         ],
     )
+
+
+def _pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            out = (proc.stdout or "").strip()
+            if not out:
+                return False
+            if "No tasks are running" in out or out.startswith("INFO:"):
+                return False
+            return str(pid) in out
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _read_lock_pid(lock_path: Path) -> int:
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return 0
+    if not raw:
+        return 0
+    try:
+        payload = json.loads(raw)
+        return int(payload.get("pid", 0) or 0)
+    except Exception:
+        try:
+            return int(raw)
+        except Exception:
+            return 0
+
+
+def _acquire_single_instance_lock(lock_path: Path) -> Tuple[bool, str]:
+    payload = {
+        "pid": os.getpid(),
+        "started_utc": datetime.now(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    for _ in range(2):
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False))
+            return True, ""
+        except FileExistsError:
+            existing_pid = _read_lock_pid(lock_path)
+            if existing_pid > 0 and _pid_running(existing_pid):
+                return False, f"Scanner ya en ejecucion (PID={existing_pid})."
+            try:
+                lock_path.unlink(missing_ok=True)
+            except Exception as exc:
+                return False, f"No se pudo limpiar lock huerfano: {exc}"
+        except Exception as exc:
+            return False, f"No se pudo crear lock de instancia unica: {exc}"
+    return False, "No se pudo adquirir lock de instancia unica."
+
+
+def _release_single_instance_lock(lock_path: Path) -> None:
+    try:
+        existing_pid = _read_lock_pid(lock_path)
+        if existing_pid in {0, os.getpid()}:
+            lock_path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -234,6 +539,298 @@ def load_state(state_path: Path) -> Dict[str, Any]:
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
     _write_json(state_path, state)
+
+
+def _iso_utc_now() -> str:
+    return datetime.now(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _new_latency_stats() -> Dict[str, Any]:
+    return {
+        "count": 0,
+        "total_ms": 0.0,
+        "avg_ms": 0.0,
+        "max_ms": 0.0,
+        "last_ms": 0.0,
+    }
+
+
+def _observe_latency(stats: Dict[str, Any], elapsed_ms: float) -> None:
+    if not isinstance(stats, dict):
+        return
+    try:
+        value = max(0.0, float(elapsed_ms))
+    except Exception:
+        return
+
+    count = int(stats.get("count", 0) or 0) + 1
+    total = float(stats.get("total_ms", 0.0) or 0.0) + value
+    max_val = max(float(stats.get("max_ms", 0.0) or 0.0), value)
+    stats["count"] = count
+    stats["total_ms"] = round(total, 3)
+    stats["avg_ms"] = round(total / count, 3) if count > 0 else 0.0
+    stats["max_ms"] = round(max_val, 3)
+    stats["last_ms"] = round(value, 3)
+
+
+def _merge_latency_stats(target: Dict[str, Any], sample: Dict[str, Any]) -> None:
+    if not isinstance(target, dict) or not isinstance(sample, dict):
+        return
+    sample_count = int(sample.get("count", 0) or 0)
+    if sample_count <= 0:
+        return
+    sample_total = float(sample.get("total_ms", 0.0) or 0.0)
+    if sample_total <= 0:
+        sample_total = float(sample.get("avg_ms", 0.0) or 0.0) * sample_count
+    sample_max = float(sample.get("max_ms", 0.0) or 0.0)
+    sample_last = float(sample.get("last_ms", 0.0) or 0.0)
+
+    target_count = int(target.get("count", 0) or 0)
+    target_total = float(target.get("total_ms", 0.0) or 0.0)
+    merged_count = target_count + sample_count
+    merged_total = target_total + sample_total
+    target["count"] = merged_count
+    target["total_ms"] = round(merged_total, 3)
+    target["avg_ms"] = round(merged_total / merged_count, 3) if merged_count > 0 else 0.0
+    target["max_ms"] = round(max(float(target.get("max_ms", 0.0) or 0.0), sample_max), 3)
+    target["last_ms"] = round(sample_last, 3)
+
+
+def _new_channel_health_stats() -> Dict[str, Any]:
+    return {
+        "attempts": 0,
+        "sent": 0,
+        "failed": 0,
+        "latency_ms": _new_latency_stats(),
+    }
+
+
+def _new_cycle_metrics() -> Dict[str, Any]:
+    return {
+        "started_utc": _iso_utc_now(),
+        "duration_ms": 0.0,
+        "rss_start_mb": 0.0,
+        "rss_end_mb": 0.0,
+        "rss_peak_mb": 0.0,
+        "watchlist_size": 0,
+        "scan_targets": 0,
+        "records_total": 0,
+        "records_success": 0,
+        "records_error": 0,
+        "alerts_triggered": 0,
+        "alerts_sent": 0,
+        "alerts_failed": 0,
+        "latency_ms": {
+            "record_eval": _new_latency_stats(),
+            "notification": _new_latency_stats(),
+        },
+        "notifications": {
+            "telegram": _new_channel_health_stats(),
+            "email": _new_channel_health_stats(),
+            "windows": _new_channel_health_stats(),
+        },
+        "errors": [],
+    }
+
+
+def _default_health_state() -> Dict[str, Any]:
+    now_iso = _iso_utc_now()
+    return {
+        "status": "starting",
+        "release": str(os.getenv("RELEASE_VERSION", os.getenv("RENDER_GIT_COMMIT", "local"))).strip() or "local",
+        "pid": os.getpid(),
+        "started_utc": now_iso,
+        "started_epoch": time.time(),
+        "last_heartbeat_utc": now_iso,
+        "last_cycle_utc": "",
+        "last_success_utc": "",
+        "last_error_utc": "",
+        "last_error": "",
+        "uptime_sec": 0,
+        "rss_mb": 0.0,
+        "rss_peak_cycle_mb": 0.0,
+        "paths": {
+            "config": "",
+            "state": "",
+            "log": "",
+        },
+        "counters": {
+            "cycles_total": 0,
+            "cycles_ok": 0,
+            "cycles_failed": 0,
+            "records_total": 0,
+            "records_error": 0,
+            "alerts_triggered": 0,
+            "alerts_sent": 0,
+            "alerts_failed": 0,
+            "errors_total": 0,
+        },
+        "latency_ms": {
+            "cycle": _new_latency_stats(),
+            "record_eval": _new_latency_stats(),
+            "notification": _new_latency_stats(),
+        },
+        "notifications": {
+            "telegram": _new_channel_health_stats(),
+            "email": _new_channel_health_stats(),
+            "windows": _new_channel_health_stats(),
+        },
+        "last_cycle": {},
+        "recent_errors": [],
+    }
+
+
+def _ensure_health_shape(health: Dict[str, Any] | None) -> Dict[str, Any]:
+    base = _default_health_state()
+    if not isinstance(health, dict):
+        return base
+    return _merge_dicts(base, health)
+
+
+def load_health(health_path: Path) -> Dict[str, Any]:
+    return _ensure_health_shape(_read_json(health_path, _default_health_state()))
+
+
+def save_health(health_path: Path, health: Dict[str, Any]) -> None:
+    _write_json(health_path, health)
+
+
+def _record_notification_metrics(cycle_metrics: Dict[str, Any], channel: str, sent_ok: bool, elapsed_ms: float) -> None:
+    notifications = cycle_metrics.get("notifications", {})
+    if not isinstance(notifications, dict):
+        return
+    bucket = notifications.get(channel)
+    if not isinstance(bucket, dict):
+        return
+    bucket["attempts"] = int(bucket.get("attempts", 0) or 0) + 1
+    if sent_ok:
+        bucket["sent"] = int(bucket.get("sent", 0) or 0) + 1
+    else:
+        bucket["failed"] = int(bucket.get("failed", 0) or 0) + 1
+    latency = bucket.get("latency_ms", {})
+    if isinstance(latency, dict):
+        _observe_latency(latency, elapsed_ms)
+    global_latency = cycle_metrics.get("latency_ms", {}).get("notification", {})
+    if isinstance(global_latency, dict):
+        _observe_latency(global_latency, elapsed_ms)
+
+
+def _update_health_from_cycle(
+    health: Dict[str, Any],
+    cycle_metrics: Dict[str, Any],
+    cycle_ok: bool,
+    cycle_error: str = "",
+) -> Dict[str, Any]:
+    payload = _ensure_health_shape(health)
+    now_iso = _iso_utc_now()
+    payload["pid"] = os.getpid()
+    payload["release"] = str(
+        os.getenv("RELEASE_VERSION", os.getenv("RENDER_GIT_COMMIT", payload.get("release", "local")))
+    ).strip() or "local"
+    payload["last_heartbeat_utc"] = now_iso
+    payload["last_cycle_utc"] = now_iso
+    payload["status"] = "ok" if cycle_ok else "degraded"
+    rss_end = float(cycle_metrics.get("rss_end_mb", 0.0) or 0.0)
+    rss_peak_cycle = float(cycle_metrics.get("rss_peak_mb", rss_end) or rss_end)
+    if rss_end > 0:
+        payload["rss_mb"] = round(rss_end, 2)
+    if rss_peak_cycle > 0:
+        payload["rss_peak_cycle_mb"] = round(rss_peak_cycle, 2)
+    if cycle_ok:
+        payload["last_success_utc"] = now_iso
+    else:
+        payload["last_error_utc"] = now_iso
+        payload["last_error"] = _redact_text(str(cycle_error or "Error no controlado en ciclo."))
+
+    try:
+        started_epoch = float(payload.get("started_epoch", time.time()) or time.time())
+    except Exception:
+        started_epoch = time.time()
+    payload["uptime_sec"] = max(0, int(time.time() - started_epoch))
+
+    counters = payload.get("counters", {})
+    if not isinstance(counters, dict):
+        counters = {}
+        payload["counters"] = counters
+    counters["cycles_total"] = int(counters.get("cycles_total", 0) or 0) + 1
+    if cycle_ok:
+        counters["cycles_ok"] = int(counters.get("cycles_ok", 0) or 0) + 1
+    else:
+        counters["cycles_failed"] = int(counters.get("cycles_failed", 0) or 0) + 1
+        counters["errors_total"] = int(counters.get("errors_total", 0) or 0) + 1
+
+    counters["records_total"] = int(counters.get("records_total", 0) or 0) + int(cycle_metrics.get("records_total", 0) or 0)
+    counters["records_error"] = int(counters.get("records_error", 0) or 0) + int(cycle_metrics.get("records_error", 0) or 0)
+    counters["alerts_triggered"] = int(counters.get("alerts_triggered", 0) or 0) + int(cycle_metrics.get("alerts_triggered", 0) or 0)
+    counters["alerts_sent"] = int(counters.get("alerts_sent", 0) or 0) + int(cycle_metrics.get("alerts_sent", 0) or 0)
+    counters["alerts_failed"] = int(counters.get("alerts_failed", 0) or 0) + int(cycle_metrics.get("alerts_failed", 0) or 0)
+
+    latencies = payload.get("latency_ms", {})
+    if not isinstance(latencies, dict):
+        latencies = {}
+        payload["latency_ms"] = latencies
+    for key in ("cycle", "record_eval", "notification"):
+        if not isinstance(latencies.get(key), dict):
+            latencies[key] = _new_latency_stats()
+
+    cycle_latency = {
+        "count": 1,
+        "total_ms": float(cycle_metrics.get("duration_ms", 0.0) or 0.0),
+        "avg_ms": float(cycle_metrics.get("duration_ms", 0.0) or 0.0),
+        "max_ms": float(cycle_metrics.get("duration_ms", 0.0) or 0.0),
+        "last_ms": float(cycle_metrics.get("duration_ms", 0.0) or 0.0),
+    }
+    _merge_latency_stats(latencies["cycle"], cycle_latency)
+    _merge_latency_stats(latencies["record_eval"], cycle_metrics.get("latency_ms", {}).get("record_eval", {}))
+    _merge_latency_stats(latencies["notification"], cycle_metrics.get("latency_ms", {}).get("notification", {}))
+
+    notif = payload.get("notifications", {})
+    if not isinstance(notif, dict):
+        notif = {}
+        payload["notifications"] = notif
+    for channel in ("telegram", "email", "windows"):
+        if not isinstance(notif.get(channel), dict):
+            notif[channel] = _new_channel_health_stats()
+        channel_target = notif[channel]
+        channel_sample = cycle_metrics.get("notifications", {}).get(channel, {})
+        channel_target["attempts"] = int(channel_target.get("attempts", 0) or 0) + int(channel_sample.get("attempts", 0) or 0)
+        channel_target["sent"] = int(channel_target.get("sent", 0) or 0) + int(channel_sample.get("sent", 0) or 0)
+        channel_target["failed"] = int(channel_target.get("failed", 0) or 0) + int(channel_sample.get("failed", 0) or 0)
+        _merge_latency_stats(channel_target.get("latency_ms", {}), channel_sample.get("latency_ms", {}))
+
+    last_cycle = {
+        "started_utc": str(cycle_metrics.get("started_utc", "")),
+        "duration_ms": round(float(cycle_metrics.get("duration_ms", 0.0) or 0.0), 3),
+        "watchlist_size": int(cycle_metrics.get("watchlist_size", 0) or 0),
+        "scan_targets": int(cycle_metrics.get("scan_targets", 0) or 0),
+        "records_total": int(cycle_metrics.get("records_total", 0) or 0),
+        "records_success": int(cycle_metrics.get("records_success", 0) or 0),
+        "records_error": int(cycle_metrics.get("records_error", 0) or 0),
+        "alerts_triggered": int(cycle_metrics.get("alerts_triggered", 0) or 0),
+        "alerts_sent": int(cycle_metrics.get("alerts_sent", 0) or 0),
+        "alerts_failed": int(cycle_metrics.get("alerts_failed", 0) or 0),
+        "rss_start_mb": round(float(cycle_metrics.get("rss_start_mb", 0.0) or 0.0), 2),
+        "rss_end_mb": round(float(cycle_metrics.get("rss_end_mb", 0.0) or 0.0), 2),
+        "rss_peak_mb": round(float(cycle_metrics.get("rss_peak_mb", 0.0) or 0.0), 2),
+        "cycle_ok": bool(cycle_ok),
+    }
+    payload["last_cycle"] = last_cycle
+
+    errors = payload.get("recent_errors", [])
+    if not isinstance(errors, list):
+        errors = []
+    cycle_errors = cycle_metrics.get("errors", [])
+    if not isinstance(cycle_errors, list):
+        cycle_errors = []
+    for raw in cycle_errors:
+        msg = _redact_text(str(raw or "").strip())
+        if not msg:
+            continue
+        errors.append({"at_utc": now_iso, "message": msg})
+    if cycle_error:
+        errors.append({"at_utc": now_iso, "message": _redact_text(str(cycle_error))})
+    payload["recent_errors"] = errors[-30:]
+    return payload
 
 
 def _parse_recipients(cfg: Dict[str, Any]) -> List[str]:
@@ -390,17 +987,17 @@ def _discover_telegram_chats_from_updates(state: Dict[str, Any]) -> Tuple[List[s
         )
         if resp.status_code >= 400:
             state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
-            return known_ids, f"HTTP {resp.status_code} al consultar getUpdates."
+            return known_ids, _redact_text(f"HTTP {resp.status_code} al consultar getUpdates.")
         payload = resp.json()
         if not payload.get("ok", False):
             state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
-            return known_ids, payload.get("description", "Error getUpdates sin descripcion.")
+            return known_ids, _redact_text(payload.get("description", "Error getUpdates sin descripcion."))
         updates = payload.get("result", [])
         if not isinstance(updates, list):
             updates = []
     except Exception as exc:
         state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
-        return known_ids, str(exc)
+        return known_ids, _redact_text(str(exc))
 
     max_update_id = last_update_id
     merged = list(known_ids)
@@ -556,7 +1153,13 @@ def _fetch_twelvedata(symbol: str, interval: str, api_key: str) -> Tuple[pd.Data
         return None, str(exc)
 
 
-def _fetch_data(item: MarketItem, period: str, interval: str) -> Tuple[pd.DataFrame | None, str, str]:
+def _fetch_data(
+    item: MarketItem,
+    period: str,
+    interval: str,
+    cfg: Dict[str, Any] | None = None,
+) -> Tuple[pd.DataFrame | None, str, str]:
+    cfg_safe = cfg if isinstance(cfg, dict) else {}
     td_key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
     td_key_upper = td_key.upper()
     td_key_valid = td_key_upper not in {"", "TU_API_KEY", "YOUR_API_KEY", "CHANGE_ME"}
@@ -564,6 +1167,7 @@ def _fetch_data(item: MarketItem, period: str, interval: str) -> Tuple[pd.DataFr
     if td_key_valid and td_interval and item.td_symbol:
         td_df, td_err = _fetch_twelvedata(item.td_symbol, td_interval, td_key)
         if td_df is not None and not td_df.empty:
+            td_df = _trim_df_for_interval(td_df, interval=interval, cfg=cfg_safe)
             return td_df, "twelvedata", ""
         logging.warning(
             "[%s] TwelveData fallo (%s), usando yfinance fallback",
@@ -573,6 +1177,7 @@ def _fetch_data(item: MarketItem, period: str, interval: str) -> Tuple[pd.DataFr
 
     try:
         yf_df = obtener_datos(item.ticker, periodo=period, intervalo=interval)
+        yf_df = _trim_df_for_interval(yf_df, interval=interval, cfg=cfg_safe)
         return yf_df, "yfinance", ""
     except Exception as exc:
         return None, "", str(exc)
@@ -831,6 +1436,287 @@ def _resolve_precision_cfg(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _normalize_alert_profile(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"conservador", "conservative"}:
+        return "conservador"
+    if raw in {"agresivo", "aggressive"}:
+        return "agresivo"
+    return "balanceado"
+
+
+def _apply_profile_to_precision_cfg(precision_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(precision_cfg)
+    profile = _normalize_alert_profile(cfg.get("alert_profile", "balanceado"))
+    cfg["alert_profile"] = profile
+
+    base_conf = int(cfg.get("min_confidence_score", 85))
+    base_rr = _safe_float(cfg.get("min_rr", 1.8), 1.8)
+    base_mtf = max(1, int(cfg.get("min_mtf_confirmations", 2)))
+    base_persistence = max(1, int(cfg.get("persistence_bars", 2)))
+
+    if profile == "conservador":
+        cfg["min_confidence_score"] = max(base_conf, 85)
+        cfg["min_rr"] = max(base_rr, 1.8)
+        cfg["min_mtf_confirmations"] = max(base_mtf, 2)
+        cfg["require_price_action_confirmation"] = True
+        cfg["persistence_bars"] = max(base_persistence, 2)
+    elif profile == "agresivo":
+        cfg["min_confidence_score"] = min(base_conf, 78)
+        cfg["min_rr"] = min(base_rr, 1.5)
+        cfg["min_mtf_confirmations"] = 1
+        cfg["require_price_action_confirmation"] = False
+        cfg["persistence_bars"] = 1
+    else:
+        cfg["min_confidence_score"] = base_conf
+        cfg["min_rr"] = base_rr
+        cfg["min_mtf_confirmations"] = base_mtf
+        cfg["persistence_bars"] = base_persistence
+
+    return cfg
+
+
+def _quality_metrics_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    stats = record.get("quality_stats", {})
+    if not isinstance(stats, dict):
+        stats = {}
+    wins = int(stats.get("wins", 0) or 0)
+    losses = int(stats.get("losses", 0) or 0)
+    timeouts = int(stats.get("timeouts", 0) or 0)
+    resolved = int(stats.get("resolved", wins + losses + timeouts) or (wins + losses + timeouts))
+    if resolved < 0:
+        resolved = 0
+
+    accuracy_pct = (wins / resolved * 100.0) if resolved > 0 else 0.0
+    noise_pct = ((losses + timeouts) / resolved * 100.0) if resolved > 0 else 0.0
+    timeout_pct = (timeouts / resolved * 100.0) if resolved > 0 else 0.0
+
+    rr_values: List[float] = []
+    history = record.get("quality_history", [])
+    if isinstance(history, list):
+        for event in history:
+            if not isinstance(event, dict):
+                continue
+            status = str(event.get("status", "")).strip().lower()
+            if status not in {"win", "loss", "timeout"}:
+                continue
+            rr = _safe_float(event.get("rr_estimado"), 0.0)
+            if rr > 0:
+                rr_values.append(rr)
+
+    rr_avg = _safe_float(stats.get("rr_avg"), 0.0)
+    rr_samples = int(stats.get("rr_samples", 0) or 0)
+    if rr_values:
+        rr_samples = len(rr_values)
+        rr_avg = sum(rr_values) / rr_samples
+    elif rr_samples <= 0:
+        rr_avg = 0.0
+        rr_samples = 0
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "timeouts": timeouts,
+        "resolved": resolved,
+        "accuracy_pct": round(accuracy_pct, 2),
+        "noise_pct": round(noise_pct, 2),
+        "timeout_pct": round(timeout_pct, 2),
+        "rr_avg": round(rr_avg, 3),
+        "rr_samples": rr_samples,
+    }
+
+
+def _aggregate_quality_stats(state: Dict[str, Any]) -> Dict[str, Any]:
+    symbols = state.get("symbols", {})
+    if not isinstance(symbols, dict):
+        return {
+            "resolved": 0,
+            "wins": 0,
+            "losses": 0,
+            "timeouts": 0,
+            "accuracy_pct": 0.0,
+            "noise_pct": 0.0,
+            "timeout_pct": 0.0,
+            "rr_avg": 0.0,
+        }
+
+    wins = 0
+    losses = 0
+    timeouts = 0
+    rr_weighted_sum = 0.0
+    rr_weighted_count = 0
+    for record in symbols.values():
+        if not isinstance(record, dict):
+            continue
+        metrics = _quality_metrics_from_record(record)
+        wins += int(metrics.get("wins", 0) or 0)
+        losses += int(metrics.get("losses", 0) or 0)
+        timeouts += int(metrics.get("timeouts", 0) or 0)
+        rr_samples = int(metrics.get("rr_samples", 0) or 0)
+        rr_avg = _safe_float(metrics.get("rr_avg"), 0.0)
+        if rr_samples > 0 and rr_avg > 0:
+            rr_weighted_sum += rr_avg * rr_samples
+            rr_weighted_count += rr_samples
+
+    resolved = wins + losses + timeouts
+    accuracy_pct = (wins / resolved * 100.0) if resolved > 0 else 0.0
+    noise_pct = ((losses + timeouts) / resolved * 100.0) if resolved > 0 else 0.0
+    timeout_pct = (timeouts / resolved * 100.0) if resolved > 0 else 0.0
+    rr_avg = (rr_weighted_sum / rr_weighted_count) if rr_weighted_count > 0 else 0.0
+    return {
+        "resolved": resolved,
+        "wins": wins,
+        "losses": losses,
+        "timeouts": timeouts,
+        "accuracy_pct": round(accuracy_pct, 2),
+        "noise_pct": round(noise_pct, 2),
+        "timeout_pct": round(timeout_pct, 2),
+        "rr_avg": round(rr_avg, 3),
+    }
+
+
+def _apply_quality_calibration(precision_cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = dict(precision_cfg)
+    calibration_enabled = bool(cfg.get("quality_calibration_enabled", True))
+    min_resolved = max(5, int(cfg.get("quality_calibration_min_resolved", 20)))
+    quality = _aggregate_quality_stats(state)
+
+    conf_delta = 0
+    rr_delta = 0.0
+    mtf_delta = 0
+    mode = "disabled"
+
+    if not calibration_enabled:
+        mode = "disabled"
+    elif quality["resolved"] < min_resolved:
+        mode = "warmup"
+    else:
+        accuracy_pct = _safe_float(quality.get("accuracy_pct"), 0.0)
+        noise_pct = _safe_float(quality.get("noise_pct"), 0.0)
+        rr_avg = _safe_float(quality.get("rr_avg"), 0.0)
+        if noise_pct >= 55.0 or accuracy_pct < 45.0:
+            conf_delta = 4
+            rr_delta = 0.2
+            mtf_delta = 1
+            mode = "tighten_hard"
+        elif noise_pct >= 45.0 or accuracy_pct < 55.0 or (rr_avg > 0 and rr_avg < 1.4):
+            conf_delta = 2
+            rr_delta = 0.1
+            mode = "tighten_soft"
+        elif accuracy_pct >= 72.0 and noise_pct <= 25.0 and rr_avg >= 1.9:
+            conf_delta = -1
+            rr_delta = -0.05
+            mode = "relax_soft"
+        else:
+            mode = "neutral"
+
+    base_conf = int(cfg.get("min_confidence_score", 85))
+    base_rr = _safe_float(cfg.get("min_rr", 1.8), 1.8)
+    base_mtf = max(1, int(cfg.get("min_mtf_confirmations", 1)))
+
+    cfg["min_confidence_score"] = max(40, min(99, base_conf + conf_delta))
+    cfg["min_rr"] = round(max(0.8, base_rr + rr_delta), 2)
+    cfg["min_mtf_confirmations"] = max(1, base_mtf + mtf_delta)
+    cfg["quality_calibration"] = {
+        "scope": "global",
+        "mode": mode,
+        "resolved": int(quality.get("resolved", 0) or 0),
+        "accuracy_pct": _safe_float(quality.get("accuracy_pct"), 0.0),
+        "noise_pct": _safe_float(quality.get("noise_pct"), 0.0),
+        "timeout_pct": _safe_float(quality.get("timeout_pct"), 0.0),
+        "rr_avg": _safe_float(quality.get("rr_avg"), 0.0),
+        "min_resolved_required": min_resolved,
+        "deltas": {
+            "conf": conf_delta,
+            "rr": round(rr_delta, 2),
+            "mtf": mtf_delta,
+        },
+    }
+    return cfg
+
+
+def _resolve_effective_precision_cfg(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    base = _resolve_precision_cfg(cfg)
+    profile_cfg = _apply_profile_to_precision_cfg(base)
+    return _apply_quality_calibration(profile_cfg, state)
+
+
+def _apply_record_quality_calibration(
+    precision_cfg: Dict[str, Any],
+    record: Dict[str, Any],
+    record_key: str,
+) -> Dict[str, Any]:
+    cfg = dict(precision_cfg)
+    if not bool(cfg.get("quality_calibration_enabled", True)):
+        return cfg
+    scope = str(cfg.get("quality_calibration_scope", "global_and_record")).strip().lower()
+    if scope not in {"global_and_record", "record"}:
+        return cfg
+    if not bool(cfg.get("quality_calibration_record_enabled", True)):
+        return cfg
+
+    min_resolved = max(4, int(cfg.get("quality_calibration_record_min_resolved", 8)))
+    metrics = _quality_metrics_from_record(record)
+
+    conf_delta = 0
+    rr_delta = 0.0
+    mtf_delta = 0
+    mode = "disabled"
+
+    if metrics["resolved"] < min_resolved:
+        mode = "warmup"
+    else:
+        accuracy_pct = _safe_float(metrics.get("accuracy_pct"), 0.0)
+        noise_pct = _safe_float(metrics.get("noise_pct"), 0.0)
+        rr_avg = _safe_float(metrics.get("rr_avg"), 0.0)
+        if noise_pct >= 58.0 or accuracy_pct < 44.0 or (rr_avg > 0 and rr_avg < 1.2):
+            conf_delta = 3
+            rr_delta = 0.15
+            mtf_delta = 1
+            mode = "tighten_hard"
+        elif noise_pct >= 48.0 or accuracy_pct < 54.0 or (rr_avg > 0 and rr_avg < 1.4):
+            conf_delta = 1
+            rr_delta = 0.05
+            mode = "tighten_soft"
+        elif accuracy_pct >= 70.0 and noise_pct <= 26.0 and rr_avg >= 1.9:
+            conf_delta = -1
+            mode = "relax_soft"
+        else:
+            mode = "neutral"
+
+    base_conf = int(cfg.get("min_confidence_score", 85))
+    base_rr = _safe_float(cfg.get("min_rr", 1.8), 1.8)
+    base_mtf = max(1, int(cfg.get("min_mtf_confirmations", 1)))
+    cfg["min_confidence_score"] = max(40, min(99, base_conf + conf_delta))
+    cfg["min_rr"] = round(max(0.8, base_rr + rr_delta), 2)
+    cfg["min_mtf_confirmations"] = max(1, base_mtf + mtf_delta)
+
+    global_cal = cfg.get("quality_calibration", {})
+    if not isinstance(global_cal, dict):
+        global_cal = {}
+    cfg["quality_calibration"] = {
+        "scope": "global_and_record" if scope == "global_and_record" else "record",
+        "mode": mode,
+        "record_key": record_key,
+        "resolved": int(metrics.get("resolved", 0) or 0),
+        "accuracy_pct": _safe_float(metrics.get("accuracy_pct"), 0.0),
+        "noise_pct": _safe_float(metrics.get("noise_pct"), 0.0),
+        "timeout_pct": _safe_float(metrics.get("timeout_pct"), 0.0),
+        "rr_avg": _safe_float(metrics.get("rr_avg"), 0.0),
+        "min_resolved_required": min_resolved,
+        "global_mode": str(global_cal.get("mode", "n/a")),
+        "global_accuracy_pct": _safe_float(global_cal.get("accuracy_pct"), 0.0),
+        "global_noise_pct": _safe_float(global_cal.get("noise_pct"), 0.0),
+        "deltas": {
+            "conf": conf_delta,
+            "rr": round(rr_delta, 2),
+            "mtf": mtf_delta,
+        },
+    }
+    cfg["quality_metrics"] = metrics
+    return cfg
+
+
 def _resolve_mtf_intervals(base_interval: str, precision_cfg: Dict[str, Any]) -> List[str]:
     mapping = precision_cfg.get("mtf_intervals", {})
     if isinstance(mapping, dict):
@@ -852,13 +1738,14 @@ def _compute_interval_direction(
     cache: Dict[str, Dict[str, Any]],
     require_closed_candle: bool = True,
     grace_seconds: int = 10,
+    cfg: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     cache_key = f"{item.state_key}|{interval}"
     if cache_key in cache:
         return cache[cache_key]
 
     period = _period_for_interval(interval)
-    df, source, err = _fetch_data(item, period=period, interval=interval)
+    df, source, err = _fetch_data(item, period=period, interval=interval, cfg=cfg)
     if df is None or df.empty:
         payload = {
             "ok": False,
@@ -919,6 +1806,7 @@ def _evaluate_mtf_alignment(
     base_direction: str,
     precision_cfg: Dict[str, Any],
     cache: Dict[str, Dict[str, Any]],
+    cfg: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     base_direction = str(base_direction or "").upper().strip()
     if base_direction not in {"ALCISTA", "BAJISTA"}:
@@ -964,6 +1852,7 @@ def _evaluate_mtf_alignment(
             cache=cache,
             require_closed_candle=require_closed_candle,
             grace_seconds=grace_seconds,
+            cfg=cfg,
         )
         if not res.get("ok", False):
             details.append(f"{tf}: error({res.get('error', 'sin detalle')})")
@@ -1145,6 +2034,8 @@ def _update_quality_stats(record: Dict[str, Any], outcome: str) -> None:
 
     resolved = wins + losses + timeouts
     accuracy = (wins / resolved * 100.0) if resolved > 0 else 0.0
+    timeout_pct = (timeouts / resolved * 100.0) if resolved > 0 else 0.0
+    noise_pct = ((losses + timeouts) / resolved * 100.0) if resolved > 0 else 0.0
     stats.update(
         {
             "total": total,
@@ -1154,9 +2045,17 @@ def _update_quality_stats(record: Dict[str, Any], outcome: str) -> None:
             "replaced": replaced,
             "resolved": resolved,
             "accuracy_pct": round(accuracy, 2),
+            "timeout_pct": round(timeout_pct, 2),
+            "noise_pct": round(noise_pct, 2),
             "updated_utc": _now_iso_utc(),
         }
     )
+    record["quality_stats"] = stats
+    metrics = _quality_metrics_from_record(record)
+    stats["rr_avg"] = _safe_float(metrics.get("rr_avg"), 0.0)
+    stats["rr_samples"] = int(metrics.get("rr_samples", 0) or 0)
+    stats["timeout_pct"] = _safe_float(metrics.get("timeout_pct"), 0.0)
+    stats["noise_pct"] = _safe_float(metrics.get("noise_pct"), 0.0)
     record["quality_stats"] = stats
 
 
@@ -1428,6 +2327,21 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     indice_alerta_utc = str(estado.get("indice_alerta_utc", "")).strip() or "N/A"
     confidence_text = str(estado.get("confidence_score", "N/A")).strip() or "N/A"
     pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
+    profile_text = str(estado.get("alert_profile", "balanceado")).strip().upper()
+    cal = estado.get("quality_calibration", {})
+    cal_mode = ""
+    if isinstance(cal, dict):
+        mode = str(cal.get("mode", "")).strip()
+        scope = str(cal.get("scope", "")).strip()
+        if mode and mode != "disabled":
+            acc = _safe_float(cal.get("accuracy_pct"), 0.0)
+            noise = _safe_float(cal.get("noise_pct"), 0.0)
+            rr_avg = _safe_float(cal.get("rr_avg"), 0.0)
+            prefix = f"{scope}:{mode}" if scope else mode
+            if rr_avg > 0:
+                cal_mode = f"{prefix} (acc {acc:.1f}% | ruido {noise:.1f}% | rr {rr_avg:.2f})"
+            else:
+                cal_mode = f"{prefix} (acc {acc:.1f}% | ruido {noise:.1f}%)"
     confirmation_hint = _confirmation_hint(direction=direction, pattern=pattern_text)
     mentor_text = _mentor_line(direction=direction, riesgo=riesgo, confidence=confidence_text)
     strength_label = _signal_strength_label(estado=estado, dorado=dorado)
@@ -1437,6 +2351,8 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
 
     body = (
         f"Fuerza: {strength_label}\n"
+        f"Perfil: {profile_text}\n"
+        f"Calibracion: {cal_mode or 'n/a'}\n"
         f"Direccion: {direction}\n"
         f"Accion: {decision}\n"
         f"Entrada: {precio_alerta_text}\n"
@@ -1469,11 +2385,11 @@ def _compute_estado(
     grace_seconds = int(precision_cfg.get("closed_candle_grace_sec", 10))
     mode = str(forced_mode or _analysis_mode(cfg)).strip().lower()
     if mode == "estructural":
-        df_1d, source_1d, err_1d = _fetch_data(item, period="3y", interval="1d")
+        df_1d, source_1d, err_1d = _fetch_data(item, period="3y", interval="1d", cfg=cfg)
         if df_1d is None or df_1d.empty:
             return None, "", f"1D: {err_1d or 'sin datos'}", {}
 
-        df_4h, source_4h, err_4h = _fetch_data(item, period="12mo", interval="4h")
+        df_4h, source_4h, err_4h = _fetch_data(item, period="12mo", interval="4h", cfg=cfg)
         if df_4h is None or df_4h.empty:
             return None, "", f"4H: {err_4h or 'sin datos'}", {}
 
@@ -1527,7 +2443,7 @@ def _compute_estado(
     if interval not in TD_INTERVAL_MAP:
         interval = "15m"
     period = str(cfg.get("period", "5d"))
-    df, source, fetch_err = _fetch_data(item, period=period, interval=interval)
+    df, source, fetch_err = _fetch_data(item, period=period, interval=interval, cfg=cfg)
     if df is None or df.empty:
         return None, "", fetch_err or "No se pudieron descargar velas.", {}
 
@@ -1610,7 +2526,7 @@ def _send_email_alert(
             server.send_message(msg)
         return True, ""
     except Exception as exc:
-        return False, str(exc)
+        return False, _redact_text(str(exc))
 
 
 def _send_telegram_alert(
@@ -1686,7 +2602,7 @@ def _send_telegram_alert(
 
     if sent_any:
         return True, ""
-    return False, "; ".join(errors) if errors else "No se pudo enviar a Telegram."
+    return False, _redact_text("; ".join(errors) if errors else "No se pudo enviar a Telegram.")
 
 
 def _send_windows_toast(subject: str, body: str) -> Tuple[bool, str]:
@@ -1728,10 +2644,10 @@ def _send_windows_toast(subject: str, body: str) -> Tuple[bool, str]:
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip()
             stdout = (proc.stdout or "").strip()
-            return False, stderr or stdout or f"powershell returncode={proc.returncode}"
+            return False, _redact_text(stderr or stdout or f"powershell returncode={proc.returncode}")
         return True, ""
     except Exception as exc:
-        return False, str(exc)
+        return False, _redact_text(str(exc))
 
 
 def _channel_enabled(cfg: Dict[str, Any], channel: str, default: bool = True) -> bool:
@@ -1749,9 +2665,24 @@ def _apply_precision_filters(
     estado: Dict[str, Any],
     compute_ctx: Dict[str, Any],
     mtf_cache: Dict[str, Dict[str, Any]],
+    precision_cfg: Dict[str, Any] | None = None,
+    record: Dict[str, Any] | None = None,
+    record_key: str = "",
 ) -> Dict[str, Any]:
-    precision_cfg = _resolve_precision_cfg(cfg)
-    enabled = bool(precision_cfg.get("enabled", True))
+    if not isinstance(precision_cfg, dict):
+        precision_cfg = _resolve_precision_cfg(cfg)
+
+    effective_cfg = dict(precision_cfg)
+    if isinstance(record, dict):
+        effective_cfg = _apply_record_quality_calibration(
+            precision_cfg=effective_cfg,
+            record=record,
+            record_key=record_key,
+        )
+        if not isinstance(effective_cfg.get("quality_metrics"), dict):
+            effective_cfg["quality_metrics"] = _quality_metrics_from_record(record)
+
+    enabled = bool(effective_cfg.get("enabled", True))
 
     dorado = estado.get("dorado_v13") or {}
     dorado_now = bool(dorado)
@@ -1761,14 +2692,15 @@ def _apply_precision_filters(
     df_ind = compute_ctx.get("df_ind")
     rr = _safe_float(dorado.get("rr_estimado"), 0.0)
 
-    mtf_enabled = enabled and bool(precision_cfg.get("multi_timeframe_filter", True))
+    mtf_enabled = enabled and bool(effective_cfg.get("multi_timeframe_filter", True))
     if mtf_enabled:
         mtf_info = _evaluate_mtf_alignment(
             item=item,
             base_interval=interval,
             base_direction=direction,
-            precision_cfg=precision_cfg,
+            precision_cfg=effective_cfg,
             cache=mtf_cache,
+            cfg=cfg,
         )
     else:
         mtf_info = {
@@ -1781,17 +2713,17 @@ def _apply_precision_filters(
         }
 
     candle_info = _detect_price_action(df_ind, direction)
-    require_price_action = enabled and bool(precision_cfg.get("require_price_action_confirmation", True))
+    require_price_action = enabled and bool(effective_cfg.get("require_price_action_confirmation", True))
     candle_ok = bool(candle_info.get("aligned", False)) if require_price_action else (str(candle_info.get("bias")) != _opposite_direction(direction))
 
-    rr_min = _safe_float(precision_cfg.get("min_rr", 1.8), 1.8) if enabled else 0.0
+    rr_min = _safe_float(effective_cfg.get("min_rr", 1.8), 1.8) if enabled else 0.0
     rr_ok = rr >= rr_min
 
     confidence_score = _compute_signal_confidence(estado=estado, mtf_info=mtf_info, candle_info=candle_info)
     min_confidence = _compute_dynamic_min_confidence(
         base_interval=interval,
         vol_ratio=vol_ratio,
-        precision_cfg=precision_cfg,
+        precision_cfg=effective_cfg,
     ) if enabled else 0
     confidence_ok = confidence_score >= min_confidence
 
@@ -1799,7 +2731,7 @@ def _apply_precision_filters(
         cfg=cfg,
         base_interval=interval,
         vol_ratio=vol_ratio,
-        precision_cfg=precision_cfg,
+        precision_cfg=effective_cfg,
     ) if enabled else max(1, int(cfg.get("cooldown_minutes", 60)))
 
     mtf_ok = bool(mtf_info.get("ok", True))
@@ -1819,10 +2751,26 @@ def _apply_precision_filters(
     if not reasons:
         reasons.append("filtros_ok")
 
+    thresholds = {
+        "min_confidence_base": int(effective_cfg.get("min_confidence_score", 0) or 0),
+        "min_confidence_effective": int(min_confidence or 0),
+        "min_rr": round(rr_min, 3),
+        "min_mtf_confirmations": max(1, int(effective_cfg.get("min_mtf_confirmations", 1) or 1)),
+        "cooldown_minutes": int(cooldown_effective or 0),
+    }
+
     return {
         "enabled": enabled,
         "signal_ready": signal_ready,
         "dorado_now": dorado_now,
+        "profile": str(effective_cfg.get("alert_profile", "balanceado")),
+        "calibration": dict(effective_cfg.get("quality_calibration", {}))
+        if isinstance(effective_cfg.get("quality_calibration", {}), dict)
+        else {},
+        "quality_metrics": dict(effective_cfg.get("quality_metrics", {}))
+        if isinstance(effective_cfg.get("quality_metrics", {}), dict)
+        else {},
+        "thresholds": thresholds,
         "confidence_score": confidence_score,
         "min_confidence": min_confidence,
         "rr": rr,
@@ -1908,16 +2856,38 @@ def _resolve_scan_targets(cfg: Dict[str, Any]) -> List[Dict[str, str]]:
     return targets
 
 
-def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
-    precision_cfg = _resolve_precision_cfg(cfg)
+def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    cycle_started_perf = time.perf_counter()
+    cycle_metrics = _new_cycle_metrics()
+    cfg = _apply_resource_profile(cfg)
+    compact_mode = _resource_profile_active(cfg, "render_512mb")
+    cycle_metrics["rss_start_mb"] = _current_process_rss_mb()
+    cycle_metrics["rss_peak_mb"] = float(cycle_metrics.get("rss_start_mb", 0.0) or 0.0)
+    precision_cfg = _resolve_effective_precision_cfg(cfg, state)
     persistence_bars = max(1, int(precision_cfg.get("persistence_bars", 1)))
     max_alerts_per_symbol_day = max(0, int(precision_cfg.get("max_alerts_per_symbol_day", 0)))
     watchlist = _build_watchlist(cfg)
     scan_targets = _resolve_scan_targets(cfg)
+    cycle_metrics["watchlist_size"] = len(watchlist)
+    cycle_metrics["scan_targets"] = len(scan_targets)
+    cal = precision_cfg.get("quality_calibration", {})
+    if isinstance(cal, dict):
+        logging.debug(
+            "Precision profile=%s | cal_mode=%s | resolved=%s | acc=%.2f | noise=%.2f",
+            precision_cfg.get("alert_profile", "balanceado"),
+            cal.get("mode", "n/a"),
+            int(cal.get("resolved", 0) or 0),
+            _safe_float(cal.get("accuracy_pct"), 0.0),
+            _safe_float(cal.get("noise_pct"), 0.0),
+        )
 
     if not watchlist:
         logging.warning("Watchlist vacia. Revisa scanner_config.json")
-        return state
+        rss_end = _current_process_rss_mb()
+        cycle_metrics["rss_end_mb"] = rss_end
+        cycle_metrics["rss_peak_mb"] = max(float(cycle_metrics.get("rss_peak_mb", 0.0) or 0.0), rss_end)
+        cycle_metrics["duration_ms"] = round((time.perf_counter() - cycle_started_perf) * 1000.0, 3)
+        return state, cycle_metrics
 
     symbols_state: Dict[str, Any] = state.setdefault("symbols", {})
     configured_telegram_chat_ids = _dedupe_chat_ids(_parse_telegram_chat_ids(cfg))
@@ -1928,6 +2898,13 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
             logging.warning("Telegram getUpdates: %s", discover_err)
     telegram_broadcast_ids = _dedupe_chat_ids(configured_telegram_chat_ids + auto_telegram_chat_ids)
     mtf_cache: Dict[str, Dict[str, Any]] = {}
+
+    def _timed_send(channel: str, fn, *args, **kwargs) -> Tuple[bool, str]:
+        started = time.perf_counter()
+        ok, err = fn(*args, **kwargs)
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        _record_notification_metrics(cycle_metrics, channel, bool(ok), elapsed_ms)
+        return ok, err
 
     for item in watchlist:
         if not _market_open(item.kind):
@@ -1947,6 +2924,8 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
             target_interval = str(target.get("interval", "15m")).strip()
             target_key = str(target.get("key", target_interval)).strip().lower() or target_interval.lower()
             record_key = f"{item.state_key}|{target_key}"
+            cycle_metrics["records_total"] = int(cycle_metrics.get("records_total", 0) or 0) + 1
+            record_eval_started = time.perf_counter()
 
             record = symbols_state.get(record_key, {})
             record["last_checked_utc"] = _now_iso_utc()
@@ -1960,19 +2939,25 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                 forced_interval=target_interval if target_mode != "estructural" else None,
             )
             if estado is None:
-                record["last_error"] = compute_err or "No se pudo calcular estado."
+                record["last_error"] = _redact_text(compute_err or "No se pudo calcular estado.")
                 symbols_state[record_key] = record
+                cycle_metrics["records_error"] = int(cycle_metrics.get("records_error", 0) or 0) + 1
+                cycle_metrics.setdefault("errors", []).append(f"{record_key}: {record['last_error']}")
+                _observe_latency(cycle_metrics.get("latency_ms", {}).get("record_eval", {}), (time.perf_counter() - record_eval_started) * 1000.0)
                 logging.warning("[%s|%s] Error de datos/estado: %s", item.state_key, target_key, record["last_error"])
                 continue
 
+            _evaluate_open_alert_outcome(record=record, estado=estado, compute_ctx=compute_ctx)
             precision = _apply_precision_filters(
                 item=item,
                 cfg=cfg,
                 estado=estado,
                 compute_ctx=compute_ctx,
                 mtf_cache=mtf_cache,
+                precision_cfg=precision_cfg,
+                record=record,
+                record_key=record_key,
             )
-            _evaluate_open_alert_outcome(record=record, estado=estado, compute_ctx=compute_ctx)
             signal_ready = bool(precision.get("signal_ready", False))
             signal_bar_utc = str(estado.get("indice_alerta_utc", "")).strip()
             prev_gate_bar = str(record.get("last_gate_bar_utc", "")).strip()
@@ -2001,7 +2986,15 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
             estado["cooldown_minutes_effective"] = precision.get("cooldown_minutes")
             estado["vol_ratio"] = round(_safe_float(precision.get("vol_ratio", estado.get("vol_ratio", 1.0)), 1.0), 4)
             estado["filtros_precision"] = precision.get("reasons", [])
+            estado["alert_profile"] = precision.get("profile", "balanceado")
+            estado["quality_calibration"] = precision.get("calibration", {})
+            estado["quality_metrics"] = precision.get("quality_metrics", {})
+            estado["effective_thresholds"] = precision.get("thresholds", {})
             record["last_gate_reasons"] = precision.get("reasons", [])
+            record["alert_profile"] = precision.get("profile", "balanceado")
+            record["quality_calibration"] = precision.get("calibration", {})
+            record["quality_metrics"] = precision.get("quality_metrics", {})
+            record["effective_thresholds"] = precision.get("thresholds", {})
             record["last_confidence_score"] = precision.get("confidence_score")
             record["last_rr"] = precision.get("rr")
             record["last_candle_pattern"] = precision.get("candle", {}).get("pattern", "sin_patron")
@@ -2017,6 +3010,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                 persistence_bars=persistence_bars,
                 max_alerts_per_symbol_day=max_alerts_per_symbol_day,
             ):
+                cycle_metrics["alerts_triggered"] = int(cycle_metrics.get("alerts_triggered", 0) or 0) + 1
                 subject, body = _build_alert_payload(cfg, item, estado, source)
                 notify_status: Dict[str, Any] = {}
                 sent_any = False
@@ -2056,7 +3050,9 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                         user_errors: List[str] = []
 
                         if telegram_enabled:
-                            sent_ok, sent_err = _send_telegram_alert(
+                            sent_ok, sent_err = _timed_send(
+                                "telegram",
+                                _send_telegram_alert,
                                 cfg,
                                 subject,
                                 body,
@@ -2070,7 +3066,9 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                                 user_errors.append(f"telegram: {sent_err}")
 
                         if is_premium and email_enabled and email:
-                            sent_ok, sent_err = _send_email_alert(
+                            sent_ok, sent_err = _timed_send(
+                                "email",
+                                _send_email_alert,
                                 cfg,
                                 item,
                                 subject,
@@ -2104,7 +3102,9 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                     known_user_chat_ids = _dedupe_chat_ids([t.get("chat_id", "") for t in user_targets])
                     broadcast_extra_chat_ids = [cid for cid in telegram_broadcast_ids if cid not in set(known_user_chat_ids)]
                     if telegram_enabled and broadcast_extra_chat_ids:
-                        sent_ok, sent_err = _send_telegram_alert(
+                        sent_ok, sent_err = _timed_send(
+                            "telegram",
+                            _send_telegram_alert,
                             cfg,
                             subject,
                             body,
@@ -2126,7 +3126,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
 
                     if windows_enabled:
                         if premium_users_alerted:
-                            sent_ok, sent_err = _send_windows_toast(subject, body)
+                            sent_ok, sent_err = _timed_send("windows", _send_windows_toast, subject, body)
                             notify_status["windows"] = {"ok": sent_ok, "error": sent_err}
                             if sent_ok:
                                 sent_any = True
@@ -2140,7 +3140,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                 else:
                     if _channel_enabled(cfg, "email", default=True):
                         enabled_any = True
-                        sent_ok, sent_err = _send_email_alert(cfg, item, subject, body)
+                        sent_ok, sent_err = _timed_send("email", _send_email_alert, cfg, item, subject, body)
                         notify_status["email"] = {"ok": sent_ok, "error": sent_err}
                         if sent_ok:
                             sent_any = True
@@ -2149,7 +3149,9 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
 
                     if _channel_enabled(cfg, "telegram", default=True):
                         enabled_any = True
-                        sent_ok, sent_err = _send_telegram_alert(
+                        sent_ok, sent_err = _timed_send(
+                            "telegram",
+                            _send_telegram_alert,
                             cfg,
                             subject,
                             body,
@@ -2164,7 +3166,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
 
                     if _channel_enabled(cfg, "windows", default=True):
                         enabled_any = True
-                        sent_ok, sent_err = _send_windows_toast(subject, body)
+                        sent_ok, sent_err = _timed_send("windows", _send_windows_toast, subject, body)
                         notify_status["windows"] = {"ok": sent_ok, "error": sent_err}
                         if sent_ok:
                             sent_any = True
@@ -2176,6 +3178,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
 
                 record["last_notify"] = notify_status
                 if sent_any:
+                    cycle_metrics["alerts_sent"] = int(cycle_metrics.get("alerts_sent", 0) or 0) + 1
                     record["last_alert_utc"] = _now_iso_utc()
                     _increment_daily_alert_count(record)
                     snapshot = _open_alert_snapshot(
@@ -2195,7 +3198,9 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
                         record["open_alert"] = snapshot
                     logging.info("[%s|%s] Alerta enviada (multicanal).", item.state_key, target_key)
                 else:
-                    record["last_error"] = "; ".join(errors)
+                    cycle_metrics["alerts_failed"] = int(cycle_metrics.get("alerts_failed", 0) or 0) + 1
+                    record["last_error"] = _redact_text("; ".join(errors))
+                    cycle_metrics.setdefault("errors", []).append(f"{record_key}: {record['last_error']}")
                     logging.error("[%s|%s] Fallo envio alerta: %s", item.state_key, target_key, record["last_error"])
 
             record["dorado_active"] = signal_ready
@@ -2209,8 +3214,18 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]
             if not record.get("last_error"):
                 record["last_error"] = ""
             symbols_state[record_key] = record
+            cycle_metrics["records_success"] = int(cycle_metrics.get("records_success", 0) or 0) + 1
+            _observe_latency(cycle_metrics.get("latency_ms", {}).get("record_eval", {}), (time.perf_counter() - record_eval_started) * 1000.0)
+            if compact_mode and int(cycle_metrics.get("records_total", 0) or 0) % 8 == 0:
+                gc.collect()
 
-    return state
+    if compact_mode:
+        gc.collect()
+    rss_end = _current_process_rss_mb()
+    cycle_metrics["rss_end_mb"] = rss_end
+    cycle_metrics["rss_peak_mb"] = max(float(cycle_metrics.get("rss_peak_mb", 0.0) or 0.0), rss_end)
+    cycle_metrics["duration_ms"] = round((time.perf_counter() - cycle_started_perf) * 1000.0, 3)
+    return state, cycle_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -2218,6 +3233,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="Ruta al scanner_config.json")
     parser.add_argument("--state", default=str(DEFAULT_STATE_PATH), help="Ruta al scanner_state.json")
     parser.add_argument("--log", default=str(DEFAULT_LOG_PATH), help="Ruta al scanner.log")
+    parser.add_argument("--health", default=str(DEFAULT_HEALTH_PATH), help="Ruta al scanner_health.json")
     parser.add_argument("--once", action="store_true", help="Ejecuta un solo ciclo y termina.")
     parser.add_argument("--debug", action="store_true", help="Activa logs DEBUG.")
     return parser.parse_args()
@@ -2228,38 +3244,91 @@ def main() -> int:
     config_path = Path(args.config).resolve()
     state_path = Path(args.state).resolve()
     log_path = Path(args.log).resolve()
+    health_path = Path(args.health).resolve()
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    health_path.parent.mkdir(parents=True, exist_ok=True)
 
     _setup_logging(log_path, debug=bool(args.debug))
+    lock_ok, lock_msg = _acquire_single_instance_lock(LOCK_PATH)
+    if not lock_ok:
+        logging.warning(lock_msg)
+        return 0
     logging.info("Scanner worker iniciado.")
 
-    cfg = load_config(config_path)
-    state = load_state(state_path)
+    try:
+        cfg = load_config(config_path)
+        state = load_state(state_path)
+        health = load_health(health_path)
+        health["pid"] = os.getpid()
+        health["started_utc"] = _iso_utc_now()
+        health["started_epoch"] = time.time()
+        health["paths"] = {
+            "config": str(config_path),
+            "state": str(state_path),
+            "log": str(log_path),
+        }
+        health["status"] = "starting"
+        save_health(health_path, health)
 
-    if not bool(cfg.get("enabled", True)):
-        logging.warning("Scanner deshabilitado en config (enabled=false).")
-        save_state(state_path, state)
-        return 0
-
-    poll_interval = max(10, int(cfg.get("poll_interval_sec", 60)))
-
-    while True:
-        cycle_start = time.time()
-        try:
-            state = run_scan_cycle(cfg, state)
+        if not bool(cfg.get("enabled", True)):
+            logging.warning("Scanner deshabilitado en config (enabled=false).")
             save_state(state_path, state)
-        except Exception as exc:
-            logging.exception("Error no controlado en ciclo: %s", exc)
+            health = _update_health_from_cycle(
+                health=health,
+                cycle_metrics=_new_cycle_metrics(),
+                cycle_ok=False,
+                cycle_error="Scanner deshabilitado en config (enabled=false).",
+            )
+            health["status"] = "disabled"
+            save_health(health_path, health)
+            return 0
 
-        if args.once:
-            break
+        poll_interval = max(10, int(cfg.get("poll_interval_sec", 60)))
 
-        elapsed = time.time() - cycle_start
-        sleep_sec = max(1, poll_interval - int(elapsed))
-        time.sleep(sleep_sec)
+        while True:
+            cycle_start = time.time()
+            cycle_metrics = _new_cycle_metrics()
+            try:
+                state, cycle_metrics = run_scan_cycle(cfg, state)
+                save_state(state_path, state)
+                health = _update_health_from_cycle(health=health, cycle_metrics=cycle_metrics, cycle_ok=True, cycle_error="")
+                save_health(health_path, health)
+                logging.info(
+                    "Health ciclo ok=true dur=%.1fms rss=%.1fMB records=%s err=%s alerts=%s sent=%s failed=%s",
+                    float(cycle_metrics.get("duration_ms", 0.0) or 0.0),
+                    float(cycle_metrics.get("rss_end_mb", 0.0) or 0.0),
+                    int(cycle_metrics.get("records_total", 0) or 0),
+                    int(cycle_metrics.get("records_error", 0) or 0),
+                    int(cycle_metrics.get("alerts_triggered", 0) or 0),
+                    int(cycle_metrics.get("alerts_sent", 0) or 0),
+                    int(cycle_metrics.get("alerts_failed", 0) or 0),
+                )
+            except Exception as exc:
+                logging.exception("Error no controlado en ciclo: %s", exc)
+                cycle_metrics["duration_ms"] = round((time.time() - cycle_start) * 1000.0, 3)
+                cycle_metrics.setdefault("errors", []).append(_redact_text(str(exc)))
+                health = _update_health_from_cycle(
+                    health=health,
+                    cycle_metrics=cycle_metrics,
+                    cycle_ok=False,
+                    cycle_error=str(exc),
+                )
+                save_health(health_path, health)
 
-    logging.info("Scanner worker finalizado.")
-    return 0
+            if args.once:
+                break
+
+            elapsed = time.time() - cycle_start
+            sleep_sec = max(1, poll_interval - int(elapsed))
+            time.sleep(sleep_sec)
+
+        health["status"] = "stopped"
+        health["last_heartbeat_utc"] = _iso_utc_now()
+        save_health(health_path, health)
+        logging.info("Scanner worker finalizado.")
+        return 0
+    finally:
+        _release_single_instance_lock(LOCK_PATH)
 
 
 if __name__ == "__main__":

@@ -1296,13 +1296,19 @@ def _color_desde_esfera(esfera_txt: str) -> str:
 # ============================================================
 USERS_DB_PATH = os.path.join(os.path.dirname(__file__), "usuarios_db.json")
 SCANNER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "scanner_config.json")
+SCANNER_STATE_PATH = os.path.join(os.path.dirname(__file__), "scanner_state.json")
+SCANNER_HEALTH_PATH = os.path.join(os.path.dirname(__file__), "scanner_health.json")
 AUTH_CACHE_PATH = os.path.join(os.path.dirname(__file__), "auth_cache.json")
 AUTH_COOKIE_PREFIX = os.getenv("AUTH_COOKIE_PREFIX", "estrella_trader")
 # Cambia esta clave en producción con variable de entorno AUTH_COOKIE_PASSWORD.
-AUTH_COOKIE_PASSWORD = os.getenv("AUTH_COOKIE_PASSWORD", "estrella-trader-change-this")
+AUTH_COOKIE_PASSWORD = os.getenv("AUTH_COOKIE_PASSWORD", "").strip()
+if not AUTH_COOKIE_PASSWORD:
+    host_name = os.getenv("COMPUTERNAME", os.getenv("HOSTNAME", "local"))
+    seed = f"{host_name}|{os.path.abspath(__file__)}|estrella-auth-fallback"
+    AUTH_COOKIE_PASSWORD = hashlib.sha256(seed.encode("utf-8")).hexdigest()
 AUTH_COOKIE_USER_KEY = "uid"
 AUTH_COOKIE_CONSENT_KEY = "cookies_consent_v1"
-PREMIUM_ACCESS_CODE = "980511"
+PREMIUM_ACCESS_CODE = os.getenv("PREMIUM_ACCESS_CODE", "").strip()
 
 
 # ============================================================
@@ -1409,6 +1415,263 @@ def _guardar_bot_username_telegram_config(bot_username: str):
         return True, "Username del bot eliminado."
     except Exception as exc:
         return False, f"No se pudo guardar scanner_config.json: {exc}"
+
+
+def _safe_float_num(value, default=0.0) -> float:
+    try:
+        val = float(value)
+        if pd.isna(val):
+            return default
+        return val
+    except Exception:
+        return default
+
+
+def _leer_scanner_state() -> dict:
+    try:
+        if not os.path.exists(SCANNER_STATE_PATH):
+            return {}
+        with open(SCANNER_STATE_PATH, "r", encoding="utf-8-sig") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def _leer_scanner_health() -> dict:
+    try:
+        if not os.path.exists(SCANNER_HEALTH_PATH):
+            return {}
+        with open(SCANNER_HEALTH_PATH, "r", encoding="utf-8-sig") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            return payload
+    except Exception:
+        return {}
+    return {}
+
+
+def _parse_scanner_record_key(record_key: str, record: dict) -> tuple[str, str, str, str]:
+    parts = [str(p).strip() for p in str(record_key or "").split("|")]
+    market = parts[0] if len(parts) >= 1 else str(record.get("market", "")).strip()
+    label = parts[1] if len(parts) >= 2 else str(record.get("label", "")).strip()
+    ticker = parts[2] if len(parts) >= 3 else str(record.get("ticker", "")).strip()
+    timeframe = parts[3] if len(parts) >= 4 else ""
+    if not timeframe:
+        timeframe = str(record.get("scan_target") or record.get("analysis_interval") or "15m").strip()
+    return market, label, ticker, timeframe
+
+
+def _rr_promedio_record(record: dict) -> tuple[float, int]:
+    stats = record.get("quality_stats", {})
+    if not isinstance(stats, dict):
+        stats = {}
+    rr_avg = _safe_float_num(stats.get("rr_avg"), 0.0)
+    rr_samples = int(stats.get("rr_samples", 0) or 0)
+    if rr_avg > 0 and rr_samples > 0:
+        return rr_avg, rr_samples
+
+    rr_values = []
+    history = record.get("quality_history", [])
+    if isinstance(history, list):
+        for event in history:
+            if not isinstance(event, dict):
+                continue
+            status = str(event.get("status", "")).strip().lower()
+            if status not in {"win", "loss", "timeout"}:
+                continue
+            rr = _safe_float_num(event.get("rr_estimado"), 0.0)
+            if rr > 0:
+                rr_values.append(rr)
+    if not rr_values:
+        return rr_avg, rr_samples
+    return sum(rr_values) / len(rr_values), len(rr_values)
+
+
+def _score_precision_operable(accuracy_pct: float, rr_avg: float, timeout_pct: float, resolved: int) -> float:
+    sample_factor = min(1.0, max(0.0, resolved) / 25.0)
+    base = (accuracy_pct * 0.72) + (min(rr_avg, 3.0) * 18.0) - (timeout_pct * 0.25)
+    score = base * (0.55 + 0.45 * sample_factor)
+    return round(max(0.0, min(100.0, score)), 2)
+
+
+def _scanner_precision_panel_data():
+    state = _leer_scanner_state()
+    symbols = state.get("symbols", {})
+    if not isinstance(symbols, dict):
+        return pd.DataFrame(), pd.DataFrame(), {
+            "resolved": 0,
+            "wins": 0,
+            "losses": 0,
+            "timeouts": 0,
+            "accuracy_pct": 0.0,
+            "rr_avg": 0.0,
+            "recommend_count": 0,
+            "last_checked_utc": "",
+        }
+
+    has_target_keys = any(len(str(k).split("|")) >= 4 for k in symbols.keys())
+    rows = []
+    ranking_acc = {}
+    summary = {
+        "resolved": 0,
+        "wins": 0,
+        "losses": 0,
+        "timeouts": 0,
+        "rr_weighted_sum": 0.0,
+        "rr_weighted_count": 0,
+        "last_checked_utc": "",
+    }
+
+    for record_key, record in symbols.items():
+        if not isinstance(record, dict):
+            continue
+        if has_target_keys and len(str(record_key).split("|")) < 4 and not str(record.get("scan_target", "")).strip():
+            continue
+
+        market, label, ticker, timeframe = _parse_scanner_record_key(record_key, record)
+        stats = record.get("quality_stats", {})
+        if not isinstance(stats, dict):
+            stats = {}
+
+        wins = int(stats.get("wins", 0) or 0)
+        losses = int(stats.get("losses", 0) or 0)
+        timeouts = int(stats.get("timeouts", 0) or 0)
+        resolved = int(stats.get("resolved", wins + losses + timeouts) or (wins + losses + timeouts))
+        accuracy_pct = _safe_float_num(stats.get("accuracy_pct"), 0.0)
+        if resolved > 0 and accuracy_pct <= 0:
+            accuracy_pct = wins / resolved * 100.0
+        timeout_pct = _safe_float_num(stats.get("timeout_pct"), 0.0)
+        if resolved > 0 and timeout_pct <= 0:
+            timeout_pct = timeouts / resolved * 100.0
+        rr_avg, rr_samples = _rr_promedio_record(record)
+        score = _score_precision_operable(accuracy_pct, rr_avg, timeout_pct, resolved)
+
+        calibration = record.get("quality_calibration", {})
+        if not isinstance(calibration, dict):
+            calibration = {}
+        thresholds = record.get("effective_thresholds", {})
+        if not isinstance(thresholds, dict):
+            thresholds = {}
+        cal_mode = str(calibration.get("mode", "n/a")).strip() or "n/a"
+        cal_scope = str(calibration.get("scope", "")).strip()
+        cal_label = f"{cal_scope}:{cal_mode}" if cal_scope else cal_mode
+
+        rows.append(
+            {
+                "Mercado": market,
+                "Activo": label,
+                "Ticker": ticker,
+                "Timeframe": timeframe,
+                "W": wins,
+                "L": losses,
+                "Timeout": timeouts,
+                "Resueltas": resolved,
+                "Acierto %": round(accuracy_pct, 2),
+                "RR prom.": round(rr_avg, 3),
+                "Calibracion": cal_label,
+                "Conf min": int(_safe_float_num(thresholds.get("min_confidence_effective"), 0)),
+                "RR min": round(_safe_float_num(thresholds.get("min_rr"), 0.0), 2),
+                "MTF min": int(_safe_float_num(thresholds.get("min_mtf_confirmations"), 0)),
+                "Score operativo": score,
+            }
+        )
+
+        summary["wins"] += wins
+        summary["losses"] += losses
+        summary["timeouts"] += timeouts
+        summary["resolved"] += resolved
+        if rr_samples > 0 and rr_avg > 0:
+            summary["rr_weighted_sum"] += rr_avg * rr_samples
+            summary["rr_weighted_count"] += rr_samples
+
+        last_checked = str(record.get("last_checked_utc", "")).strip()
+        if last_checked and last_checked > summary["last_checked_utc"]:
+            summary["last_checked_utc"] = last_checked
+
+        agg_key = f"{market}|{label}|{ticker}"
+        agg = ranking_acc.get(agg_key)
+        if agg is None:
+            agg = {
+                "Mercado": market,
+                "Activo": label,
+                "Ticker": ticker,
+                "wins": 0,
+                "losses": 0,
+                "timeouts": 0,
+                "resolved": 0,
+                "rr_sum": 0.0,
+                "rr_count": 0,
+                "best_timeframe": timeframe,
+                "best_score": score,
+            }
+            ranking_acc[agg_key] = agg
+
+        agg["wins"] += wins
+        agg["losses"] += losses
+        agg["timeouts"] += timeouts
+        agg["resolved"] += resolved
+        if rr_samples > 0 and rr_avg > 0:
+            agg["rr_sum"] += rr_avg * rr_samples
+            agg["rr_count"] += rr_samples
+        if score >= agg["best_score"]:
+            agg["best_score"] = score
+            agg["best_timeframe"] = timeframe
+
+    metrics_df = pd.DataFrame(rows)
+    if not metrics_df.empty:
+        metrics_df = metrics_df.sort_values(
+            by=["Score operativo", "Acierto %", "Resueltas"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+
+    ranking_rows = []
+    for agg in ranking_acc.values():
+        resolved = int(agg.get("resolved", 0) or 0)
+        wins = int(agg.get("wins", 0) or 0)
+        losses = int(agg.get("losses", 0) or 0)
+        timeouts = int(agg.get("timeouts", 0) or 0)
+        accuracy_pct = (wins / resolved * 100.0) if resolved > 0 else 0.0
+        timeout_pct = (timeouts / resolved * 100.0) if resolved > 0 else 0.0
+        rr_avg = (agg["rr_sum"] / agg["rr_count"]) if agg["rr_count"] > 0 else 0.0
+        score = _score_precision_operable(accuracy_pct, rr_avg, timeout_pct, resolved)
+        conviene = "SI" if resolved >= 8 and accuracy_pct >= 55.0 and rr_avg >= 1.5 and timeout_pct <= 35.0 else "NO"
+        ranking_rows.append(
+            {
+                "Mercado": agg["Mercado"],
+                "Activo": agg["Activo"],
+                "Ticker": agg["Ticker"],
+                "Mejor timeframe": agg.get("best_timeframe", ""),
+                "Resueltas": resolved,
+                "Acierto %": round(accuracy_pct, 2),
+                "RR prom.": round(rr_avg, 3),
+                "Timeout %": round(timeout_pct, 2),
+                "Score operativo": score,
+                "Conviene operar": conviene,
+            }
+        )
+
+    ranking_df = pd.DataFrame(ranking_rows)
+    if not ranking_df.empty:
+        ranking_df = ranking_df.sort_values(
+            by=["Score operativo", "Acierto %", "Resueltas"],
+            ascending=[False, False, False],
+        ).reset_index(drop=True)
+
+    summary["accuracy_pct"] = round(
+        (summary["wins"] / summary["resolved"] * 100.0) if summary["resolved"] > 0 else 0.0,
+        2,
+    )
+    summary["rr_avg"] = round(
+        (summary["rr_weighted_sum"] / summary["rr_weighted_count"]) if summary["rr_weighted_count"] > 0 else 0.0,
+        3,
+    )
+    summary["recommend_count"] = int((ranking_df["Conviene operar"] == "SI").sum()) if not ranking_df.empty else 0
+    summary.pop("rr_weighted_sum", None)
+    summary.pop("rr_weighted_count", None)
+    return metrics_df, ranking_df, summary
 
 
 def _telegram_bot_username_actual() -> str:
@@ -2028,6 +2291,8 @@ def set_premium_usuario(user_id: str, enabled: bool, plan_dias: int = 30):
 
 
 def activar_premium_por_codigo(user_id: str, codigo: str):
+    if not PREMIUM_ACCESS_CODE:
+        return False, "Activación por código deshabilitada. Configura PREMIUM_ACCESS_CODE en servidor.", None
     code = str(codigo or "").strip()
     if code != PREMIUM_ACCESS_CODE:
         return False, "Código inválido.", None
@@ -2757,20 +3022,23 @@ with st.sidebar.expander("Cuenta", expanded=True):
             else:
                 st.error(msg)
 
-        codigo_premium = st.text_input(
-            "Código premium",
-            type="password",
-            key="premium_code_input_v1",
-            placeholder="Ingresa tu código",
-        )
-        if st.button("Activar por código", key="btn_premium_code_v1"):
-            ok, msg, user_public = activar_premium_por_codigo(usuario_ui["id"], codigo_premium)
-            if ok and user_public:
-                st.session_state["usuario"] = user_public
-                st.success(msg)
-                rerun_app()
-            else:
-                st.error(msg)
+        if PREMIUM_ACCESS_CODE:
+            codigo_premium = st.text_input(
+                "Código premium",
+                type="password",
+                key="premium_code_input_v1",
+                placeholder="Ingresa tu código",
+            )
+            if st.button("Activar por código", key="btn_premium_code_v1"):
+                ok, msg, user_public = activar_premium_por_codigo(usuario_ui["id"], codigo_premium)
+                if ok and user_public:
+                    st.session_state["usuario"] = user_public
+                    st.success(msg)
+                    rerun_app()
+                else:
+                    st.error(msg)
+        else:
+            st.caption("Activación por código deshabilitada en este entorno.")
 
         if st.button("Cerrar sesión", key="btn_logout_v1"):
             st.session_state["usuario"] = _usuario_invitado()
@@ -3509,6 +3777,87 @@ if es_premium and st.session_state.get("debug_v13", False):
         "</div>"
     )
     st.markdown(diag_html, unsafe_allow_html=True)
+
+    metrics_df, ranking_df, precision_summary = _scanner_precision_panel_data()
+    st.markdown("### Precision medible")
+    cpm1, cpm2, cpm3, cpm4 = st.columns(4)
+    cpm1.metric("Resueltas", int(precision_summary.get("resolved", 0) or 0))
+    cpm2.metric("Acierto global", f"{_safe_float_num(precision_summary.get('accuracy_pct'), 0.0):.1f}%")
+    cpm3.metric("RR promedio", f"{_safe_float_num(precision_summary.get('rr_avg'), 0.0):.2f}")
+    cpm4.metric("Activos recomendados", int(precision_summary.get("recommend_count", 0) or 0))
+    last_checked = str(precision_summary.get("last_checked_utc", "")).strip()
+    if last_checked:
+        st.caption(f"Ultima lectura scanner: {last_checked} UTC")
+
+    scanner_health = _leer_scanner_health()
+    if scanner_health:
+        counters = scanner_health.get("counters", {})
+        if not isinstance(counters, dict):
+            counters = {}
+        lat = scanner_health.get("latency_ms", {})
+        if not isinstance(lat, dict):
+            lat = {}
+        cycle_lat = (lat.get("cycle", {}) if isinstance(lat.get("cycle", {}), dict) else {})
+        notif_lat = (lat.get("notification", {}) if isinstance(lat.get("notification", {}), dict) else {})
+        cycles_total = int(counters.get("cycles_total", 0) or 0)
+        cycles_failed = int(counters.get("cycles_failed", 0) or 0)
+        failed_pct = (cycles_failed / cycles_total * 100.0) if cycles_total > 0 else 0.0
+        alerts_sent_total = int(counters.get("alerts_sent", 0) or 0)
+        alerts_failed_total = int(counters.get("alerts_failed", 0) or 0)
+        status = str(scanner_health.get("status", "unknown")).strip().upper()
+        hb = str(scanner_health.get("last_heartbeat_utc", "")).strip()
+        rss_mb = _safe_float_num(scanner_health.get("rss_mb"), 0.0)
+
+        st.markdown("### Salud operativa")
+        ch1, ch2, ch3, ch4, ch5, ch6 = st.columns(6)
+        ch1.metric("Estado", status)
+        ch2.metric("Ciclos", cycles_total)
+        ch3.metric("Fallo ciclos", f"{failed_pct:.1f}%")
+        ch4.metric("Lat ciclo prom.", f"{_safe_float_num(cycle_lat.get('avg_ms'), 0.0):.0f} ms")
+        ch5.metric("Lat envio prom.", f"{_safe_float_num(notif_lat.get('avg_ms'), 0.0):.0f} ms")
+        ch6.metric("RSS worker", f"{rss_mb:.0f} MB")
+        if hb:
+            st.caption(f"Heartbeat: {hb} UTC | Alertas enviadas: {alerts_sent_total} | fallidas: {alerts_failed_total}")
+
+        notif = scanner_health.get("notifications", {})
+        if isinstance(notif, dict):
+            notif_rows = []
+            for channel in ("telegram", "email", "windows"):
+                item = notif.get(channel, {})
+                if not isinstance(item, dict):
+                    item = {}
+                item_lat = item.get("latency_ms", {})
+                if not isinstance(item_lat, dict):
+                    item_lat = {}
+                attempts = int(item.get("attempts", 0) or 0)
+                sent = int(item.get("sent", 0) or 0)
+                failed = int(item.get("failed", 0) or 0)
+                sent_pct = (sent / attempts * 100.0) if attempts > 0 else 0.0
+                notif_rows.append(
+                    {
+                        "Canal": channel,
+                        "Intentos": attempts,
+                        "Enviadas": sent,
+                        "Fallidas": failed,
+                        "% exito": round(sent_pct, 2),
+                        "Lat prom. ms": round(_safe_float_num(item_lat.get("avg_ms"), 0.0), 2),
+                    }
+                )
+            st.dataframe(pd.DataFrame(notif_rows), use_container_width=True, hide_index=True)
+
+    if metrics_df.empty:
+        st.info("No hay datos del scanner_state para construir metricas.")
+    else:
+        st.caption("Metrica por simbolo/timeframe (win/loss/timeout, %acierto y RR promedio).")
+        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+        if int(precision_summary.get("resolved", 0) or 0) <= 0:
+            st.info("Aun no hay alertas cerradas. El ranking aparecera cuando existan resultados historicos.")
+        else:
+            st.caption("Ranking de pares/criptos que conviene operar, segun historial.")
+            if ranking_df.empty:
+                st.info("No hay suficientes datos para ranking operativo.")
+            else:
+                st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
 # ============================================================
 # BLOQUE: PANEL PRINCIPAL FLOTANTE (DECISION + CTA)

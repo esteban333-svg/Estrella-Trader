@@ -18,6 +18,7 @@
   "scan_gold": true,
   "precision_filters": {
     "enabled": true,
+    "alert_profile": "balanceado",
     "require_closed_candle": true,
     "closed_candle_grace_sec": 10,
     "persistence_bars": 2,
@@ -27,6 +28,11 @@
     "min_rr": 1.6,
     "adaptive_threshold": false,
     "adaptive_cooldown": true,
+    "quality_calibration_enabled": true,
+    "quality_calibration_min_resolved": 20,
+    "quality_calibration_scope": "global_and_record",
+    "quality_calibration_record_enabled": true,
+    "quality_calibration_record_min_resolved": 8,
     "max_alerts_per_symbol_day": 2,
     "min_mtf_confirmations": 1,
     "quality_window_bars": 12,
@@ -94,9 +100,7 @@
     },
     "telegram": {
       "enabled": true,
-      "chat_ids": [
-        "6751045178"
-      ],
+      "chat_ids": [],
       "parse_mode": "",
       "bot_username": "Estrella_TraderBot"
     },

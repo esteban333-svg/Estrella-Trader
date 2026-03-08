@@ -10,7 +10,10 @@ __pycache__/
 auth_cache.json
 analysis_cache.json
 scanner.log
+scanner.log.*
 scanner_state.json
+scanner_health.json
+scanner_worker.lock
 usuarios_db.json
 
 # Streamlit local secrets
