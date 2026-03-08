@@ -1397,6 +1397,16 @@ def _mentor_line(direction: str, riesgo: str, confidence: Any) -> str:
     return "Mentor: Contexto mixto; espera mejor estructura."
 
 
+def _signal_strength_label(estado: Dict[str, Any], dorado: Dict[str, Any]) -> str:
+    confidence = _safe_float(estado.get("confidence_score"), 0.0)
+    min_conf = _safe_float(estado.get("min_confidence_required"), 0.0)
+    rr = _safe_float(dorado.get("rr_estimado"), 0.0)
+    # FUERTE: supera claramente el umbral de confianza y ofrece RR robusto.
+    if confidence >= max(min_conf + 6.0, 86.0) and rr >= 2.0:
+        return "FUERTE"
+    return "DEBIL"
+
+
 def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str, Any], source: str) -> Tuple[str, str]:
     dorado = estado.get("dorado_v13") or {}
     score = dorado.get("micro_score")
@@ -1420,11 +1430,13 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
     confirmation_hint = _confirmation_hint(direction=direction, pattern=pattern_text)
     mentor_text = _mentor_line(direction=direction, riesgo=riesgo, confidence=confidence_text)
+    strength_label = _signal_strength_label(estado=estado, dorado=dorado)
 
     prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
-    subject = f"{prefix} DORADO | {item.ticker} | {temporalidad}"
+    subject = f"{prefix} DORADO {strength_label} | {item.ticker} | {temporalidad}"
 
     body = (
+        f"Fuerza: {strength_label}\n"
         f"Direccion: {direction}\n"
         f"Accion: {decision}\n"
         f"Entrada: {precio_alerta_text}\n"

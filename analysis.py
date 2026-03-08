@@ -34,6 +34,14 @@ def _bbands(series: pd.Series, length: int = 20, std: float = 2.0) -> pd.DataFra
     return pd.DataFrame({"BBL": lower, "BBM": mid, "BBU": upper})
 
 
+def _to_float_or_nan(value: Any) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float("nan")
+    return out
+
+
 def obtener_datos_robusto(ticker: str, period: str = "5d", interval: str = "15m") -> pd.DataFrame:
     """
     Descarga robusta: evita crasheos cuando yfinance devuelve vacío o falla.
@@ -522,6 +530,9 @@ def obtener_precio_live(ticker: str) -> Optional[float]:
 
 def calcular_indicadores(data):
     data = data.copy()
+    for col in ("Open", "High", "Low", "Close", "Volume"):
+        if col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors="coerce")
 
     # EMAs
     if _HAS_PANDAS_TA:
@@ -985,6 +996,11 @@ from typing import Dict, Any, Optional
 def _atr14(df: pd.DataFrame) -> float:
     """ATR(14) simple para umbrales adaptativos."""
     d = df.copy()
+    required = {"High", "Low", "Close"}
+    if not required.issubset(set(d.columns)):
+        return 1e-9
+    for col in ("High", "Low", "Close"):
+        d[col] = pd.to_numeric(d[col], errors="coerce")
     tr = np.maximum(
         d["High"] - d["Low"],
         np.maximum(
@@ -993,18 +1009,28 @@ def _atr14(df: pd.DataFrame) -> float:
         )
     )
     atr = pd.Series(tr).rolling(14).mean()
-    val = float(atr.iloc[-1]) if not pd.isna(atr.iloc[-1]) else 0.0
+    if atr.empty or pd.isna(atr.iloc[-1]):
+        return 1e-9
+    val = _to_float_or_nan(atr.iloc[-1])
+    if pd.isna(val):
+        return 1e-9
     return max(val, 1e-9)
 
 
 def _nivel_resistencia(df: pd.DataFrame, n: int = 50) -> float:
     """Resistencia simple: máximo reciente."""
-    return float(df["High"].tail(n).max())
+    if "High" not in df.columns:
+        return float("nan")
+    high = pd.to_numeric(df["High"], errors="coerce")
+    return _to_float_or_nan(high.tail(n).max())
 
 
 def _nivel_soporte(df: pd.DataFrame, n: int = 50) -> float:
     """Soporte simple: mínimo reciente."""
-    return float(df["Low"].tail(n).min())
+    if "Low" not in df.columns:
+        return float("nan")
+    low = pd.to_numeric(df["Low"], errors="coerce")
+    return _to_float_or_nan(low.tail(n).min())
 
 
 def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Dict[str, Any]]:
@@ -1019,10 +1045,17 @@ def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Di
         return None
 
     d = df.copy()
-    close = float(d["Close"].iloc[-1])
-    ema20 = float(d["EMA_20"].iloc[-1])
-    ema50 = float(d["EMA_50"].iloc[-1])
+    for col in ("High", "Low", "Close", "EMA_20", "EMA_50", "RSI"):
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
+    close = _to_float_or_nan(d["Close"].iloc[-1] if "Close" in d.columns and len(d) else float("nan"))
+    ema20 = _to_float_or_nan(d["EMA_20"].iloc[-1] if "EMA_20" in d.columns and len(d) else float("nan"))
+    ema50 = _to_float_or_nan(d["EMA_50"].iloc[-1] if "EMA_50" in d.columns and len(d) else float("nan"))
+    if pd.isna(close) or pd.isna(ema20) or pd.isna(ema50):
+        return None
     atr = _atr14(d)
+    if pd.isna(atr) or atr <= 0:
+        return None
 
     # =========================
     # Micro-score Dorado (0–7)
@@ -1045,6 +1078,8 @@ def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Di
     # 2) Zona técnica simple (proximidad a soporte/resistencia reciente)
     soporte = _nivel_soporte(d, n=50)
     resistencia = _nivel_resistencia(d, n=50)
+    if pd.isna(soporte) or pd.isna(resistencia):
+        return None
 
     # distancia relativa en ATR
     dist_soporte = abs(close - soporte) / atr
@@ -1182,12 +1217,23 @@ def calcular_micro_score_rojo(
 
     direccion = (direccion or "").upper().strip()
     d = df.copy()
+    for col in ("High", "Low", "Close", "EMA_20", "RSI"):
+        if col in d.columns:
+            d[col] = pd.to_numeric(d[col], errors="coerce")
 
-    close = float(d["Close"].iloc[-1])
-    ema20 = float(d["EMA_20"].iloc[-1])
+    close = _to_float_or_nan(d["Close"].iloc[-1] if "Close" in d.columns and len(d) else float("nan"))
+    ema20 = _to_float_or_nan(d["EMA_20"].iloc[-1] if "EMA_20" in d.columns and len(d) else float("nan"))
+    if pd.isna(close) or pd.isna(ema20):
+        return {
+            "micro_score": 0,
+            "nivel": "Bajo",
+            "razones": ["Datos incompletos para evaluar riesgo (Close/EMA20)."],
+        }
 
     # ATR para umbrales adaptativos
     atr = _atr14(d)
+    if pd.isna(atr) or atr <= 0:
+        atr = 1e-9
 
     # 1) Volatilidad extrema (ATR ratio)
     # Reutilizamos ATR(14) y un proxy con ATR(50) calculado rápido
