@@ -24,7 +24,7 @@
     "persistence_bars": 2,
     "multi_timeframe_filter": true,
     "require_price_action_confirmation": false,
-    "min_confidence_score": 76,
+    "min_confidence_score": 72,
     "min_rr": 1.6,
     "adaptive_threshold": false,
     "adaptive_cooldown": true,
