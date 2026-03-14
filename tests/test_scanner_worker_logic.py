@@ -98,6 +98,41 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertEqual(strong, "FUERTE")
         self.assertEqual(weak, "DEBIL")
 
+    def test_build_alert_payload_includes_pullback_metadata(self):
+        cfg = {"notification": {"subject_prefix": "[Estrella Trader]"}}
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTC-USD",
+            td_symbol="BTC/USD",
+            kind="crypto",
+        )
+        estado = {
+            "dorado_v13": {
+                "micro_score": 6,
+                "umbral": 4,
+                "rr_estimado": 2.1,
+                "setup_tipo": "pullback_tendencia",
+                "setup_label": "Pullback en tendencia",
+                "zona_pullback": "EMA20",
+            },
+            "riesgo": "Moderado",
+            "decision": "OPERAR CON DISCIPLINA",
+            "direccion_v13": "ALCISTA",
+            "temporalidad_alerta": "15m",
+            "modo_alerta": "Tendencial",
+            "precio_alerta": 102345.12,
+            "indice_alerta_utc": "2026-03-13T15:00:00Z",
+            "confidence_score": 88,
+            "min_confidence_required": 72,
+            "candle_pattern": "rechazo_alcista",
+            "alert_profile": "balanceado",
+        }
+        subject, body = sw._build_alert_payload(cfg, item, estado, "source")
+        self.assertIn("DORADO PULLBACK", subject)
+        self.assertIn("Setup: Pullback en tendencia", body)
+        self.assertIn("Zona: EMA20", body)
+
     def test_should_alert_respects_cooldown(self):
         record = {
             "dorado_streak": 2,
@@ -146,4 +181,3 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

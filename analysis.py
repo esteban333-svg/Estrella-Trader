@@ -1033,6 +1033,76 @@ def _nivel_soporte(df: pd.DataFrame, n: int = 50) -> float:
     return _to_float_or_nan(low.tail(n).min())
 
 
+def _dorado_setup_defaults() -> Dict[str, Any]:
+    return {
+        "setup_tipo": "",
+        "setup_label": "",
+        "zona_pullback": "",
+        "setup_descripcion": "",
+        "tendencia_alineada": False,
+    }
+
+
+def _classify_dorado_setup(
+        direccion: str,
+        close: float,
+        ema20: float,
+        ema50: float,
+        ema200: float,
+        atr: float,
+        soporte: float,
+        resistencia: float,
+) -> Dict[str, Any]:
+    meta = _dorado_setup_defaults()
+    direccion = (direccion or "").upper().strip()
+    values = (close, ema20, ema50, ema200, atr)
+    if direccion not in ("ALCISTA", "BAJISTA"):
+        return meta
+    if any(pd.isna(v) for v in values) or atr <= 0:
+        return meta
+
+    tendencia_alineada = (
+        ema20 > ema50 > ema200 if direccion == "ALCISTA"
+        else ema20 < ema50 < ema200
+    )
+    meta["tendencia_alineada"] = bool(tendencia_alineada)
+    if not tendencia_alineada:
+        return meta
+
+    dist_ema20 = abs(close - ema20) / atr
+    dist_ema50 = abs(close - ema50) / atr
+    dist_structure = (
+        abs(close - soporte) / atr if direccion == "ALCISTA" and not pd.isna(soporte)
+        else abs(resistencia - close) / atr if direccion == "BAJISTA" and not pd.isna(resistencia)
+        else float("inf")
+    )
+
+    aligned_price = (
+        close >= (ema50 - 0.8 * atr) if direccion == "ALCISTA"
+        else close <= (ema50 + 0.8 * atr)
+    )
+    near_ema = min(dist_ema20, dist_ema50) <= 1.2
+    if not (aligned_price and near_ema):
+        return meta
+
+    zone_candidates = [("EMA20", dist_ema20), ("EMA50", dist_ema50)]
+    if direccion == "ALCISTA" and not pd.isna(soporte):
+        zone_candidates.append(("soporte", dist_structure))
+    if direccion == "BAJISTA" and not pd.isna(resistencia):
+        zone_candidates.append(("resistencia", dist_structure))
+    zona_pullback, _ = min(zone_candidates, key=lambda item: item[1])
+
+    meta.update({
+        "setup_tipo": "pullback_tendencia",
+        "setup_label": "Pullback en tendencia",
+        "zona_pullback": zona_pullback,
+        "setup_descripcion": (
+            f"Pullback {direccion.lower()} en tendencia hacia {zona_pullback} con estructura alineada."
+        ),
+    })
+    return meta
+
+
 def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Dict[str, Any]]:
     """
     v1.3 — Dorado (micro-score de ventaja)
@@ -1146,6 +1216,17 @@ def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Di
         return None
 
     # Texto final sobrio
+    setup_meta = _classify_dorado_setup(
+        direccion=direccion,
+        close=close,
+        ema20=ema20,
+        ema50=ema50,
+        ema200=_to_float_or_nan(d["EMA_200"].iloc[-1] if "EMA_200" in d.columns and len(d) else float("nan")),
+        atr=atr,
+        soporte=soporte,
+        resistencia=resistencia,
+    )
+
     if direccion == "ALCISTA":
         if dist_soporte <= 1.5:
             score += 2
@@ -1170,14 +1251,22 @@ def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Di
             razones.append("Precio relativamente cercano a resistencia (zona posible).")
 
     # Textos consistentes (NO dependen de variables externas)
-    if direccion == "ALCISTA":
+    if setup_meta.get("setup_tipo") == "pullback_tendencia":
+        zona_pullback = str(setup_meta.get("zona_pullback", "")).strip() or "zona tecnica"
+        if direccion == "ALCISTA":
+            accion = "Pullback alcista en tendencia"
+            resumen = f"Pullback alcista detectado hacia {zona_pullback} (micro-score {score}/{umbral_final})"
+        else:
+            accion = "Pullback bajista en tendencia"
+            resumen = f"Pullback bajista detectado hacia {zona_pullback} (micro-score {score}/{umbral_final})"
+    elif direccion == "ALCISTA":
         accion = "Posible preparación alcista"
         resumen = f"Ventaja alcista detectada (micro-score {score}/{umbral_final})"
     else:
         accion = "Posible preparación bajista"
         resumen = f"Ventaja bajista detectada (micro-score {score}/{umbral_final})"
 
-    return {
+    payload = {
         "activo": True,
         "direccion": direccion,
         "micro_score": score,
@@ -1187,6 +1276,8 @@ def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Di
         "razones": razones[:5],  # limpio
         "rr_estimado": round(rr, 2),
     }
+    payload.update(setup_meta)
+    return payload
 
 
 from typing import Dict, Any, Optional
@@ -1347,6 +1438,9 @@ def construir_estado_final(
         "umbral": umbral,
         "dorado_v13": dorado,
         "rojo_v13": rojo,
+        "setup_tipo": (dorado or {}).get("setup_tipo", ""),
+        "setup_label": (dorado or {}).get("setup_label", ""),
+        "zona_pullback": (dorado or {}).get("zona_pullback", ""),
         "esfera": "🔵 Azul (análisis)",
         "decision": "OBSERVAR",
         "accion": "OBSERVAR",
@@ -1429,6 +1523,9 @@ def construir_estado_final_estructural(
         "umbral": umbral_1d,
         "dorado_v13": None,
         "rojo_v13": None,
+        "setup_tipo": "",
+        "setup_label": "",
+        "zona_pullback": "",
         "esfera": "🔵 Azul (análisis)",
         "decision": "OBSERVAR",
         "accion": "OBSERVAR",
@@ -1478,6 +1575,9 @@ def construir_estado_final_estructural(
                 impacto_memoria=impacto_memoria
             )
             estado["rojo_v13"] = rojo
+            estado["setup_tipo"] = dorado.get("setup_tipo", "")
+            estado["setup_label"] = dorado.get("setup_label", "")
+            estado["zona_pullback"] = dorado.get("zona_pullback", "")
             estado.update({
                 "esfera": "🟡 Dorada (criterio y decisión)",
                 "decision": "OPERAR CON DISCIPLINA",
@@ -1812,6 +1912,9 @@ def resumen_estado_humano(estado: Dict[str, Any], usuario: Dict[str, Any]) -> Di
     dorado_umbral = dorado.get("umbral") if isinstance(dorado, dict) else None
     dorado_razones = dorado.get("razones", []) if isinstance(dorado, dict) else []
     dorado_razones = [r for r in dorado_razones if isinstance(r, str) and r.strip()][:2]
+    dorado_setup_tipo = dorado.get("setup_tipo") if isinstance(dorado, dict) else None
+    dorado_setup_label = dorado.get("setup_label") if isinstance(dorado, dict) else None
+    dorado_setup_zone = dorado.get("zona_pullback") if isinstance(dorado, dict) else None
 
     # Rojo
     rojo_nivel = rojo.get("nivel") if isinstance(rojo, dict) else None
@@ -1835,6 +1938,9 @@ def resumen_estado_humano(estado: Dict[str, Any], usuario: Dict[str, Any]) -> Di
             "micro_score": dorado_score,
             "umbral": dorado_umbral,
             "razones": dorado_razones,
+            "setup_tipo": dorado_setup_tipo,
+            "setup_label": dorado_setup_label,
+            "zona_pullback": dorado_setup_zone,
         },
         "rojo": {
             "nivel": rojo_nivel,

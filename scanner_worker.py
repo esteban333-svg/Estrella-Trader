@@ -2328,6 +2328,9 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     confidence_text = str(estado.get("confidence_score", "N/A")).strip() or "N/A"
     pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
     profile_text = str(estado.get("alert_profile", "balanceado")).strip().upper()
+    setup_tipo = str(estado.get("setup_tipo", dorado.get("setup_tipo", ""))).strip().lower()
+    setup_label = str(estado.get("setup_label", dorado.get("setup_label", ""))).strip()
+    setup_zone = str(estado.get("zona_pullback", dorado.get("zona_pullback", ""))).strip()
     cal = estado.get("quality_calibration", {})
     cal_mode = ""
     if isinstance(cal, dict):
@@ -2347,10 +2350,14 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     strength_label = _signal_strength_label(estado=estado, dorado=dorado)
 
     prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
-    subject = f"{prefix} DORADO {strength_label} | {item.ticker} | {temporalidad}"
+    signal_label = "DORADO PULLBACK" if setup_tipo == "pullback_tendencia" else "DORADO"
+    subject = f"{prefix} {signal_label} {strength_label} | {item.ticker} | {temporalidad}"
+    setup_text = setup_label or ("Pullback en tendencia" if setup_tipo == "pullback_tendencia" else "Dorado tendencial")
 
     body = (
         f"Fuerza: {strength_label}\n"
+        f"Setup: {setup_text}\n"
+        f"Zona: {setup_zone or 'n/a'}\n"
         f"Perfil: {profile_text}\n"
         f"Calibracion: {cal_mode or 'n/a'}\n"
         f"Direccion: {direction}\n"
