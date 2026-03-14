@@ -1,6 +1,7 @@
 import os
 import unittest
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import pytz
 
@@ -132,6 +133,121 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertIn("DORADO PULLBACK", subject)
         self.assertIn("Setup: Pullback en tendencia", body)
         self.assertIn("Zona: EMA20", body)
+
+    def test_apply_precision_filters_allows_pullback_with_neutral_mtf(self):
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTC-USD",
+            td_symbol="BTC/USD",
+            kind="crypto",
+        )
+        cfg = {"interval": "15m", "cooldown_minutes": 60}
+        precision_cfg = {
+            "enabled": True,
+            "multi_timeframe_filter": True,
+            "require_price_action_confirmation": False,
+            "min_rr": 1.6,
+            "min_confidence_score": 72,
+            "min_mtf_confirmations": 1,
+            "adaptive_threshold": False,
+            "adaptive_cooldown": True,
+        }
+        estado = {
+            "dorado_v13": {
+                "rr_estimado": 2.4,
+                "setup_tipo": "pullback_tendencia",
+            },
+            "setup_tipo": "pullback_tendencia",
+            "direccion_v13": "ALCISTA",
+        }
+        compute_ctx = {"interval": "15m", "vol_ratio": 1.0, "df_ind": None}
+        mtf_info = {
+            "ok": False,
+            "score": 0,
+            "details": ["30m:NEUTRAL"],
+            "summary": "confirmaciones=0, opuestos=0, neutrales=1",
+            "confirmations": 0,
+            "opposites": 0,
+            "neutrals": 1,
+        }
+        candle_info = {"aligned": False, "bias": "ALCISTA", "pattern": "sin_patron", "score": 0}
+        with (
+            patch.object(sw, "_evaluate_mtf_alignment", return_value=mtf_info),
+            patch.object(sw, "_detect_price_action", return_value=candle_info),
+            patch.object(sw, "_compute_signal_confidence", return_value=68),
+            patch.object(sw, "_compute_dynamic_min_confidence", return_value=72),
+            patch.object(sw, "_compute_adaptive_cooldown_minutes", return_value=36),
+        ):
+            out = sw._apply_precision_filters(
+                item=item,
+                cfg=cfg,
+                estado=estado,
+                compute_ctx=compute_ctx,
+                mtf_cache={},
+                precision_cfg=precision_cfg,
+            )
+        self.assertTrue(out["signal_ready"])
+        self.assertTrue(out["mtf"]["ok"])
+        self.assertEqual(out["mtf"]["override"], "pullback_neutral")
+        self.assertEqual(out["reasons"], ["filtros_ok"])
+
+    def test_apply_precision_filters_keeps_neutral_mtf_block_for_non_pullback(self):
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTC-USD",
+            td_symbol="BTC/USD",
+            kind="crypto",
+        )
+        cfg = {"interval": "15m", "cooldown_minutes": 60}
+        precision_cfg = {
+            "enabled": True,
+            "multi_timeframe_filter": True,
+            "require_price_action_confirmation": False,
+            "min_rr": 1.6,
+            "min_confidence_score": 72,
+            "min_mtf_confirmations": 1,
+            "adaptive_threshold": False,
+            "adaptive_cooldown": True,
+        }
+        estado = {
+            "dorado_v13": {
+                "rr_estimado": 2.4,
+                "setup_tipo": "",
+            },
+            "setup_tipo": "",
+            "direccion_v13": "ALCISTA",
+        }
+        compute_ctx = {"interval": "15m", "vol_ratio": 1.0, "df_ind": None}
+        mtf_info = {
+            "ok": False,
+            "score": 0,
+            "details": ["30m:NEUTRAL"],
+            "summary": "confirmaciones=0, opuestos=0, neutrales=1",
+            "confirmations": 0,
+            "opposites": 0,
+            "neutrals": 1,
+        }
+        candle_info = {"aligned": False, "bias": "ALCISTA", "pattern": "sin_patron", "score": 0}
+        with (
+            patch.object(sw, "_evaluate_mtf_alignment", return_value=mtf_info),
+            patch.object(sw, "_detect_price_action", return_value=candle_info),
+            patch.object(sw, "_compute_signal_confidence", return_value=68),
+            patch.object(sw, "_compute_dynamic_min_confidence", return_value=72),
+            patch.object(sw, "_compute_adaptive_cooldown_minutes", return_value=36),
+        ):
+            out = sw._apply_precision_filters(
+                item=item,
+                cfg=cfg,
+                estado=estado,
+                compute_ctx=compute_ctx,
+                mtf_cache={},
+                precision_cfg=precision_cfg,
+            )
+        self.assertFalse(out["signal_ready"])
+        self.assertIn("mtf_no_alineado", out["reasons"])
+        self.assertIn("confianza_baja(<72)", out["reasons"])
 
     def test_should_alert_respects_cooldown(self):
         record = {

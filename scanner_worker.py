@@ -1828,6 +1828,7 @@ def _evaluate_mtf_alignment(
             "summary": "Sin filtros MTF requeridos para este timeframe.",
             "confirmations": 0,
             "opposites": 0,
+            "neutrals": 0,
         }
 
     opposite = _opposite_direction(base_direction)
@@ -1887,6 +1888,7 @@ def _evaluate_mtf_alignment(
         "summary": f"confirmaciones={confirmations}, opuestos={opposites}, neutrales={neutrals}",
         "confirmations": confirmations,
         "opposites": opposites,
+        "neutrals": neutrals,
     }
 
 
@@ -1960,6 +1962,32 @@ def _compute_signal_confidence(
 
     raw = score_component + rr_component + mtf_component + candle_component
     return max(0, min(100, int(round(raw))))
+
+
+def _should_allow_pullback_neutral_mtf(
+    *,
+    setup_tipo: str,
+    base_interval: str,
+    rr: float,
+    mtf_info: Dict[str, Any],
+    confidence_score: int,
+    min_confidence: int,
+) -> bool:
+    if str(setup_tipo or "").strip().lower() != "pullback_tendencia":
+        return False
+    if str(base_interval or "").strip() not in {"15m", "30m"}:
+        return False
+    if _safe_float(rr, 0.0) < 2.0:
+        return False
+    if int(confidence_score or 0) < max(0, int(min_confidence or 0) - 6):
+        return False
+    if int(mtf_info.get("opposites", 0) or 0) != 0:
+        return False
+    if int(mtf_info.get("confirmations", 0) or 0) != 0:
+        return False
+    if int(mtf_info.get("neutrals", 0) or 0) <= 0:
+        return False
+    return True
 
 
 def _daily_alert_count(record: Dict[str, Any]) -> int:
@@ -2693,6 +2721,7 @@ def _apply_precision_filters(
 
     dorado = estado.get("dorado_v13") or {}
     dorado_now = bool(dorado)
+    setup_tipo = str(estado.get("setup_tipo", dorado.get("setup_tipo", ""))).strip().lower()
     direction = str(estado.get("direccion_v13", "NEUTRAL")).upper().strip() or "NEUTRAL"
     interval = str(compute_ctx.get("interval") or estado.get("analysis_interval") or cfg.get("interval", "15m")).strip()
     vol_ratio = _safe_float(compute_ctx.get("vol_ratio", estado.get("vol_ratio", 1.0)), 1.0)
@@ -2733,6 +2762,25 @@ def _apply_precision_filters(
         precision_cfg=effective_cfg,
     ) if enabled else 0
     confidence_ok = confidence_score >= min_confidence
+    pullback_neutral_mtf_ok = enabled and _should_allow_pullback_neutral_mtf(
+        setup_tipo=setup_tipo,
+        base_interval=interval,
+        rr=rr,
+        mtf_info=mtf_info,
+        confidence_score=confidence_score,
+        min_confidence=min_confidence,
+    )
+    if pullback_neutral_mtf_ok:
+        mtf_info = dict(mtf_info)
+        mtf_info["ok"] = True
+        mtf_info["override"] = "pullback_neutral"
+        summary = str(mtf_info.get("summary", "")).strip()
+        mtf_info["summary"] = (
+            f"{summary} | override=pullback_neutral"
+            if summary
+            else "override=pullback_neutral"
+        )
+        confidence_ok = True
 
     cooldown_effective = _compute_adaptive_cooldown_minutes(
         cfg=cfg,
