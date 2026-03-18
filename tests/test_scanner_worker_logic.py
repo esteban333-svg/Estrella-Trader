@@ -341,6 +341,15 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             else:
                 os.environ[key] = prev
 
+    def test_compact_memory_sweep_calls_gc_and_trim(self):
+        with (
+            patch.object(sw.gc, "collect") as gc_collect,
+            patch.object(sw, "_trim_process_memory") as trim_memory,
+        ):
+            sw._compact_memory_sweep()
+        gc_collect.assert_called_once_with()
+        trim_memory.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

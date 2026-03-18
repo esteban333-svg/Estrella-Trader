@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import gc
 import json
 import logging
@@ -201,6 +202,24 @@ def _current_process_rss_mb() -> float:
     except Exception:
         return 0.0
     return 0.0
+
+
+def _trim_process_memory() -> None:
+    try:
+        if os.name != "posix":
+            return
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is None:
+            return
+        malloc_trim(0)
+    except Exception:
+        return
+
+
+def _compact_memory_sweep() -> None:
+    gc.collect()
+    _trim_process_memory()
 
 
 def _trim_df_for_interval(df: pd.DataFrame | None, interval: str, cfg: Dict[str, Any]) -> pd.DataFrame | None:
@@ -3286,10 +3305,10 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             cycle_metrics["records_success"] = int(cycle_metrics.get("records_success", 0) or 0) + 1
             _observe_latency(cycle_metrics.get("latency_ms", {}).get("record_eval", {}), (time.perf_counter() - record_eval_started) * 1000.0)
             if compact_mode and int(cycle_metrics.get("records_total", 0) or 0) % 8 == 0:
-                gc.collect()
+                _compact_memory_sweep()
 
     if compact_mode:
-        gc.collect()
+        _compact_memory_sweep()
     rss_end = _current_process_rss_mb()
     cycle_metrics["rss_end_mb"] = rss_end
     cycle_metrics["rss_peak_mb"] = max(float(cycle_metrics.get("rss_peak_mb", 0.0) or 0.0), rss_end)
