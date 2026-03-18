@@ -1990,6 +1990,16 @@ def _should_allow_pullback_neutral_mtf(
     return True
 
 
+def _compute_dorado_active_state(
+    signal_ready: bool,
+    current_streak: int,
+    persistence_bars: int,
+) -> bool:
+    if not signal_ready:
+        return False
+    return int(current_streak or 0) >= max(1, int(persistence_bars))
+
+
 def _daily_alert_count(record: Dict[str, Any]) -> int:
     day_key = _utc_day_key()
     per_day = record.get("daily_alert_counts", {})
@@ -3258,7 +3268,11 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                     cycle_metrics.setdefault("errors", []).append(f"{record_key}: {record['last_error']}")
                     logging.error("[%s|%s] Fallo envio alerta: %s", item.state_key, target_key, record["last_error"])
 
-            record["dorado_active"] = signal_ready
+            record["dorado_active"] = _compute_dorado_active_state(
+                signal_ready=signal_ready,
+                current_streak=current_streak,
+                persistence_bars=persistence_bars,
+            )
             record["last_source"] = source
             record["decision"] = estado.get("decision", "")
             record["riesgo"] = estado.get("riesgo", "")

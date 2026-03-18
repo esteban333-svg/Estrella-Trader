@@ -277,6 +277,53 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             )
         )
 
+    def test_persistence_allows_first_alert_on_second_bar(self):
+        record = {
+            "dorado_streak": 1,
+            "dorado_active": False,
+            "last_alert_utc": "",
+        }
+        self.assertFalse(
+            sw._should_alert(
+                record=record,
+                signal_ready=True,
+                cooldown_minutes=60,
+                persistence_bars=2,
+                max_alerts_per_symbol_day=0,
+            )
+        )
+        record["dorado_active"] = sw._compute_dorado_active_state(
+            signal_ready=True,
+            current_streak=1,
+            persistence_bars=2,
+        )
+        self.assertFalse(record["dorado_active"])
+        record["dorado_streak"] = 2
+        self.assertTrue(
+            sw._should_alert(
+                record=record,
+                signal_ready=True,
+                cooldown_minutes=60,
+                persistence_bars=2,
+                max_alerts_per_symbol_day=0,
+            )
+        )
+        record["dorado_active"] = sw._compute_dorado_active_state(
+            signal_ready=True,
+            current_streak=2,
+            persistence_bars=2,
+        )
+        self.assertTrue(record["dorado_active"])
+        self.assertFalse(
+            sw._should_alert(
+                record=record,
+                signal_ready=True,
+                cooldown_minutes=60,
+                persistence_bars=2,
+                max_alerts_per_symbol_day=0,
+            )
+        )
+
     def test_redact_text_hides_sensitive_values(self):
         key = "TELEGRAM_BOT_TOKEN"
         prev = os.environ.get(key)
