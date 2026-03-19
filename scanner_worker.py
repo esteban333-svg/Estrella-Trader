@@ -269,6 +269,7 @@ def _apply_resource_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     tuned = dict(cfg)
     tuned["resource_profile"] = "render_512mb"
     # In 512MB, structural + many intervals aumentan RAM/latencia.
+    tuned["scan_forex"] = False
     tuned["scan_structural_1d_4h"] = False
     tuned["auto_multi_interval"] = True
     tuned["scan_intervals"] = ["15m", "1h"]
@@ -312,7 +313,7 @@ def _default_config() -> Dict[str, Any]:
         "scan_intervals": ["15m", "30m", "1h", "4h"],
         "scan_structural_1d_4h": True,
         "cooldown_minutes": 60,
-        "scan_forex": True,
+        "scan_forex": False,
         "scan_crypto": True,
         "scan_gold": True,
         "resource_profile": "default",

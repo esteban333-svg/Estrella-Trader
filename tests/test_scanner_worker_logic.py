@@ -48,6 +48,27 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertFalse(out["require_price_action_confirmation"])
         self.assertEqual(out["persistence_bars"], 1)
 
+    def test_render_512mb_profile_disables_forex(self):
+        cfg = {
+            "resource_profile": "render_512mb",
+            "scan_forex": True,
+            "scan_crypto": True,
+            "scan_gold": True,
+            "scan_structural_1d_4h": True,
+            "scan_intervals": ["15m", "30m", "1h", "4h"],
+            "poll_interval_sec": 60,
+            "forex_pairs": ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD"],
+            "crypto_symbols": ["BTC", "ETH", "SOL", "BNB", "XRP"],
+            "gold_symbols": ["XAU/USD"],
+            "runtime_limits": {},
+        }
+        out = sw._apply_resource_profile(cfg)
+        self.assertEqual(out["resource_profile"], "render_512mb")
+        self.assertFalse(out["scan_forex"])
+        self.assertFalse(out["scan_structural_1d_4h"])
+        self.assertEqual(out["scan_intervals"], ["15m", "1h"])
+        self.assertGreaterEqual(out["poll_interval_sec"], 90)
+
     def test_global_quality_calibration_tighten_hard(self):
         cfg = {
             "enabled": True,
