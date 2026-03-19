@@ -3051,10 +3051,16 @@ mercados = {
     "S&P 500": "^GSPC",
     "Cripto": "CRYPTO"
 }
+mercados_visibles = ["Cripto", "Oro (XAU/USD)"]
+mercado_ui_default = str(st.session_state.get("mercado_nombre_ui", "Cripto"))
+if mercado_ui_default not in mercados_visibles:
+    mercado_ui_default = "Cripto"
 
 mercado_nombre = st.sidebar.selectbox(
     "Selecciona mercado",
-    list(mercados.keys())
+    mercados_visibles,
+    index=mercados_visibles.index(mercado_ui_default),
+    key="mercado_nombre_ui",
 )
 mercado_abierto = mercado_abierto_ahora(mercado_nombre)
 if not mercado_abierto:
