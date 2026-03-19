@@ -3714,17 +3714,6 @@ if es_premium and st.session_state.get("debug_v13", False):
     )
     st.markdown(diag_html, unsafe_allow_html=True)
 
-    metrics_df, ranking_df, precision_summary = _scanner_precision_panel_data()
-    st.markdown("### Precision medible")
-    cpm1, cpm2, cpm3, cpm4 = st.columns(4)
-    cpm1.metric("Resueltas", int(precision_summary.get("resolved", 0) or 0))
-    cpm2.metric("Acierto global", f"{_safe_float_num(precision_summary.get('accuracy_pct'), 0.0):.1f}%")
-    cpm3.metric("RR promedio", f"{_safe_float_num(precision_summary.get('rr_avg'), 0.0):.2f}")
-    cpm4.metric("Activos recomendados", int(precision_summary.get("recommend_count", 0) or 0))
-    last_checked = str(precision_summary.get("last_checked_utc", "")).strip()
-    if last_checked:
-        st.caption(f"Ultima lectura scanner: {last_checked} UTC")
-
     scanner_health = _leer_scanner_health()
     if scanner_health:
         counters = scanner_health.get("counters", {})
@@ -3780,20 +3769,6 @@ if es_premium and st.session_state.get("debug_v13", False):
                     }
                 )
             st.dataframe(pd.DataFrame(notif_rows), use_container_width=True, hide_index=True)
-
-    if metrics_df.empty:
-        st.info("No hay datos del scanner_state para construir metricas.")
-    else:
-        st.caption("Metrica por simbolo/timeframe (win/loss/timeout, %acierto y RR promedio).")
-        st.dataframe(metrics_df, use_container_width=True, hide_index=True)
-        if int(precision_summary.get("resolved", 0) or 0) <= 0:
-            st.info("Aun no hay alertas cerradas. El ranking aparecera cuando existan resultados historicos.")
-        else:
-            st.caption("Ranking de pares/criptos que conviene operar, segun historial.")
-            if ranking_df.empty:
-                st.info("No hay suficientes datos para ranking operativo.")
-            else:
-                st.dataframe(ranking_df, use_container_width=True, hide_index=True)
 
 # ============================================================
 # BLOQUE: PANEL PRINCIPAL FLOTANTE (DECISION + CTA)
