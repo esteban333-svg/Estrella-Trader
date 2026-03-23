@@ -62,6 +62,8 @@ services:
         value: "1"
       - key: TZ
         value: America/Bogota
+      - key: AUTH_COOKIE_PASSWORD
+        sync: false
       - key: SMTP_HOST
         sync: false
       - key: SMTP_PORT

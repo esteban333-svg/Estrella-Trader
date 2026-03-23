@@ -25,6 +25,8 @@ Variables secretas recomendadas:
 - `ALERT_TELEGRAM_CHAT_IDS`
 - `RELEASE_VERSION` (ej: `2026.03.08-r1`)
 
+`AUTH_COOKIE_PASSWORD` debe estar en web y worker con el mismo valor para que el worker pueda resolver los enlaces `t.me/...?...start=...` aunque Streamlit se duerma.
+
 Referencia rapida: `env.render.example`.
 
 Antes de desplegar, corre validacion local:

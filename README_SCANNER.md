@@ -9,7 +9,7 @@ Canales soportados:
 
 ## Archivos
 
-- `scanner_worker.py`: loop de escaneo forex + cripto y envio de alertas.
+- `scanner_worker.py`: loop de escaneo cripto + oro y envio de alertas.
 - `scanner_config.json`: configuracion de watchlist, intervalo y destino de alertas.
 - `scanner_health.json`: estado de salud operativo (errores, latencia, envios).
 - `check_scanner_health.py`: valida salud y retorna exit code util para monitoreo.
@@ -43,6 +43,7 @@ Variables y config:
 
 - `TELEGRAM_BOT_TOKEN` en variable de entorno de Windows/usuario.
 - `TELEGRAM_BOT_USERNAME` (opcional, para el boton "Abrir bot de Telegram" en la UI).
+- `AUTH_COOKIE_PASSWORD` debe coincidir entre web y worker para que el worker aprenda y persista el `chat_id` desde el `/start` del bot.
 - Cada usuario debe guardar su `Chat ID Telegram` en la seccion `Cuenta` de la app.
 - `scanner_config.json` -> `notification.telegram.chat_ids`
   - Opcional como fallback/admin si no hay usuarios con chat id configurado.
@@ -53,7 +54,7 @@ Variables y config:
 
 ### Limites por plan (automatico)
 
-- Usuario gratis: `1` señal Dorado por dia por mercado (ejemplo: `Forex|EUR/USD`, `Cripto|BTC`).
+- Usuario gratis: `1` señal Dorado por dia por mercado (ejemplo: `Cripto|BTC|15m`, `Oro|XAU/USD|1h`).
 - Usuario premium: sin limite (recibe todas las activaciones Dorado).
 - El limite se aplica en `scanner_worker.py` aunque la web/app este cerrada.
 
@@ -76,8 +77,8 @@ Edita `scanner_config.json`:
 - `scan_structural_1d_4h`: si `true`, agrega tambien alertas estructurales `1D + 4H`.
 - `poll_interval_sec`: cada cuantos segundos escanea
 - `interval`: temporalidad de velas (`1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`)
-- `scan_forex` / `scan_crypto` / `scan_gold`
-- `forex_pairs` / `crypto_symbols` / `gold_symbols`
+- `scan_crypto` / `scan_gold`
+- `crypto_symbols` / `gold_symbols`
   - Oro default: `XAU/USD` (`GC=F` en yfinance, `XAU/USD` en TwelveData)
 - `cooldown_minutes`: evita spam de alertas repetidas
 - `notification.*.enabled`: activa/desactiva cada canal

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -34,10 +35,11 @@ DEFAULT_CONFIG_PATH = ROOT / "scanner_config.json"
 DEFAULT_STATE_PATH = ROOT / "scanner_state.json"
 DEFAULT_LOG_PATH = ROOT / "scanner.log"
 DEFAULT_HEALTH_PATH = ROOT / "scanner_health.json"
-USERS_DB_PATH = ROOT / "usuarios_db.json"
+USERS_DB_PATH = Path(os.getenv("USERS_DB_PATH", str(ROOT / "usuarios_db.json"))).resolve()
 LOCK_PATH = ROOT / "scanner_worker.lock"
 TELEGRAM_AUTO_CHAT_IDS_KEY = "telegram_auto_chat_ids"
 TELEGRAM_LAST_UPDATE_ID_KEY = "telegram_last_update_id"
+TELEGRAM_USER_CHAT_LINKS_KEY = "telegram_user_chat_links"
 
 NY_TZ = pytz.timezone("America/New_York")
 
@@ -49,16 +51,6 @@ TD_INTERVAL_MAP = {
     "1h": "1h",
     "4h": "4h",
     "1d": "1day",
-}
-
-FOREX_MAP = {
-    "EUR/USD": {"ticker": "EURUSD=X", "td": "EUR/USD"},
-    "GBP/USD": {"ticker": "GBPUSD=X", "td": "GBP/USD"},
-    "USD/JPY": {"ticker": "JPY=X", "td": "USD/JPY"},
-    "USD/CHF": {"ticker": "CHF=X", "td": "USD/CHF"},
-    "AUD/USD": {"ticker": "AUDUSD=X", "td": "AUD/USD"},
-    "USD/CAD": {"ticker": "CAD=X", "td": "USD/CAD"},
-    "NZD/USD": {"ticker": "NZDUSD=X", "td": "NZD/USD"},
 }
 
 CRYPTO_MAP = {
@@ -99,6 +91,7 @@ SENSITIVE_ENV_KEYS = [
 TOKEN_PATTERN = re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b")
 EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 CHAT_ID_PATTERN = re.compile(r"(?:(?<=^)|(?<=[\s,;]))-?\d{8,}(?=\s*:)")
+TELEGRAM_START_CODE_PATTERN = re.compile(r"\bet[a-f0-9]{16}\b")
 
 
 @dataclass(frozen=True)
@@ -107,7 +100,7 @@ class MarketItem:
     label: str
     ticker: str
     td_symbol: str
-    kind: str  # "forex" | "crypto"
+    kind: str  # "crypto" | "gold"
 
     @property
     def state_key(self) -> str:
@@ -269,15 +262,11 @@ def _apply_resource_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
     tuned = dict(cfg)
     tuned["resource_profile"] = "render_512mb"
     # In 512MB, structural + many intervals aumentan RAM/latencia.
-    tuned["scan_forex"] = False
     tuned["scan_structural_1d_4h"] = False
     tuned["auto_multi_interval"] = True
     tuned["scan_intervals"] = ["15m", "1h"]
     tuned["poll_interval_sec"] = max(90, int(tuned.get("poll_interval_sec", 60)))
 
-    forex = tuned.get("forex_pairs", [])
-    if isinstance(forex, list) and len(forex) > 4:
-        tuned["forex_pairs"] = forex[:4]
     crypto = tuned.get("crypto_symbols", [])
     if isinstance(crypto, list) and len(crypto) > 4:
         tuned["crypto_symbols"] = crypto[:4]
@@ -313,7 +302,6 @@ def _default_config() -> Dict[str, Any]:
         "scan_intervals": ["15m", "30m", "1h", "4h"],
         "scan_structural_1d_4h": True,
         "cooldown_minutes": 60,
-        "scan_forex": False,
         "scan_crypto": True,
         "scan_gold": True,
         "resource_profile": "default",
@@ -371,7 +359,6 @@ def _default_config() -> Dict[str, Any]:
                 "1d": 720,
             },
         },
-        "forex_pairs": list(FOREX_MAP.keys()),
         "crypto_symbols": list(CRYPTO_MAP.keys()),
         "gold_symbols": list(GOLD_MAP.keys()),
         "notification": {
@@ -515,6 +502,60 @@ def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, An
     return merged
 
 
+def _is_legacy_forex_key(value: Any) -> bool:
+    return str(value or "").strip().startswith("Forex|")
+
+
+def _sanitize_legacy_forex_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    clean = dict(payload)
+    clean.pop("scan_forex", None)
+    clean.pop("forex_pairs", None)
+    return clean
+
+
+def _prune_legacy_forex_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return {"symbols": {}, "free_daily_market_alerts": {}}
+
+    symbols = state.get("symbols", {})
+    if isinstance(symbols, dict):
+        state["symbols"] = {
+            key: value for key, value in symbols.items()
+            if not _is_legacy_forex_key(key)
+        }
+
+    free_alerts = state.get("free_daily_market_alerts", {})
+    if isinstance(free_alerts, dict):
+        clean_free_alerts: Dict[str, Any] = {}
+        for user_id, user_state in free_alerts.items():
+            if not isinstance(user_state, dict):
+                continue
+            filtered = {
+                key: value for key, value in user_state.items()
+                if not _is_legacy_forex_key(key)
+            }
+            if filtered:
+                clean_free_alerts[user_id] = filtered
+        state["free_daily_market_alerts"] = clean_free_alerts
+
+    return state
+
+
+def _prune_legacy_forex_from_health(health: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(health, dict):
+        return _default_health_state()
+
+    recent_errors = health.get("recent_errors", [])
+    if isinstance(recent_errors, list):
+        health["recent_errors"] = [
+            err for err in recent_errors
+            if not _is_legacy_forex_key((err.get("message", "") if isinstance(err, dict) else err))
+        ]
+    return health
+
+
 def _read_json(path: Path, fallback: Dict[str, Any]) -> Dict[str, Any]:
     try:
         if not path.exists():
@@ -538,7 +579,7 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         logging.info("Config creada en %s", config_path)
         return defaults
     user_cfg = _read_json(config_path, {})
-    return _merge_dicts(defaults, user_cfg)
+    return _merge_dicts(defaults, _sanitize_legacy_forex_config(user_cfg))
 
 
 def load_state(state_path: Path) -> Dict[str, Any]:
@@ -550,11 +591,13 @@ def load_state(state_path: Path) -> Dict[str, Any]:
         state["free_daily_market_alerts"] = {}
     if not isinstance(state.get(TELEGRAM_AUTO_CHAT_IDS_KEY), list):
         state[TELEGRAM_AUTO_CHAT_IDS_KEY] = []
+    if not isinstance(state.get(TELEGRAM_USER_CHAT_LINKS_KEY), dict):
+        state[TELEGRAM_USER_CHAT_LINKS_KEY] = {}
     try:
         state[TELEGRAM_LAST_UPDATE_ID_KEY] = int(state.get(TELEGRAM_LAST_UPDATE_ID_KEY, 0) or 0)
     except Exception:
         state[TELEGRAM_LAST_UPDATE_ID_KEY] = 0
-    return state
+    return _prune_legacy_forex_from_state(state)
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
@@ -708,7 +751,7 @@ def _ensure_health_shape(health: Dict[str, Any] | None) -> Dict[str, Any]:
 
 
 def load_health(health_path: Path) -> Dict[str, Any]:
-    return _ensure_health_shape(_read_json(health_path, _default_health_state()))
+    return _prune_legacy_forex_from_health(_ensure_health_shape(_read_json(health_path, _default_health_state())))
 
 
 def save_health(health_path: Path, health: Dict[str, Any]) -> None:
@@ -931,6 +974,86 @@ def _dedupe_chat_ids(chat_ids: List[str]) -> List[str]:
     return clean
 
 
+def _auth_cookie_password() -> str:
+    auth_secret = str(os.getenv("AUTH_COOKIE_PASSWORD", "") or "").strip()
+    if auth_secret:
+        return auth_secret
+
+    host_name = os.getenv("COMPUTERNAME", os.getenv("HOSTNAME", "local"))
+    app_path = os.path.abspath(str(ROOT / "app.py"))
+    seed = f"{host_name}|{app_path}|estrella-auth-fallback"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _telegram_start_code_usuario(user_id: str) -> str:
+    uid = str(user_id or "").strip().lower()
+    auth_secret = _auth_cookie_password()
+    if not uid or not auth_secret:
+        return ""
+    raw = f"{uid}|{auth_secret}|telegram-link"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return f"et{digest[:16]}"
+
+
+def _extract_start_links_from_update(update: Dict[str, Any]) -> List[Tuple[str, str]]:
+    links: List[Tuple[str, str]] = []
+    if not isinstance(update, dict):
+        return links
+
+    for key in ("message", "edited_message", "channel_post", "edited_channel_post"):
+        payload = update.get(key, {})
+        if not isinstance(payload, dict):
+            continue
+        chat = payload.get("chat", {})
+        if not isinstance(chat, dict):
+            continue
+        chat_id = _normalizar_telegram_chat_id(chat.get("id", ""))
+        if not _chat_id_telegram_valido(chat_id):
+            continue
+
+        text = str(payload.get("text", "") or payload.get("caption", "")).strip().lower()
+        if not text:
+            continue
+
+        for match in TELEGRAM_START_CODE_PATTERN.findall(text):
+            links.append((match, chat_id))
+
+    return links
+
+
+def _normalize_telegram_user_chat_links(state: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    raw_links = state.get(TELEGRAM_USER_CHAT_LINKS_KEY, {})
+    if not isinstance(raw_links, dict):
+        state[TELEGRAM_USER_CHAT_LINKS_KEY] = {}
+        return {}
+
+    clean_links: Dict[str, Dict[str, str]] = {}
+    for raw_user_id, raw_payload in raw_links.items():
+        user_id = str(raw_user_id or "").strip()
+        if not user_id:
+            continue
+
+        chat_id = ""
+        updated_utc = ""
+        if isinstance(raw_payload, dict):
+            chat_id = _normalizar_telegram_chat_id(raw_payload.get("chat_id", ""))
+            updated_utc = str(raw_payload.get("updated_utc", "") or "").strip()
+        else:
+            chat_id = _normalizar_telegram_chat_id(raw_payload)
+
+        if not _chat_id_telegram_valido(chat_id):
+            continue
+
+        clean_links[user_id] = {
+            "chat_id": chat_id,
+            "updated_utc": updated_utc,
+            "source": "telegram_start",
+        }
+
+    state[TELEGRAM_USER_CHAT_LINKS_KEY] = clean_links
+    return clean_links
+
+
 def _coin_image_url_for_telegram(cfg: Dict[str, Any], item: MarketItem | None) -> str:
     if item is None or str(item.kind).lower() != "crypto":
         return ""
@@ -983,12 +1106,28 @@ def _extract_chat_ids_from_update(update: Dict[str, Any]) -> List[str]:
     return _dedupe_chat_ids(ids)
 
 
-def _discover_telegram_chats_from_updates(state: Dict[str, Any]) -> Tuple[List[str], str]:
+def _discover_telegram_chats_from_updates(
+    state: Dict[str, Any],
+    user_records: List[Dict[str, Any]] | None = None,
+) -> Tuple[List[str], Dict[str, Dict[str, str]], str]:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     known_ids = _dedupe_chat_ids(state.get(TELEGRAM_AUTO_CHAT_IDS_KEY, []))
+    user_chat_links = _normalize_telegram_user_chat_links(state)
+    start_code_map: Dict[str, str] = {}
+    for raw_user in user_records or []:
+        if not isinstance(raw_user, dict):
+            continue
+        user_id = str(raw_user.get("id", "") or "").strip()
+        if not user_id:
+            continue
+        start_code = _telegram_start_code_usuario(user_id)
+        if start_code:
+            start_code_map[start_code] = user_id
+
     if not token:
         state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
-        return known_ids, "TELEGRAM_BOT_TOKEN no configurado."
+        state[TELEGRAM_USER_CHAT_LINKS_KEY] = user_chat_links
+        return known_ids, user_chat_links, "TELEGRAM_BOT_TOKEN no configurado."
 
     try:
         last_update_id = int(state.get(TELEGRAM_LAST_UPDATE_ID_KEY, 0) or 0)
@@ -1007,22 +1146,26 @@ def _discover_telegram_chats_from_updates(state: Dict[str, Any]) -> Tuple[List[s
         )
         if resp.status_code >= 400:
             state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
-            return known_ids, _redact_text(f"HTTP {resp.status_code} al consultar getUpdates.")
+            state[TELEGRAM_USER_CHAT_LINKS_KEY] = user_chat_links
+            return known_ids, user_chat_links, _redact_text(f"HTTP {resp.status_code} al consultar getUpdates.")
         payload = resp.json()
         if not payload.get("ok", False):
             state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
-            return known_ids, _redact_text(payload.get("description", "Error getUpdates sin descripcion."))
+            state[TELEGRAM_USER_CHAT_LINKS_KEY] = user_chat_links
+            return known_ids, user_chat_links, _redact_text(payload.get("description", "Error getUpdates sin descripcion."))
         updates = payload.get("result", [])
         if not isinstance(updates, list):
             updates = []
     except Exception as exc:
         state[TELEGRAM_AUTO_CHAT_IDS_KEY] = known_ids
-        return known_ids, _redact_text(str(exc))
+        state[TELEGRAM_USER_CHAT_LINKS_KEY] = user_chat_links
+        return known_ids, user_chat_links, _redact_text(str(exc))
 
     max_update_id = last_update_id
     merged = list(known_ids)
     seen = set(merged)
     added = 0
+    linked = 0
     for upd in updates:
         if not isinstance(upd, dict):
             continue
@@ -1040,11 +1183,28 @@ def _discover_telegram_chats_from_updates(state: Dict[str, Any]) -> Tuple[List[s
             merged.append(cid)
             added += 1
 
+        for start_code, chat_id in _extract_start_links_from_update(upd):
+            user_id = start_code_map.get(start_code, "")
+            if not user_id:
+                continue
+            current = user_chat_links.get(user_id, {}) if isinstance(user_chat_links.get(user_id, {}), dict) else {}
+            if str(current.get("chat_id", "") or "").strip() == chat_id:
+                continue
+            user_chat_links[user_id] = {
+                "chat_id": chat_id,
+                "updated_utc": _iso_utc_now(),
+                "source": "telegram_start",
+            }
+            linked += 1
+
     state[TELEGRAM_AUTO_CHAT_IDS_KEY] = merged
     state[TELEGRAM_LAST_UPDATE_ID_KEY] = max_update_id
+    state[TELEGRAM_USER_CHAT_LINKS_KEY] = user_chat_links
     if added > 0:
         logging.info("Telegram: %s chat(s) nuevos detectados via getUpdates.", added)
-    return merged, ""
+    if linked > 0:
+        logging.info("Telegram: %s vinculo(s) user/chat actualizados via /start.", linked)
+    return merged, user_chat_links, ""
 
 
 def _premium_activo_usuario(record: Dict[str, Any]) -> bool:
@@ -1059,20 +1219,32 @@ def _premium_activo_usuario(record: Dict[str, Any]) -> bool:
     return datetime.now(pytz.UTC) <= until_dt
 
 
-def _load_user_targets(users_db_path: Path = USERS_DB_PATH) -> List[Dict[str, Any]]:
+def _load_user_records(users_db_path: Path = USERS_DB_PATH) -> List[Dict[str, Any]]:
     payload = _read_json(users_db_path, {"users": []})
     users = payload.get("users") if isinstance(payload, dict) else []
     if not isinstance(users, list):
         return []
+    return [raw for raw in users if isinstance(raw, dict)]
+
+
+def _load_user_targets(
+    users_db_path: Path = USERS_DB_PATH,
+    telegram_user_chat_links: Dict[str, Dict[str, str]] | None = None,
+) -> List[Dict[str, Any]]:
+    users = _load_user_records(users_db_path)
+    chat_links = telegram_user_chat_links if isinstance(telegram_user_chat_links, dict) else {}
 
     targets: List[Dict[str, Any]] = []
     for raw in users:
-        if not isinstance(raw, dict):
-            continue
         user_id = str(raw.get("id", "")).strip()
-        chat_id = _normalizar_telegram_chat_id(raw.get("telegram_chat_id", ""))
-        if not user_id or not _chat_id_telegram_valido(chat_id):
+        link_payload = chat_links.get(user_id, {}) if isinstance(chat_links.get(user_id, {}), dict) else {}
+        chat_id_override = _normalizar_telegram_chat_id(link_payload.get("chat_id", ""))
+        chat_id_db = _normalizar_telegram_chat_id(raw.get("telegram_chat_id", ""))
+        chat_id = chat_id_override or chat_id_db
+        if not user_id:
             continue
+        if chat_id and not _chat_id_telegram_valido(chat_id):
+            chat_id = ""
 
         targets.append(
             {
@@ -2269,23 +2441,6 @@ def _should_alert(
 def _build_watchlist(cfg: Dict[str, Any]) -> List[MarketItem]:
     watchlist: List[MarketItem] = []
 
-    if bool(cfg.get("scan_forex", True)):
-        selected_pairs = cfg.get("forex_pairs", list(FOREX_MAP.keys()))
-        for pair in selected_pairs:
-            row = FOREX_MAP.get(pair)
-            if not row:
-                logging.warning("Par forex desconocido en config: %s", pair)
-                continue
-            watchlist.append(
-                MarketItem(
-                    market="Forex",
-                    label=pair,
-                    ticker=row["ticker"],
-                    td_symbol=row.get("td", ""),
-                    kind="forex",
-                )
-            )
-
     if bool(cfg.get("scan_crypto", True)):
         selected_crypto = cfg.get("crypto_symbols", list(CRYPTO_MAP.keys()))
         for symbol in selected_crypto:
@@ -2428,6 +2583,46 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
         f"Patron: {pattern_text}\n\n"
         f"Confirmacion: esperar {confirmation_hint}\n"
         f"{mentor_text}"
+    )
+    return subject, body
+
+
+def _build_replaced_payload(
+    cfg: Dict[str, Any],
+    item: MarketItem,
+    replaced_alert: Dict[str, Any],
+    estado: Dict[str, Any],
+) -> Tuple[str, str]:
+    prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
+    temporalidad = str(
+        replaced_alert.get("interval")
+        or estado.get("temporalidad_alerta")
+        or estado.get("analysis_interval")
+        or cfg.get("interval", "15m")
+    ).strip()
+    subject = f"{prefix} ALERTA REPLACED | {item.ticker} | {temporalidad}"
+
+    previous_direction = str(replaced_alert.get("direction", "") or "N/A").strip()
+    previous_entry = _format_price(replaced_alert.get("entry_price"))
+    opened_utc = str(replaced_alert.get("opened_utc", "") or "N/A").strip() or "N/A"
+    closed_utc = str(replaced_alert.get("closed_utc", "") or "N/A").strip() or "N/A"
+    previous_rr = _safe_float(replaced_alert.get("rr_estimado"), 0.0)
+    rr_text = f"{previous_rr:.2f}" if previous_rr > 0 else "N/A"
+    new_direction = str(estado.get("direccion_v13", "") or "N/A").strip()
+    new_entry = _format_price(estado.get("precio_alerta"))
+    new_bar_utc = str(estado.get("indice_alerta_utc", "") or "N/A").strip() or "N/A"
+
+    body = (
+        "La alerta anterior del mismo activo/timeframe fue reemplazada por una nueva lectura.\n"
+        f"Direccion anterior: {previous_direction}\n"
+        f"Entrada anterior: {previous_entry}\n"
+        f"R:R anterior: {rr_text}\n"
+        f"Abierta UTC: {opened_utc}\n"
+        f"Replaced UTC: {closed_utc}\n"
+        f"Nueva direccion: {new_direction}\n"
+        f"Nueva entrada: {new_entry}\n"
+        f"Nueva vela UTC: {new_bar_utc}\n"
+        "Motivo: llego una nueva alerta antes de que la anterior cerrara por TP/SL/timeout."
     )
     return subject, body
 
@@ -2975,13 +3170,19 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
         return state, cycle_metrics
 
     symbols_state: Dict[str, Any] = state.setdefault("symbols", {})
+    user_records = _load_user_records()
     configured_telegram_chat_ids = _dedupe_chat_ids(_parse_telegram_chat_ids(cfg))
     auto_telegram_chat_ids: List[str] = []
+    telegram_user_chat_links = _normalize_telegram_user_chat_links(state)
     if _channel_enabled(cfg, "telegram", default=True):
-        auto_telegram_chat_ids, discover_err = _discover_telegram_chats_from_updates(state)
+        auto_telegram_chat_ids, telegram_user_chat_links, discover_err = _discover_telegram_chats_from_updates(
+            state,
+            user_records=user_records,
+        )
         if discover_err:
             logging.warning("Telegram getUpdates: %s", discover_err)
     telegram_broadcast_ids = _dedupe_chat_ids(configured_telegram_chat_ids + auto_telegram_chat_ids)
+    user_targets = _load_user_targets(telegram_user_chat_links=telegram_user_chat_links)
     mtf_cache: Dict[str, Dict[str, Any]] = {}
 
     def _timed_send(channel: str, fn, *args, **kwargs) -> Tuple[bool, str]:
@@ -3101,16 +3302,16 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                 sent_any = False
                 errors: List[str] = []
                 enabled_any = False
-                user_targets = _load_user_targets()
+                replacement_telegram_chat_ids: List[str] = []
                 temporalidad = str(estado.get("temporalidad_alerta", target_interval)).strip()
                 market_key = f"{item.market}|{item.label}|{temporalidad}"
+                telegram_enabled = _channel_enabled(cfg, "telegram", default=True)
 
                 if user_targets:
                     user_results: List[Dict[str, Any]] = []
                     premium_users_alerted = False
                     eligible_users = 0
 
-                    telegram_enabled = _channel_enabled(cfg, "telegram", default=True)
                     email_enabled = _channel_enabled(cfg, "email", default=True)
                     windows_enabled = _channel_enabled(cfg, "windows", default=True)
 
@@ -3134,7 +3335,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                         user_notified = False
                         user_errors: List[str] = []
 
-                        if telegram_enabled:
+                        if telegram_enabled and _chat_id_telegram_valido(chat_id):
                             sent_ok, sent_err = _timed_send(
                                 "telegram",
                                 _send_telegram_alert,
@@ -3147,6 +3348,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                             if sent_ok:
                                 user_notified = True
                                 sent_any = True
+                                replacement_telegram_chat_ids.append(chat_id)
                             else:
                                 user_errors.append(f"telegram: {sent_err}")
 
@@ -3203,6 +3405,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                         }
                         if sent_ok:
                             sent_any = True
+                            replacement_telegram_chat_ids.extend(broadcast_extra_chat_ids)
                         else:
                             errors.append(f"telegram_broadcast: {sent_err}")
 
@@ -3232,7 +3435,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                         else:
                             errors.append(f"email: {sent_err}")
 
-                    if _channel_enabled(cfg, "telegram", default=True):
+                    if telegram_enabled:
                         enabled_any = True
                         sent_ok, sent_err = _timed_send(
                             "telegram",
@@ -3246,6 +3449,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                         notify_status["telegram"] = {"ok": sent_ok, "error": sent_err}
                         if sent_ok:
                             sent_any = True
+                            replacement_telegram_chat_ids.extend(telegram_broadcast_ids)
                         else:
                             errors.append(f"telegram: {sent_err}")
 
@@ -3280,6 +3484,35 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                             existing_open["outcome_note"] = "reemplazada_por_nueva_alerta"
                             _append_quality_event(record, dict(existing_open))
                             _update_quality_stats(record, "replaced")
+                            replacement_chat_ids = _dedupe_chat_ids(replacement_telegram_chat_ids)
+                            if telegram_enabled and replacement_chat_ids:
+                                replaced_subject, replaced_body = _build_replaced_payload(
+                                    cfg=cfg,
+                                    item=item,
+                                    replaced_alert=existing_open,
+                                    estado=estado,
+                                )
+                                replaced_ok, replaced_err = _timed_send(
+                                    "telegram",
+                                    _send_telegram_alert,
+                                    cfg,
+                                    replaced_subject,
+                                    replaced_body,
+                                    chat_ids_override=replacement_chat_ids,
+                                    item=None,
+                                )
+                                notify_status["telegram_replaced"] = {
+                                    "ok": replaced_ok,
+                                    "error": replaced_err,
+                                    "sent_to": len(replacement_chat_ids),
+                                }
+                                if not replaced_ok:
+                                    logging.warning(
+                                        "[%s|%s] Fallo aviso REPLACED: %s",
+                                        item.state_key,
+                                        target_key,
+                                        replaced_err,
+                                    )
                         record["open_alert"] = snapshot
                     logging.info("[%s|%s] Alerta enviada (multicanal).", item.state_key, target_key)
                 else:
