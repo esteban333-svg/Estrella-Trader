@@ -2509,13 +2509,121 @@ def _mentor_line(direction: str, riesgo: str, confidence: Any) -> str:
     return "Mentor: Contexto mixto; espera mejor estructura."
 
 
+def _alert_action_label(direction: str, strength: str) -> str:
+    direction = str(direction or "").upper().strip()
+    strength = str(strength or "").upper().strip()
+
+    if direction == "ALCISTA":
+        if strength == "FUERTE":
+            return "Preparar compra"
+        if strength == "MEDIA":
+            return "Preparar compra si confirma"
+        return "Esperar confirmacion de compra"
+    if direction == "BAJISTA":
+        if strength == "FUERTE":
+            return "Preparar venta"
+        if strength == "MEDIA":
+            return "Preparar venta si confirma"
+        return "Esperar confirmacion de venta"
+    return "Esperar confirmacion"
+
+
+def _alert_scenario_label(setup_tipo: str, strength: str) -> str:
+    setup_tipo = str(setup_tipo or "").strip().lower()
+    strength = str(strength or "").upper().strip()
+
+    if strength == "FUERTE":
+        return "Continuacion tendencial confirmada"
+    if strength == "MEDIA":
+        return "Continuacion con confirmacion parcial"
+    if setup_tipo == "pullback_tendencia":
+        return "Pullback en tendencia"
+    return "Sesgo tendencial en desarrollo"
+
+
+def _mentor_block(direction: str, strength: str) -> str:
+    direction = str(direction or "").upper().strip()
+    strength = str(strength or "").upper().strip()
+
+    if direction == "ALCISTA":
+        if strength == "FUERTE":
+            lines = [
+                "Mentor:",
+                "Lectura: la estructura mantiene presion alcista y la ventaja aparece si el mercado confirma continuacion en zona.",
+                "Confirmacion: retesteo defendido o nueva vela de impulso con rechazo vendedor debil.",
+                "Invalidacion: si rompe el ultimo piso operativo, la continuacion pierde valor.",
+                "Error comun: entrar tarde cuando el movimiento ya se extendio.",
+                "Trader disciplinado: ejecuta solo si aparece confirmacion donde toca.",
+            ]
+        elif strength == "MEDIA":
+            lines = [
+                "Mentor:",
+                "Lectura: la estructura mantiene ventaja alcista y el mercado empieza a dar senales de continuidad, pero todavia conviene validar el gatillo.",
+                "Confirmacion: busca defensa clara de la zona o una vela de continuidad con cierre firme.",
+                "Invalidacion: si pierde el soporte operativo y no recupera rapido, la idea se debilita.",
+                "Error comun: adelantarse antes de que el mercado confirme la intencion real.",
+                "Trader disciplinado: prepara la compra, pero ejecuta solo si la confirmacion aparece limpia.",
+            ]
+        else:
+            lines = [
+                "Mentor:",
+                "Lectura: el sesgo sigue siendo alcista, pero la entrada todavia necesita una confirmacion limpia para tener ventaja real.",
+                "Confirmacion: busca rechazo alcista en retesteo o continuidad con debilidad vendedora.",
+                "Invalidacion: si pierde estructura y sostiene por debajo, la idea pierde fuerza.",
+                "Error comun: comprar por impulso solo porque la direccion ya es alcista.",
+                "Trader disciplinado: espera el gatillo en zona valida; no persigas precio.",
+            ]
+        return "\n".join(lines)
+
+    if direction == "BAJISTA":
+        if strength == "FUERTE":
+            lines = [
+                "Mentor:",
+                "Lectura: la estructura mantiene presion bajista y la ventaja aparece si el mercado confirma continuacion en zona.",
+                "Confirmacion: retesteo fallido o nueva vela de impulso con rechazo comprador debil.",
+                "Invalidacion: si rompe el ultimo techo operativo, la continuacion pierde valor.",
+                "Error comun: entrar tarde cuando el movimiento ya se extendio.",
+                "Trader disciplinado: ejecuta solo si aparece confirmacion donde toca.",
+            ]
+        elif strength == "MEDIA":
+            lines = [
+                "Mentor:",
+                "Lectura: la estructura mantiene ventaja bajista y el mercado empieza a dar senales de continuidad, pero todavia conviene validar el gatillo.",
+                "Confirmacion: busca rechazo claro de la zona o una vela de continuidad con cierre firme hacia abajo.",
+                "Invalidacion: si recupera la zona operativa y sostiene por encima, la idea se debilita.",
+                "Error comun: adelantarse antes de que el mercado confirme la intencion real.",
+                "Trader disciplinado: prepara la venta, pero ejecuta solo si la confirmacion aparece limpia.",
+            ]
+        else:
+            lines = [
+                "Mentor:",
+                "Lectura: el sesgo sigue siendo bajista, pero la entrada todavia necesita una confirmacion limpia para tener ventaja real.",
+                "Confirmacion: busca rechazo bajista en retesteo o continuidad con debilidad compradora.",
+                "Invalidacion: si recupera estructura y sostiene arriba, la idea pierde fuerza.",
+                "Error comun: vender por impulso solo porque la direccion ya es bajista.",
+                "Trader disciplinado: espera el gatillo en zona valida; no persigas precio.",
+            ]
+        return "\n".join(lines)
+
+    return (
+        "Mentor:\n"
+        "Lectura: la estructura no esta lo bastante clara para definir una ventaja operativa limpia.\n"
+        "Confirmacion: espera una direccion clara antes de preparar entrada.\n"
+        "Invalidacion: si el precio sigue mixto, la idea no merece ejecucion.\n"
+        "Error comun: forzar una operacion cuando el contexto no esta ordenado.\n"
+        "Trader disciplinado: sin claridad, no hay entrada."
+    )
+
+
 def _signal_strength_label(estado: Dict[str, Any], dorado: Dict[str, Any]) -> str:
     confidence = _safe_float(estado.get("confidence_score"), 0.0)
     min_conf = _safe_float(estado.get("min_confidence_required"), 0.0)
     rr = _safe_float(dorado.get("rr_estimado"), 0.0)
-    # FUERTE: supera claramente el umbral de confianza y ofrece RR robusto.
-    if confidence >= max(min_conf + 6.0, 86.0) and rr >= 2.0:
+    pattern = str(estado.get("candle_pattern", "sin_patron")).strip().lower()
+    if confidence >= max(min_conf + 6.0, 86.0) and rr >= 2.0 and pattern != "sin_patron":
         return "FUERTE"
+    if confidence >= max(min_conf + 2.0, 80.0) and rr >= 1.8:
+        return "MEDIA"
     return "DEBIL"
 
 
@@ -2523,65 +2631,37 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     dorado = estado.get("dorado_v13") or {}
     score = dorado.get("micro_score")
     umbral = dorado.get("umbral")
-    rr = dorado.get("rr_estimado")
-    riesgo = estado.get("riesgo", "")
-    decision = estado.get("decision", "")
-    resumen = estado.get("mensaje", dorado.get("resumen", "Dorado activado."))
     direction = estado.get("direccion_v13", "")
     temporalidad = str(estado.get("temporalidad_alerta", "")).strip()
     modo = str(estado.get("modo_alerta", "Tendencial")).strip() or "Tendencial"
     if not temporalidad:
         temporalidad = "1D + 4H" if "1d+4h" in modo.lower().replace(" ", "") else str(cfg.get("interval", "15m"))
 
-    rr_text = str(rr).strip() if rr is not None else "N/A"
     score_text = str(score).strip() if score is not None else "N/A"
     umbral_text = str(umbral).strip() if umbral is not None else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
     indice_alerta_utc = str(estado.get("indice_alerta_utc", "")).strip() or "N/A"
     confidence_text = str(estado.get("confidence_score", "N/A")).strip() or "N/A"
     pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
-    profile_text = str(estado.get("alert_profile", "balanceado")).strip().upper()
     setup_tipo = str(estado.get("setup_tipo", dorado.get("setup_tipo", ""))).strip().lower()
-    setup_label = str(estado.get("setup_label", dorado.get("setup_label", ""))).strip()
-    setup_zone = str(estado.get("zona_pullback", dorado.get("zona_pullback", ""))).strip()
-    cal = estado.get("quality_calibration", {})
-    cal_mode = ""
-    if isinstance(cal, dict):
-        mode = str(cal.get("mode", "")).strip()
-        scope = str(cal.get("scope", "")).strip()
-        if mode and mode != "disabled":
-            acc = _safe_float(cal.get("accuracy_pct"), 0.0)
-            noise = _safe_float(cal.get("noise_pct"), 0.0)
-            rr_avg = _safe_float(cal.get("rr_avg"), 0.0)
-            prefix = f"{scope}:{mode}" if scope else mode
-            if rr_avg > 0:
-                cal_mode = f"{prefix} (acc {acc:.1f}% | ruido {noise:.1f}% | rr {rr_avg:.2f})"
-            else:
-                cal_mode = f"{prefix} (acc {acc:.1f}% | ruido {noise:.1f}%)"
-    confirmation_hint = _confirmation_hint(direction=direction, pattern=pattern_text)
-    mentor_text = _mentor_line(direction=direction, riesgo=riesgo, confidence=confidence_text)
     strength_label = _signal_strength_label(estado=estado, dorado=dorado)
+    action_text = _alert_action_label(direction=direction, strength=strength_label)
+    scenario_text = _alert_scenario_label(setup_tipo=setup_tipo, strength=strength_label)
+    mentor_text = _mentor_block(direction=direction, strength=strength_label)
 
     prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
-    signal_label = "DORADO PULLBACK" if setup_tipo == "pullback_tendencia" else "DORADO"
-    subject = f"{prefix} {signal_label} {strength_label} | {item.ticker} | {temporalidad}"
-    setup_text = setup_label or ("Pullback en tendencia" if setup_tipo == "pullback_tendencia" else "Dorado tendencial")
+    subject = f"{prefix} {item.ticker} | {temporalidad}"
 
     body = (
-        f"Fuerza: {strength_label}\n"
-        f"Setup: {setup_text}\n"
-        f"Zona: {setup_zone or 'n/a'}\n"
-        f"Perfil: {profile_text}\n"
-        f"Calibracion: {cal_mode or 'n/a'}\n"
         f"Direccion: {direction}\n"
-        f"Accion: {decision}\n"
-        f"Entrada: {precio_alerta_text}\n"
-        f"R:R: {rr_text}\n"
-        f"Score: {score_text}/{umbral_text}\n"
-        f"Confianza: {confidence_text}%\n"
+        f"Accion: {action_text}\n"
+        f"Escenario: {scenario_text}\n"
+        f"Entrada guia: {precio_alerta_text}\n"
+        f"Fuerza: {strength_label}\n"
+        f"Puntaje tecnico: {confidence_text}/100\n"
+        f"Checklist tecnico: {score_text}/{umbral_text}\n"
         f"Vela UTC: {indice_alerta_utc}\n"
         f"Patron: {pattern_text}\n\n"
-        f"Confirmacion: esperar {confirmation_hint}\n"
         f"{mentor_text}"
     )
     return subject, body

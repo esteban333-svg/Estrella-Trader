@@ -28,7 +28,7 @@ try {
         -Settings $settings `
         -User $env:USERNAME `
         -RunLevel Limited `
-        -Description "Escaner Dorado de Estrella Trader (forex + cripto)." `
+        -Description "Escaner Dorado de Estrella Trader (cripto + oro)." `
         -Force | Out-Null
     Write-Output "Tarea instalada: $TaskName"
 } catch {

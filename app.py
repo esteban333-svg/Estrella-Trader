@@ -1294,7 +1294,7 @@ def _color_desde_esfera(esfera_txt: str) -> str:
 # ============================================================
 # BLOQUE: AUTH - CONFIGURACION Y CONSTANTES
 # ============================================================
-USERS_DB_PATH = os.path.join(os.path.dirname(__file__), "usuarios_db.json")
+USERS_DB_PATH = os.getenv("USERS_DB_PATH", os.path.join(os.path.dirname(__file__), "usuarios_db.json"))
 SCANNER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "scanner_config.json")
 SCANNER_STATE_PATH = os.path.join(os.path.dirname(__file__), "scanner_state.json")
 SCANNER_HEALTH_PATH = os.path.join(os.path.dirname(__file__), "scanner_health.json")
@@ -2304,16 +2304,6 @@ TD_SYMBOLS = {
     "S&P 500": "SPX",
 }
 
-FOREX_MAP = {
-    "EUR/USD": {"ticker": "EURUSD=X", "td": "EUR/USD"},
-    "GBP/USD": {"ticker": "GBPUSD=X", "td": "GBP/USD"},
-    "USD/JPY": {"ticker": "JPY=X", "td": "USD/JPY"},
-    "USD/CHF": {"ticker": "CHF=X", "td": "USD/CHF"},
-    "AUD/USD": {"ticker": "AUDUSD=X", "td": "AUD/USD"},
-    "USD/CAD": {"ticker": "CAD=X", "td": "USD/CAD"},
-    "NZD/USD": {"ticker": "NZDUSD=X", "td": "NZD/USD"},
-}
-
 CRYPTO_MAP = {
     "BTC": {"ticker": "BTC-USD", "binance": "BTCUSDT", "td": "BTC/USD"},
     "ETH": {"ticker": "ETH-USD", "binance": "ETHUSDT", "td": "ETH/USD"},
@@ -3045,7 +3035,6 @@ zona = st.sidebar.selectbox(
 st.sidebar.divider()
 
 mercados = {
-    "Forex": "FOREX",
     "Oro (XAU/USD)": "GC=F",
     "NASDAQ 100": "^NDX",
     "S&P 500": "^GSPC",
@@ -3069,7 +3058,6 @@ else:
     st.sidebar.caption("Estado: Mercado abierto.")
 
 crypto_symbol = None
-forex_pair = None
 binance_symbol = None
 td_symbol = None
 if mercado_nombre == "Cripto":
@@ -3088,20 +3076,6 @@ if mercado_nombre == "Cripto":
     ticker = crypto_cfg["ticker"]
     binance_symbol = crypto_cfg["binance"]
     td_symbol = crypto_cfg["td"]
-elif mercado_nombre == "Forex":
-    with st.sidebar.expander("Seleccionar par Forex", expanded=True):
-        if "forex_pair_v1" not in st.session_state:
-            st.session_state["forex_pair_v1"] = "EUR/USD"
-        forex_pair = st.selectbox(
-            "Par",
-            list(FOREX_MAP.keys()),
-            index=list(FOREX_MAP.keys()).index(st.session_state["forex_pair_v1"])
-            if st.session_state.get("forex_pair_v1") in FOREX_MAP else 0,
-            key="forex_pair_v1"
-        )
-    forex_cfg = FOREX_MAP.get(forex_pair, FOREX_MAP["EUR/USD"])
-    ticker = forex_cfg["ticker"]
-    td_symbol = forex_cfg["td"]
 else:
     ticker = mercados[mercado_nombre]
     td_symbol = TD_SYMBOLS.get(mercado_nombre)

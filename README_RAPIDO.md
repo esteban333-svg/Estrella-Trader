@@ -1,7 +1,7 @@
 # Estrella Trader V 1.0
 
 ## Uso en 30 Segundos
-1. Elige mercado (`Forex`, `Oro`, etc.) y `timeframe` en la sidebar.
+1. Elige mercado (`Cripto` u `Oro`) y `timeframe` en la sidebar.
 2. Lee el panel principal:
    - Azul = `OBSERVAR`
    - Dorado + Rojo bajo = posible operacion disciplinada
@@ -36,8 +36,7 @@ Notas:
 - Usalo para entender el "por que", no como señal automatica.
 
 ## Mercados Disponibles
-- Forex: EUR/USD, GBP/USD, USD/JPY, USD/CHF, AUD/USD, USD/CAD, NZD/USD.
-- Otros: Oro (XAU/USD), NASDAQ 100, S&P 500, Crypto.
+- Disponibles hoy: Oro (XAU/USD) y Cripto.
 
 ## Errores Comunes
 - Confundir velas historicas con live.

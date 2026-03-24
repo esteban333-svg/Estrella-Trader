@@ -48,26 +48,24 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertFalse(out["require_price_action_confirmation"])
         self.assertEqual(out["persistence_bars"], 1)
 
-    def test_render_512mb_profile_disables_forex(self):
+    def test_render_512mb_profile_compacts_watchlist(self):
         cfg = {
             "resource_profile": "render_512mb",
-            "scan_forex": True,
             "scan_crypto": True,
             "scan_gold": True,
             "scan_structural_1d_4h": True,
             "scan_intervals": ["15m", "30m", "1h", "4h"],
             "poll_interval_sec": 60,
-            "forex_pairs": ["EUR/USD", "GBP/USD", "USD/JPY", "USD/CHF", "AUD/USD"],
             "crypto_symbols": ["BTC", "ETH", "SOL", "BNB", "XRP"],
             "gold_symbols": ["XAU/USD"],
             "runtime_limits": {},
         }
         out = sw._apply_resource_profile(cfg)
         self.assertEqual(out["resource_profile"], "render_512mb")
-        self.assertFalse(out["scan_forex"])
         self.assertFalse(out["scan_structural_1d_4h"])
         self.assertEqual(out["scan_intervals"], ["15m", "1h"])
         self.assertGreaterEqual(out["poll_interval_sec"], 90)
+        self.assertEqual(out["crypto_symbols"], ["BTC", "ETH", "SOL", "BNB"])
 
     def test_global_quality_calibration_tighten_hard(self):
         cfg = {
@@ -110,14 +108,19 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
     def test_signal_strength_label(self):
         strong = sw._signal_strength_label(
-            {"confidence_score": 92, "min_confidence_required": 84},
+            {"confidence_score": 92, "min_confidence_required": 84, "candle_pattern": "rechazo_alcista"},
             {"rr_estimado": 2.2},
         )
+        medium = sw._signal_strength_label(
+            {"confidence_score": 83, "min_confidence_required": 80, "candle_pattern": "sin_patron"},
+            {"rr_estimado": 1.9},
+        )
         weak = sw._signal_strength_label(
-            {"confidence_score": 85, "min_confidence_required": 84},
+            {"confidence_score": 85, "min_confidence_required": 84, "candle_pattern": "sin_patron"},
             {"rr_estimado": 1.6},
         )
         self.assertEqual(strong, "FUERTE")
+        self.assertEqual(medium, "MEDIA")
         self.assertEqual(weak, "DEBIL")
 
     def test_build_alert_payload_includes_pullback_metadata(self):
@@ -151,9 +154,14 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "alert_profile": "balanceado",
         }
         subject, body = sw._build_alert_payload(cfg, item, estado, "source")
-        self.assertIn("DORADO PULLBACK", subject)
-        self.assertIn("Setup: Pullback en tendencia", body)
-        self.assertIn("Zona: EMA20", body)
+        self.assertIn("BTC-USD | 15m", subject)
+        self.assertIn("Direccion: ALCISTA", body)
+        self.assertIn("Escenario: Continuacion tendencial confirmada", body)
+        self.assertIn("Entrada guia: 102345.12", body)
+        self.assertIn("Puntaje tecnico: 88/100", body)
+        self.assertIn("Checklist tecnico: 6/4", body)
+        self.assertIn("Patron: rechazo_alcista", body)
+        self.assertIn("Mentor:", body)
 
     def test_apply_precision_filters_allows_pullback_with_neutral_mtf(self):
         item = sw.MarketItem(

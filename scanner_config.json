@@ -13,7 +13,6 @@
   ],
   "scan_structural_1d_4h": true,
   "cooldown_minutes": 60,
-  "scan_forex": true,
   "scan_crypto": true,
   "scan_gold": true,
   "precision_filters": {
@@ -45,19 +44,19 @@
       "1d": 5
     },
     "mtf_intervals": {
+      "5m": [
+        "15m"
+      ],
       "15m": [
-        "30m",
-        "1h",
-        "4h",
-        "1d"
+        "30m"
       ],
       "30m": [
-        "1h",
-        "4h",
-        "1d"
+        "1h"
       ],
       "1h": [
-        "4h",
+        "4h"
+      ],
+      "4h": [
         "1d"
       ]
     },
@@ -70,15 +69,6 @@
       "1d": 720
     }
   },
-  "forex_pairs": [
-    "EUR/USD",
-    "GBP/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "AUD/USD",
-    "USD/CAD",
-    "NZD/USD"
-  ],
   "crypto_symbols": [
     "BTC",
     "ETH",
