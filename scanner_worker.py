@@ -2631,12 +2631,15 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     dorado = estado.get("dorado_v13") or {}
     score = dorado.get("micro_score")
     umbral = dorado.get("umbral")
+    rr = dorado.get("rr_estimado")
     direction = estado.get("direccion_v13", "")
     temporalidad = str(estado.get("temporalidad_alerta", "")).strip()
     modo = str(estado.get("modo_alerta", "Tendencial")).strip() or "Tendencial"
     if not temporalidad:
         temporalidad = "1D + 4H" if "1d+4h" in modo.lower().replace(" ", "") else str(cfg.get("interval", "15m"))
 
+    rr_value = _safe_float(rr, 0.0)
+    rr_text = f"1/{rr_value:.2f}" if rr_value > 0 else "N/A"
     score_text = str(score).strip() if score is not None else "N/A"
     umbral_text = str(umbral).strip() if umbral is not None else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
@@ -2658,6 +2661,7 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
         f"Escenario: {scenario_text}\n"
         f"Entrada guia: {precio_alerta_text}\n"
         f"Fuerza: {strength_label}\n"
+        f"Riesgo/beneficio: {rr_text}\n"
         f"Puntaje tecnico: {confidence_text}/100\n"
         f"Checklist tecnico: {score_text}/{umbral_text}\n"
         f"Vela UTC: {indice_alerta_utc}\n"
