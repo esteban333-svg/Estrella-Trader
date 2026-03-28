@@ -2884,6 +2884,8 @@ def _build_alert_payload(
     score_text = str(score).strip() if score is not None else "N/A"
     umbral_text = str(umbral).strip() if umbral is not None else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
+    sl_text = _format_price(operational_plan.get("sl_price"))
+    tp_text = _format_price(operational_plan.get("tp_price"))
     indice_alerta_utc = str(estado.get("indice_alerta_utc", "")).strip() or "N/A"
     confidence_text = str(estado.get("confidence_score", "N/A")).strip() or "N/A"
     pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
@@ -2918,7 +2920,9 @@ def _build_alert_payload(
         f"Direccion: {direction}\n"
         f"Accion: {action_text}\n"
         f"Escenario operativo: {scenario_text}\n"
-        f"Entrada guia: {precio_alerta_text}\n"
+        f"Entrada: {precio_alerta_text}\n"
+        f"SL: {sl_text}\n"
+        f"TP: {tp_text}\n"
         f"Fuerza: {strength_label}\n"
         f"Riesgo/beneficio: {rr_text}\n"
         f"Puntaje tecnico: {confidence_text}/100\n"

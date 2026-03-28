@@ -175,7 +175,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "candle_pattern": "rechazo_alcista",
             "mtf_summary": "confirmaciones=1, opuestos=0, neutrales=0",
             "alert_profile": "balanceado",
-            "operational_plan": {"rr_ratio": 2.0},
+            "operational_plan": {"rr_ratio": 2.0, "sl_price": 101833.3944, "tp_price": 103368.5712},
             "contexto_estructural": "Alcista",
         }
         subject, body = sw._build_alert_payload(cfg, item, estado, "source")
@@ -186,7 +186,9 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertIn("Contexto estructural: Alcista", body)
         self.assertIn("Direccion: ALCISTA", body)
         self.assertIn("Escenario operativo: Pullback alcista de continuidad", body)
-        self.assertIn("Entrada guia: 102345.12", body)
+        self.assertIn("Entrada: 102345.12", body)
+        self.assertIn("SL: 101833.39", body)
+        self.assertIn("TP: 103368.57", body)
         self.assertIn("Puntaje tecnico: 90/100", body)
         self.assertIn("Checklist tecnico: 6/4", body)
         self.assertIn("Patron: rechazo_alcista", body)
