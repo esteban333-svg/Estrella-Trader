@@ -2542,15 +2542,121 @@ def _alert_action_label(direction: str, strength: str) -> str:
     return "Esperar confirmacion"
 
 
-def _alert_scenario_label(setup_tipo: str, strength: str) -> str:
+def _human_direction_label(direction: str) -> str:
+    direction = str(direction or "").upper().strip()
+    if direction == "ALCISTA":
+        return "Alcista"
+    if direction == "BAJISTA":
+        return "Bajista"
+    return "No claro"
+
+
+def _structural_context_label_from_state(estado: Dict[str, Any]) -> str:
+    estructura = estado.get("estructura_1d_4h", {}) if isinstance(estado.get("estructura_1d_4h", {}), dict) else {}
+    macro_direction = str(estructura.get("direccion_1d") or estado.get("direccion_v13", "")).upper().strip()
+    alignment = str(estructura.get("alineacion", "")).upper().strip()
+
+    if alignment == "CONFLICTO":
+        return "En transicion"
+    if macro_direction in {"ALCISTA", "BAJISTA"}:
+        return _human_direction_label(macro_direction)
+    return "No claro"
+
+
+def _resolve_structural_context_label(
+    item: MarketItem,
+    estado: Dict[str, Any],
+    cfg: Dict[str, Any],
+    cache: Dict[str, str] | None = None,
+) -> str:
+    explicit = str(estado.get("contexto_estructural", "")).strip()
+    if explicit:
+        return explicit
+
+    local_label = _structural_context_label_from_state(estado)
+    if local_label not in {"No claro"}:
+        return local_label
+
+    cache_ref = cache if isinstance(cache, dict) else {}
+    cache_key = str(item.state_key or item.ticker or item.label).strip()
+    if cache_key and cache_key in cache_ref:
+        return str(cache_ref.get(cache_key, "")).strip() or "No claro"
+
+    label = ""
+    precision_cfg = _resolve_precision_cfg(cfg)
+    require_closed_candle = bool(precision_cfg.get("require_closed_candle", True))
+    grace_seconds = int(precision_cfg.get("closed_candle_grace_sec", 10))
+    try:
+        df_1d, _, err_1d = _fetch_data(item, period="3y", interval="1d", cfg=cfg)
+        df_4h, _, err_4h = _fetch_data(item, period="12mo", interval="4h", cfg=cfg)
+        if (
+            err_1d
+            or err_4h
+            or df_1d is None
+            or df_4h is None
+            or df_1d.empty
+            or df_4h.empty
+        ):
+            raise ValueError("structural_context_fetch_failed")
+
+        df_1d_ready, ok_1d, _ = _prepare_df_for_closed_candle(
+            df_1d,
+            interval="1d",
+            require_closed_candle=require_closed_candle,
+            grace_seconds=grace_seconds,
+        )
+        df_4h_ready, ok_4h, _ = _prepare_df_for_closed_candle(
+            df_4h,
+            interval="4h",
+            require_closed_candle=require_closed_candle,
+            grace_seconds=grace_seconds,
+        )
+        if not ok_1d or not ok_4h or df_1d_ready.empty or df_4h_ready.empty:
+            raise ValueError("structural_context_no_closed_candles")
+
+        structural_state = construir_estado_final_estructural(
+            calcular_indicadores(df_1d_ready),
+            calcular_indicadores(df_4h_ready),
+            impacto_memoria=0,
+        )
+        label = _structural_context_label_from_state(structural_state)
+    except Exception:
+        fallback_direction = str(estado.get("direccion_v13", "")).upper().strip()
+        if fallback_direction in {"ALCISTA", "BAJISTA"}:
+            label = _human_direction_label(fallback_direction)
+        else:
+            label = "No claro"
+
+    if cache_key:
+        cache_ref[cache_key] = label
+    return label
+
+
+def _alert_operational_scenario_label(
+    direction: str,
+    setup_tipo: str,
+    strength: str,
+    temporalidad: str,
+    modo: str,
+) -> str:
+    direction = str(direction or "").upper().strip()
     setup_tipo = str(setup_tipo or "").strip().lower()
     strength = str(strength or "").upper().strip()
+    temporalidad = str(temporalidad or "").strip().lower()
+    modo = str(modo or "").strip().lower()
+    direction_text = str(direction or "").lower().strip()
+    structural_mode = temporalidad == "1d + 4h" or "estructural" in modo or "1d+4h" in modo
 
-    if strength == "FUERTE":
-        return "Continuacion tendencial confirmada"
+    if direction not in {"ALCISTA", "BAJISTA"}:
+        return "Cambio estructural en desarrollo" if structural_mode else "Cambio local en desarrollo"
+
+    if structural_mode and setup_tipo == "pullback_tendencia":
+        return f"Pullback estructural {direction_text}"
     if setup_tipo == "pullback_tendencia":
-        return "Pullback en tendencia"
-    return "Sesgo tendencial en desarrollo"
+        return f"Pullback {direction_text} de continuidad"
+    if strength == "FUERTE":
+        return f"Continuacion {direction_text} confirmada"
+    return f"Continuacion {direction_text} en desarrollo"
 
 
 def _mentor_block(direction: str, strength: str) -> str:
@@ -2755,7 +2861,13 @@ def _signal_strength_label(estado: Dict[str, Any], dorado: Dict[str, Any]) -> st
     return "DEBIL"
 
 
-def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str, Any], source: str) -> Tuple[str, str]:
+def _build_alert_payload(
+    cfg: Dict[str, Any],
+    item: MarketItem,
+    estado: Dict[str, Any],
+    source: str,
+    structural_context_label: str | None = None,
+) -> Tuple[str, str]:
     dorado = estado.get("dorado_v13") or {}
     score = dorado.get("micro_score")
     umbral = dorado.get("umbral")
@@ -2778,7 +2890,18 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     setup_tipo = str(estado.get("setup_tipo", dorado.get("setup_tipo", ""))).strip().lower()
     strength_label = _signal_strength_label(estado=estado, dorado=dorado)
     action_text = _alert_action_label(direction=direction, strength=strength_label)
-    scenario_text = _alert_scenario_label(setup_tipo=setup_tipo, strength=strength_label)
+    context_text = str(structural_context_label or estado.get("contexto_estructural", "")).strip()
+    if not context_text:
+        context_text = _structural_context_label_from_state(estado)
+    if not context_text or context_text == "No claro":
+        context_text = _human_direction_label(direction) if str(direction or "").upper().strip() in {"ALCISTA", "BAJISTA"} else "No claro"
+    scenario_text = _alert_operational_scenario_label(
+        direction=direction,
+        setup_tipo=setup_tipo,
+        strength=strength_label,
+        temporalidad=temporalidad,
+        modo=modo,
+    )
     mentor_text = _mentor_block(direction=direction, strength=strength_label)
     session_state, session_recommendation = _session_status_for_alert(indice_alerta_utc)
     session_note = _session_risk_note()
@@ -2791,9 +2914,10 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
         f"Estado de la sesion: {session_state}\n"
         f"Recomendacion: {session_recommendation}\n"
         f"Hora Col: {hora_col_text}\n"
+        f"Contexto estructural: {context_text}\n"
         f"Direccion: {direction}\n"
         f"Accion: {action_text}\n"
-        f"Escenario: {scenario_text}\n"
+        f"Escenario operativo: {scenario_text}\n"
         f"Entrada guia: {precio_alerta_text}\n"
         f"Fuerza: {strength_label}\n"
         f"Riesgo/beneficio: {rr_text}\n"
@@ -3409,6 +3533,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
     telegram_broadcast_ids = _dedupe_chat_ids(configured_telegram_chat_ids + auto_telegram_chat_ids)
     user_targets = _load_user_targets(telegram_user_chat_links=telegram_user_chat_links)
     mtf_cache: Dict[str, Dict[str, Any]] = {}
+    structural_context_cache: Dict[str, str] = {}
 
     def _timed_send(channel: str, fn, *args, **kwargs) -> Tuple[bool, str]:
         started = time.perf_counter()
@@ -3528,7 +3653,20 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                 max_alerts_per_symbol_day=max_alerts_per_symbol_day,
             ):
                 cycle_metrics["alerts_triggered"] = int(cycle_metrics.get("alerts_triggered", 0) or 0) + 1
-                subject, body = _build_alert_payload(cfg, item, estado, source)
+                structural_context_label = _resolve_structural_context_label(
+                    item=item,
+                    estado=estado,
+                    cfg=cfg,
+                    cache=structural_context_cache,
+                )
+                estado["contexto_estructural"] = structural_context_label
+                subject, body = _build_alert_payload(
+                    cfg,
+                    item,
+                    estado,
+                    source,
+                    structural_context_label=structural_context_label,
+                )
                 notify_status: Dict[str, Any] = {}
                 sent_any = False
                 errors: List[str] = []

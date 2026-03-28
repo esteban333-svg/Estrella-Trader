@@ -176,20 +176,43 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "mtf_summary": "confirmaciones=1, opuestos=0, neutrales=0",
             "alert_profile": "balanceado",
             "operational_plan": {"rr_ratio": 2.0},
+            "contexto_estructural": "Alcista",
         }
         subject, body = sw._build_alert_payload(cfg, item, estado, "source")
         self.assertIn("BTC-USD | 15m", subject)
         self.assertIn("Estado de la sesion: Optima", body)
         self.assertIn("Recomendacion: Operar normal", body)
         self.assertIn("Hora Col: 2026-03-10 10:00", body)
+        self.assertIn("Contexto estructural: Alcista", body)
         self.assertIn("Direccion: ALCISTA", body)
-        self.assertIn("Escenario: Continuacion tendencial confirmada", body)
+        self.assertIn("Escenario operativo: Pullback alcista de continuidad", body)
         self.assertIn("Entrada guia: 102345.12", body)
         self.assertIn("Puntaje tecnico: 90/100", body)
         self.assertIn("Checklist tecnico: 6/4", body)
         self.assertIn("Patron: rechazo_alcista", body)
         self.assertIn("Mentor:", body)
         self.assertIn("viernes y durante el fin de semana", body)
+
+    def test_operational_scenario_label_uses_pullback_for_lower_timeframes(self):
+        label = sw._alert_operational_scenario_label(
+            direction="BAJISTA",
+            setup_tipo="pullback_tendencia",
+            strength="DEBIL",
+            temporalidad="30m",
+            modo="Tendencial",
+        )
+        self.assertEqual(label, "Pullback bajista de continuidad")
+
+    def test_structural_context_label_uses_conflict_as_transition(self):
+        estado = {
+            "direccion_v13": "ALCISTA",
+            "estructura_1d_4h": {
+                "direccion_1d": "ALCISTA",
+                "direccion_4h": "BAJISTA",
+                "alineacion": "CONFLICTO",
+            },
+        }
+        self.assertEqual(sw._structural_context_label_from_state(estado), "En transicion")
 
     def test_session_status_for_alert_marks_weekend_as_not_favorable(self):
         state, recommendation = sw._session_status_for_alert("2026-03-14T15:00:00Z")
