@@ -171,3 +171,87 @@ Idea de implementacion:
 - Mostrar esta escala en la UI o en documentacion interna como referencia rapida.
 - Usarla solo como traduccion humana del `puntaje tecnico`.
 - Nunca presentarla como precision historica comprobada mientras el worker no tenga suficiente muestra resuelta.
+
+
+## alerta-telegram-sl-guia-doble-tp
+
+Fecha: 2026-03-25
+
+Objetivo: agregar a la alerta del worker un `SL guia` y dos `TP` sin quitar informacion actual, para que la alerta sea mas operativa en Telegram.
+
+Resumen:
+- Mantener intacta la alerta actual.
+- Agregar `SL guia` medido desde la `entrada guia`, pero ubicado por estructura:
+  - `short`: por encima del ultimo `high` valido
+  - `long`: por debajo del ultimo `low` valido
+- Mostrar el riesgo del `SL` como porcentaje real desde la entrada.
+- Agregar dos objetivos:
+  - `TP conservador (2R)`
+  - `TP estimado (RR estimado actual)`
+- El `TP` debe calcularse desde la entrada usando el porcentaje de riesgo del `SL`, no como un numero visual arbitrario.
+- Mantener un solo bloque Telegram, sin quitar `Mentor`, `Puntaje tecnico`, `Checklist tecnico`, `Vela UTC` ni `Patron`.
+
+Regla de calculo:
+- `SL % = distancia entre entrada y SL / entrada`
+- `TP conservador = 2R`
+- `TP estimado = RR estimado actual`
+- Para `short`:
+  - `SL precio` va arriba de la entrada
+  - `TP` va abajo de la entrada
+- Para `long`:
+  - `SL precio` va abajo de la entrada
+  - `TP` va arriba de la entrada
+
+Formato propuesto:
+
+```text
+[Estrella Trader] BNB-USD | 1D + 4H
+
+Direccion: BAJISTA
+Accion: Esperar confirmacion de venta
+Escenario: Pullback en tendencia
+Entrada guia: 645.1921386719
+SL guia: 649.98 | Riesgo: +0.74%
+TP conservador (2R): 635.62 | Objetivo: -1.48%
+TP estimado (2.89R): 631.36 | Objetivo: -2.14%
+Fuerza: DEBIL
+Riesgo/beneficio: 1/2.89
+Puntaje tecnico: 77/100
+Checklist tecnico: 4/4
+Vela UTC: 2026-03-25T12:00:00Z
+Patron: sin_patron
+
+Mentor:
+...
+```
+
+Idea de implementacion:
+- Calcular `SL guia` desde estructura valida reciente.
+- Exponer en el estado del worker:
+  - `sl_price`
+  - `sl_pct`
+  - `tp_conservative_price`
+  - `tp_conservative_pct`
+  - `tp_estimated_price`
+  - `tp_estimated_pct`
+- Insertar estas lineas justo despues de `Entrada guia`.
+- Mantener Telegram con una sola salida compacta, y dejar mas detalle para la web si hiciera falta.
+
+## microscalping-para-luego
+
+Fecha: 2026-03-28
+
+Objetivo: evaluar mas adelante una excepcion operativa para `MS` sin contaminar la alerta principal ni mezclarla con el modelo actual.
+
+Resumen:
+- Mantener el marco actual como base:
+  - `SL` normal entre `0.5%` y `1.0%`
+  - `TP` normal entre `1.0%` y `2.0%`
+  - relacion objetivo `1:2`
+- Si se retoma `MS`, permitir un `SL` mas corto que `0.5%`, pero solo dentro de un marco propio de microscalping.
+- No mezclar esta logica en la alerta visible por ahora, para no alargar ni complicar el mensaje.
+
+Nota:
+- La prioridad sigue siendo respetar el modelo que ya ha funcionado.
+- Si una idea necesita un `SL` demasiado amplio para ese marco, no encaja con el estilo actual.
+- Si se estudia `MS` despues, debe definirse con limites propios y validacion separada.

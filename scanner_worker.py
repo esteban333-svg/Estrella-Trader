@@ -28,6 +28,7 @@ from analysis import (
     construir_estado_final_estructural,
     obtener_datos,
 )
+from live_binance import fetch_klines
 
 
 ROOT = Path(__file__).resolve().parent
@@ -42,6 +43,11 @@ TELEGRAM_LAST_UPDATE_ID_KEY = "telegram_last_update_id"
 TELEGRAM_USER_CHAT_LINKS_KEY = "telegram_user_chat_links"
 
 NY_TZ = pytz.timezone("America/New_York")
+BOGOTA_TZ = pytz.timezone("America/Bogota")
+
+OPERATIONAL_SL_MIN_PCT = 0.5
+OPERATIONAL_SL_MAX_PCT = 1.0
+OPERATIONAL_TP_R_MULT = 2.0
 
 TD_INTERVAL_MAP = {
     "1m": "1min",
@@ -54,14 +60,14 @@ TD_INTERVAL_MAP = {
 }
 
 CRYPTO_MAP = {
-    "BTC": {"ticker": "BTC-USD", "td": "BTC/USD"},
-    "ETH": {"ticker": "ETH-USD", "td": "ETH/USD"},
-    "SOL": {"ticker": "SOL-USD", "td": "SOL/USD"},
-    "BNB": {"ticker": "BNB-USD", "td": "BNB/USD"},
-    "XRP": {"ticker": "XRP-USD", "td": "XRP/USD"},
-    "ADA": {"ticker": "ADA-USD", "td": "ADA/USD"},
-    "DOGE": {"ticker": "DOGE-USD", "td": "DOGE/USD"},
-    "WLD": {"ticker": "WLD-USD", "td": "WLD/USD"},
+    "BTC": {"ticker": "BTC-USD", "binance": "BTCUSDT", "td": "BTC/USD"},
+    "ETH": {"ticker": "ETH-USD", "binance": "ETHUSDT", "td": "ETH/USD"},
+    "SOL": {"ticker": "SOL-USD", "binance": "SOLUSDT", "td": "SOL/USD"},
+    "BNB": {"ticker": "BNB-USD", "binance": "BNBUSDT", "td": "BNB/USD"},
+    "XRP": {"ticker": "XRP-USD", "binance": "XRPUSDT", "td": "XRP/USD"},
+    "ADA": {"ticker": "ADA-USD", "binance": "ADAUSDT", "td": "ADA/USD"},
+    "DOGE": {"ticker": "DOGE-USD", "binance": "DOGEUSDT", "td": "DOGE/USD"},
+    "WLD": {"ticker": "WLD-USD", "binance": "WLDUSDT", "td": "WLD/USD"},
 }
 
 GOLD_MAP = {
@@ -101,6 +107,7 @@ class MarketItem:
     ticker: str
     td_symbol: str
     kind: str  # "crypto" | "gold"
+    binance_symbol: str = ""
 
     @property
     def state_key(self) -> str:
@@ -1352,6 +1359,17 @@ def _fetch_data(
     cfg: Dict[str, Any] | None = None,
 ) -> Tuple[pd.DataFrame | None, str, str]:
     cfg_safe = cfg if isinstance(cfg, dict) else {}
+    if item.kind == "crypto" and item.binance_symbol:
+        binance_df, binance_err = fetch_klines(item.binance_symbol, interval, limit=500)
+        if binance_df is not None and not binance_df.empty:
+            binance_df = _trim_df_for_interval(binance_df, interval=interval, cfg=cfg_safe)
+            return binance_df, "binance", ""
+        logging.warning(
+            "[%s] Binance fallo (%s), usando fallback de datos",
+            item.state_key,
+            binance_err or "sin detalle",
+        )
+
     td_key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
     td_key_upper = td_key.upper()
     td_key_valid = td_key_upper not in {"", "TU_API_KEY", "YOUR_API_KEY", "CHANGE_ME"}
@@ -2301,18 +2319,15 @@ def _open_alert_snapshot(
     if direction not in {"ALCISTA", "BAJISTA"} or entry_price <= 0:
         return None
 
-    df_ind = compute_ctx.get("df_ind")
-    atr14 = _atr14_from_df(df_ind) if isinstance(df_ind, pd.DataFrame) else 0.0
-    if atr14 <= 0:
-        atr14 = max(entry_price * 0.002, 1e-6)
+    operational_plan = precision.get("operational_plan", {}) if isinstance(precision.get("operational_plan", {}), dict) else {}
+    if not bool(operational_plan.get("ok", False)):
+        return None
 
-    risk_1r = atr14
-    if direction == "ALCISTA":
-        tp_price = entry_price + risk_1r
-        sl_price = entry_price - risk_1r
-    else:
-        tp_price = entry_price - risk_1r
-        sl_price = entry_price + risk_1r
+    sl_price = _safe_float(operational_plan.get("sl_price"), 0.0)
+    tp_price = _safe_float(operational_plan.get("tp_price"), 0.0)
+    risk_1r = abs(entry_price - sl_price)
+    if risk_1r <= 0 or tp_price <= 0:
+        return None
 
     return {
         "status": "open",
@@ -2328,7 +2343,9 @@ def _open_alert_snapshot(
         "tp_price": round(tp_price, 10),
         "sl_price": round(sl_price, 10),
         "confidence_score": int(precision.get("confidence_score", 0) or 0),
-        "rr_estimado": _safe_float(precision.get("rr"), 0.0),
+        "rr_estimado": _safe_float(operational_plan.get("rr_ratio"), OPERATIONAL_TP_R_MULT),
+        "risk_pct_operativo": _safe_float(operational_plan.get("risk_pct"), 0.0),
+        "risk_pct_structural": _safe_float(operational_plan.get("risk_pct_structural"), 0.0),
         "reasons": list(precision.get("reasons", [])),
     }
 
@@ -2455,6 +2472,7 @@ def _build_watchlist(cfg: Dict[str, Any]) -> List[MarketItem]:
                     ticker=row["ticker"],
                     td_symbol=row.get("td", ""),
                     kind="crypto",
+                    binance_symbol=row.get("binance", ""),
                 )
             )
 
@@ -2516,14 +2534,10 @@ def _alert_action_label(direction: str, strength: str) -> str:
     if direction == "ALCISTA":
         if strength == "FUERTE":
             return "Preparar compra"
-        if strength == "MEDIA":
-            return "Preparar compra si confirma"
         return "Esperar confirmacion de compra"
     if direction == "BAJISTA":
         if strength == "FUERTE":
             return "Preparar venta"
-        if strength == "MEDIA":
-            return "Preparar venta si confirma"
         return "Esperar confirmacion de venta"
     return "Esperar confirmacion"
 
@@ -2534,8 +2548,6 @@ def _alert_scenario_label(setup_tipo: str, strength: str) -> str:
 
     if strength == "FUERTE":
         return "Continuacion tendencial confirmada"
-    if strength == "MEDIA":
-        return "Continuacion con confirmacion parcial"
     if setup_tipo == "pullback_tendencia":
         return "Pullback en tendencia"
     return "Sesgo tendencial en desarrollo"
@@ -2554,15 +2566,6 @@ def _mentor_block(direction: str, strength: str) -> str:
                 "Invalidacion: si rompe el ultimo piso operativo, la continuacion pierde valor.",
                 "Error comun: entrar tarde cuando el movimiento ya se extendio.",
                 "Trader disciplinado: ejecuta solo si aparece confirmacion donde toca.",
-            ]
-        elif strength == "MEDIA":
-            lines = [
-                "Mentor:",
-                "Lectura: la estructura mantiene ventaja alcista y el mercado empieza a dar senales de continuidad, pero todavia conviene validar el gatillo.",
-                "Confirmacion: busca defensa clara de la zona o una vela de continuidad con cierre firme.",
-                "Invalidacion: si pierde el soporte operativo y no recupera rapido, la idea se debilita.",
-                "Error comun: adelantarse antes de que el mercado confirme la intencion real.",
-                "Trader disciplinado: prepara la compra, pero ejecuta solo si la confirmacion aparece limpia.",
             ]
         else:
             lines = [
@@ -2585,15 +2588,6 @@ def _mentor_block(direction: str, strength: str) -> str:
                 "Error comun: entrar tarde cuando el movimiento ya se extendio.",
                 "Trader disciplinado: ejecuta solo si aparece confirmacion donde toca.",
             ]
-        elif strength == "MEDIA":
-            lines = [
-                "Mentor:",
-                "Lectura: la estructura mantiene ventaja bajista y el mercado empieza a dar senales de continuidad, pero todavia conviene validar el gatillo.",
-                "Confirmacion: busca rechazo claro de la zona o una vela de continuidad con cierre firme hacia abajo.",
-                "Invalidacion: si recupera la zona operativa y sostiene por encima, la idea se debilita.",
-                "Error comun: adelantarse antes de que el mercado confirme la intencion real.",
-                "Trader disciplinado: prepara la venta, pero ejecuta solo si la confirmacion aparece limpia.",
-            ]
         else:
             lines = [
                 "Mentor:",
@@ -2615,15 +2609,149 @@ def _mentor_block(direction: str, strength: str) -> str:
     )
 
 
+def _session_status_for_alert(alert_bar_utc: str) -> Tuple[str, str]:
+    bar_dt = _parse_iso_utc(str(alert_bar_utc or "").strip())
+    ref_dt = bar_dt if bar_dt is not None else datetime.now(pytz.UTC)
+    ref_ny = ref_dt.astimezone(NY_TZ)
+    weekday = ref_ny.weekday()
+
+    if weekday >= 4:
+        return "No favorable", "No operar"
+    return "Optima", "Operar normal"
+
+
+def _session_risk_note() -> str:
+    return (
+        "Nota de sesion: los viernes y durante el fin de semana el mercado suele mostrar menos liquidez, "
+        "mas barridas y liquidaciones rapidas; si la estructura se ensucia, reduce riesgo o no operes."
+    )
+
+
+def _format_colombia_alert_time(alert_bar_utc: str) -> str:
+    bar_dt = _parse_iso_utc(str(alert_bar_utc or "").strip())
+    ref_dt = bar_dt if bar_dt is not None else datetime.now(pytz.UTC)
+    return ref_dt.astimezone(BOGOTA_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def _resolve_operational_trade_plan(
+    estado: Dict[str, Any],
+    compute_ctx: Dict[str, Any],
+    lookback_bars: int = 5,
+) -> Dict[str, Any]:
+    direction = str(estado.get("direccion_v13", "")).upper().strip()
+    entry_price = _safe_float(estado.get("precio_alerta"), 0.0)
+    df_ind = compute_ctx.get("df_ind")
+    base = {
+        "ok": False,
+        "reason": "plan_operativo_incompleto",
+        "risk_pct": 0.0,
+        "risk_pct_structural": 0.0,
+        "sl_price": 0.0,
+        "tp_price": 0.0,
+        "rr_ratio": OPERATIONAL_TP_R_MULT,
+        "lookback_bars": int(max(2, lookback_bars)),
+        "adjusted_to_min": False,
+        "structure_price": 0.0,
+    }
+    if direction not in {"ALCISTA", "BAJISTA"} or entry_price <= 0:
+        return base
+    if not isinstance(df_ind, pd.DataFrame) or df_ind.empty:
+        base["reason"] = "plan_operativo_sin_df"
+        return base
+    if "High" not in df_ind.columns or "Low" not in df_ind.columns:
+        base["reason"] = "plan_operativo_sin_estructura"
+        return base
+
+    window = max(2, min(int(lookback_bars or 5), len(df_ind)))
+    highs = pd.to_numeric(df_ind["High"], errors="coerce").tail(window)
+    lows = pd.to_numeric(df_ind["Low"], errors="coerce").tail(window)
+    if highs.empty or lows.empty:
+        base["reason"] = "plan_operativo_sin_estructura"
+        return base
+
+    if direction == "ALCISTA":
+        structure_price = _safe_float(lows.min(), 0.0)
+        if structure_price <= 0 or structure_price >= entry_price:
+            base["reason"] = "plan_operativo_estructura_long_invalida"
+            return base
+        structural_risk_pct = ((entry_price - structure_price) / entry_price) * 100.0
+    else:
+        structure_price = _safe_float(highs.max(), 0.0)
+        if structure_price <= entry_price:
+            base["reason"] = "plan_operativo_estructura_short_invalida"
+            return base
+        structural_risk_pct = ((structure_price - entry_price) / entry_price) * 100.0
+
+    structural_risk_pct = max(0.0, structural_risk_pct)
+    risk_pct = max(OPERATIONAL_SL_MIN_PCT, structural_risk_pct)
+    adjusted_to_min = risk_pct > 0 and risk_pct != structural_risk_pct
+
+    base["risk_pct_structural"] = round(structural_risk_pct, 4)
+    base["risk_pct"] = round(risk_pct, 4)
+    base["adjusted_to_min"] = bool(adjusted_to_min)
+    base["structure_price"] = round(structure_price, 10)
+
+    if risk_pct > OPERATIONAL_SL_MAX_PCT:
+        base["reason"] = f"riesgo_operativo_fuera_marco(>{OPERATIONAL_SL_MAX_PCT:.2f}%)"
+        return base
+
+    if direction == "ALCISTA":
+        sl_price = entry_price * (1.0 - (risk_pct / 100.0))
+        tp_price = entry_price * (1.0 + ((risk_pct * OPERATIONAL_TP_R_MULT) / 100.0))
+    else:
+        sl_price = entry_price * (1.0 + (risk_pct / 100.0))
+        tp_price = entry_price * (1.0 - ((risk_pct * OPERATIONAL_TP_R_MULT) / 100.0))
+
+    base.update(
+        {
+            "ok": True,
+            "reason": "",
+            "sl_price": round(sl_price, 10),
+            "tp_price": round(tp_price, 10),
+        }
+    )
+    return base
+
+
+def _parse_mtf_summary_counts(summary: Any) -> Tuple[int, int, int]:
+    text = str(summary or "").strip().lower()
+    if not text:
+        return 0, 0, 0
+
+    def _extract(label: str) -> int:
+        match = re.search(rf"{label}\s*=\s*(\d+)", text)
+        if not match:
+            return 0
+        try:
+            return int(match.group(1))
+        except Exception:
+            return 0
+
+    return _extract("confirmaciones"), _extract("opuestos"), _extract("neutrales")
+
+
 def _signal_strength_label(estado: Dict[str, Any], dorado: Dict[str, Any]) -> str:
     confidence = _safe_float(estado.get("confidence_score"), 0.0)
     min_conf = _safe_float(estado.get("min_confidence_required"), 0.0)
     rr = _safe_float(dorado.get("rr_estimado"), 0.0)
+    micro_score = _safe_float(dorado.get("micro_score"), 0.0)
+    umbral = _safe_float(dorado.get("umbral"), 0.0)
     pattern = str(estado.get("candle_pattern", "sin_patron")).strip().lower()
-    if confidence >= max(min_conf + 6.0, 86.0) and rr >= 2.0 and pattern != "sin_patron":
+    riesgo = str(estado.get("riesgo", "")).strip().lower()
+    session_state, _ = _session_status_for_alert(str(estado.get("indice_alerta_utc", "")).strip())
+    confirmations, opposites, neutrals = _parse_mtf_summary_counts(estado.get("mtf_summary", ""))
+    if (
+        session_state == "Optima"
+        and pattern != "sin_patron"
+        and confidence >= max(min_conf + 8.0, 88.0)
+        and rr >= 2.2
+        and micro_score >= max(umbral + 1.0, 5.0)
+        and riesgo not in {"alto", "muy alto"}
+        and opposites == 0
+        and confirmations >= 1
+        and neutrals == 0
+    ):
         return "FUERTE"
-    if confidence >= max(min_conf + 2.0, 80.0) and rr >= 1.8:
-        return "MEDIA"
     return "DEBIL"
 
 
@@ -2631,7 +2759,8 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     dorado = estado.get("dorado_v13") or {}
     score = dorado.get("micro_score")
     umbral = dorado.get("umbral")
-    rr = dorado.get("rr_estimado")
+    operational_plan = estado.get("operational_plan", {}) if isinstance(estado.get("operational_plan", {}), dict) else {}
+    rr = operational_plan.get("rr_ratio", OPERATIONAL_TP_R_MULT)
     direction = estado.get("direccion_v13", "")
     temporalidad = str(estado.get("temporalidad_alerta", "")).strip()
     modo = str(estado.get("modo_alerta", "Tendencial")).strip() or "Tendencial"
@@ -2651,11 +2780,17 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
     action_text = _alert_action_label(direction=direction, strength=strength_label)
     scenario_text = _alert_scenario_label(setup_tipo=setup_tipo, strength=strength_label)
     mentor_text = _mentor_block(direction=direction, strength=strength_label)
+    session_state, session_recommendation = _session_status_for_alert(indice_alerta_utc)
+    session_note = _session_risk_note()
+    hora_col_text = str(estado.get("hora_col", "")).strip() or _format_colombia_alert_time(indice_alerta_utc)
 
     prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
     subject = f"{prefix} {item.ticker} | {temporalidad}"
 
     body = (
+        f"Estado de la sesion: {session_state}\n"
+        f"Recomendacion: {session_recommendation}\n"
+        f"Hora Col: {hora_col_text}\n"
         f"Direccion: {direction}\n"
         f"Accion: {action_text}\n"
         f"Escenario: {scenario_text}\n"
@@ -2664,9 +2799,9 @@ def _build_alert_payload(cfg: Dict[str, Any], item: MarketItem, estado: Dict[str
         f"Riesgo/beneficio: {rr_text}\n"
         f"Puntaje tecnico: {confidence_text}/100\n"
         f"Checklist tecnico: {score_text}/{umbral_text}\n"
-        f"Vela UTC: {indice_alerta_utc}\n"
         f"Patron: {pattern_text}\n\n"
-        f"{mentor_text}"
+        f"{mentor_text}\n\n"
+        f"{session_note}"
     )
     return subject, body
 
@@ -3036,6 +3171,8 @@ def _apply_precision_filters(
     vol_ratio = _safe_float(compute_ctx.get("vol_ratio", estado.get("vol_ratio", 1.0)), 1.0)
     df_ind = compute_ctx.get("df_ind")
     rr = _safe_float(dorado.get("rr_estimado"), 0.0)
+    operational_plan = _resolve_operational_trade_plan(estado=estado, compute_ctx=compute_ctx)
+    risk_ok = bool(operational_plan.get("ok", False))
 
     mtf_enabled = enabled and bool(effective_cfg.get("multi_timeframe_filter", True))
     if mtf_enabled:
@@ -3099,7 +3236,7 @@ def _apply_precision_filters(
     ) if enabled else max(1, int(cfg.get("cooldown_minutes", 60)))
 
     mtf_ok = bool(mtf_info.get("ok", True))
-    signal_ready = dorado_now and (not enabled or (mtf_ok and candle_ok and rr_ok and confidence_ok))
+    signal_ready = dorado_now and risk_ok and (not enabled or (mtf_ok and candle_ok and rr_ok and confidence_ok))
 
     reasons: List[str] = []
     if not dorado_now:
@@ -3112,6 +3249,8 @@ def _apply_precision_filters(
         reasons.append(f"rr_bajo(<{rr_min})")
     if enabled and not confidence_ok:
         reasons.append(f"confianza_baja(<{min_confidence})")
+    if not risk_ok:
+        reasons.append(str(operational_plan.get("reason", "plan_operativo_invalido")))
     if not reasons:
         reasons.append("filtros_ok")
 
@@ -3140,6 +3279,8 @@ def _apply_precision_filters(
         "rr": rr,
         "min_rr": rr_min,
         "rr_ok": rr_ok,
+        "operational_plan": operational_plan,
+        "risk_ok": risk_ok,
         "mtf": mtf_info,
         "candle": candle_info,
         "cooldown_minutes": cooldown_effective,
@@ -3360,6 +3501,11 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             estado["quality_calibration"] = precision.get("calibration", {})
             estado["quality_metrics"] = precision.get("quality_metrics", {})
             estado["effective_thresholds"] = precision.get("thresholds", {})
+            estado["hora_col"] = _format_colombia_alert_time(signal_bar_utc)
+            estado["operational_plan"] = precision.get("operational_plan", {})
+            estado["risk_pct_operativo"] = precision.get("operational_plan", {}).get("risk_pct")
+            estado["sl_price_operativo"] = precision.get("operational_plan", {}).get("sl_price")
+            estado["tp_price_operativo"] = precision.get("operational_plan", {}).get("tp_price")
             record["last_gate_reasons"] = precision.get("reasons", [])
             record["alert_profile"] = precision.get("profile", "balanceado")
             record["quality_calibration"] = precision.get("calibration", {})
@@ -3367,6 +3513,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             record["effective_thresholds"] = precision.get("thresholds", {})
             record["last_confidence_score"] = precision.get("confidence_score")
             record["last_rr"] = precision.get("rr")
+            record["last_operational_risk_pct"] = precision.get("operational_plan", {}).get("risk_pct")
             record["last_candle_pattern"] = precision.get("candle", {}).get("pattern", "sin_patron")
             record["last_mtf_summary"] = precision.get("mtf", {}).get("summary", "")
             quality_stats = record.get("quality_stats", {}) if isinstance(record.get("quality_stats", {}), dict) else {}

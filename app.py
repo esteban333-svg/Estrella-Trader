@@ -1298,14 +1298,16 @@ USERS_DB_PATH = os.getenv("USERS_DB_PATH", os.path.join(os.path.dirname(__file__
 SCANNER_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "scanner_config.json")
 SCANNER_STATE_PATH = os.path.join(os.path.dirname(__file__), "scanner_state.json")
 SCANNER_HEALTH_PATH = os.path.join(os.path.dirname(__file__), "scanner_health.json")
-AUTH_CACHE_PATH = os.path.join(os.path.dirname(__file__), "auth_cache.json")
 AUTH_COOKIE_PREFIX = os.getenv("AUTH_COOKIE_PREFIX", "estrella_trader")
 # Cambia esta clave en producción con variable de entorno AUTH_COOKIE_PASSWORD.
 AUTH_COOKIE_PASSWORD = os.getenv("AUTH_COOKIE_PASSWORD", "").strip()
 if not AUTH_COOKIE_PASSWORD:
-    host_name = os.getenv("COMPUTERNAME", os.getenv("HOSTNAME", "local"))
-    seed = f"{host_name}|{os.path.abspath(__file__)}|estrella-auth-fallback"
+    seed = f"{os.path.abspath(os.path.dirname(__file__))}|estrella-auth-stable-fallback"
     AUTH_COOKIE_PASSWORD = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    logger.warning(
+        "AUTH_COOKIE_PASSWORD no configurado; usando fallback estable local. "
+        "Configuralo en produccion para sesiones persistentes y seguras."
+    )
 AUTH_COOKIE_USER_KEY = "uid"
 PREMIUM_ACCESS_CODE = os.getenv("PREMIUM_ACCESS_CODE", "").strip()
 
@@ -1851,6 +1853,18 @@ def _hash_password(password: str) -> str:
     return hashlib.sha256((password or "").encode("utf-8")).hexdigest()
 
 
+def _candidate_password_hashes(password: str) -> list[str]:
+    raw = password or ""
+    hashes: list[str] = []
+    seen: set[str] = set()
+    for variant in (raw, raw.strip()):
+        if variant in seen:
+            continue
+        seen.add(variant)
+        hashes.append(_hash_password(variant))
+    return hashes
+
+
 # ============================================================
 # BLOQUE: AUTH - PERSISTENCIA DE USUARIOS Y COOKIES
 # ============================================================
@@ -1928,39 +1942,6 @@ def _escribir_cookie_uid_retry(uid: str, retries: int = 6, delay_sec: float = 0.
     return False
 
 
-def _leer_auth_cache_uid():
-    try:
-        with open(AUTH_CACHE_PATH, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-    except Exception:
-        return None
-    if not isinstance(payload, dict):
-        return None
-    uid = str(payload.get("user_id") or payload.get("uid") or "").strip()
-    return uid or None
-
-
-def _escribir_auth_cache_uid(uid: str) -> bool:
-    uid = str(uid or "").strip()
-    if not uid:
-        try:
-            if os.path.exists(AUTH_CACHE_PATH):
-                os.remove(AUTH_CACHE_PATH)
-        except Exception:
-            return False
-        return True
-    payload = {
-        "user_id": uid,
-        "saved_at": _iso_utc(_utc_now()),
-    }
-    try:
-        with open(AUTH_CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
-
-
 # ============================================================
 # BLOQUE: AUTH - MODELO PUBLICO DE USUARIO
 # ============================================================
@@ -2016,7 +1997,7 @@ def _usuario_invitado() -> dict:
 def registrar_usuario(username: str, email: str, password: str, telegram_chat_id: str = ""):
     username = (username or "").strip()
     email = _normalizar_email(email)
-    password = password or ""
+    password = (password or "").strip()
     telegram_chat_id = _normalizar_telegram_chat_id(telegram_chat_id)
 
     if len(username) < 3:
@@ -2062,14 +2043,14 @@ def autenticar_usuario(email: str, password: str):
     email = _normalizar_email(email)
     if not _es_gmail(email):
         return False, "Ingresa un correo Gmail valido.", None
-    password_hash = _hash_password(password or "")
+    password_hashes = _candidate_password_hashes(password)
 
     db = _cargar_usuarios_db()
     changed = False
     for u in db["users"]:
         if _normalizar_email(u.get("email")) != email:
             continue
-        if u.get("password_hash") != password_hash:
+        if str(u.get("password_hash") or "") not in password_hashes:
             return False, "Credenciales inválidas.", None
 
         if u.get("es_premium", False) and not _premium_activo(u):
@@ -2107,13 +2088,11 @@ def guardar_sesion_local(user_id: str):
         return
     st.session_state["auth_cookie_pending_uid"] = uid
     _sincronizar_cookie_pendiente()
-    _escribir_auth_cache_uid(uid)
 
 
 def limpiar_sesion_local():
     st.session_state["auth_cookie_pending_uid"] = ""
     _sincronizar_cookie_pendiente()
-    _escribir_auth_cache_uid("")
 
 
 def _sincronizar_cookie_pendiente():
@@ -2130,7 +2109,7 @@ def recuperar_sesion_local():
     cookie_mgr = _cookie_manager()
     if _HAS_COOKIE_MANAGER and not _cookie_manager_ready(cookie_mgr):
         attempts = int(st.session_state.get("auth_cookie_boot_attempts", 0))
-        if attempts < 8:
+        if attempts < 1:
             st.session_state["auth_cookie_boot_attempts"] = attempts + 1
             rerun_app()
         return _usuario_invitado()
@@ -2138,8 +2117,6 @@ def recuperar_sesion_local():
 
     _sincronizar_cookie_pendiente()
     uid = _leer_cookie_uid()
-    if not uid:
-        uid = _leer_auth_cache_uid()
     if not uid:
         return _usuario_invitado()
 
@@ -2820,9 +2797,9 @@ if st.session_state["usuario"].get("autenticado", False):
 with st.sidebar.expander("Cuenta", expanded=True):
     usuario_ui = st.session_state["usuario"]
     if not _HAS_COOKIE_MANAGER:
-        st.caption("Recordarme por navegador desactivado: falta streamlit-cookies-manager. Fallback local activo en este equipo.")
-    elif st.session_state.get("auth_cookie_boot_attempts", 0) >= 2:
-        st.caption("Tu navegador puede estar bloqueando cookies; por eso pide iniciar sesión al refrescar.")
+        st.caption("Recordarme por navegador desactivado: falta streamlit-cookies-manager.")
+    elif st.session_state.get("auth_cookie_boot_attempts", 0) >= 1:
+        st.caption("Tu navegador puede estar bloqueando cookies; la sesión puede no persistir al refrescar.")
 
     if not usuario_ui.get("autenticado", False):
         st.caption("Inicia sesion o crea cuenta.")

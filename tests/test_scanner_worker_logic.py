@@ -3,6 +3,7 @@ import unittest
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
+import pandas as pd
 import pytz
 
 import scanner_worker as sw
@@ -108,19 +109,40 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
     def test_signal_strength_label(self):
         strong = sw._signal_strength_label(
-            {"confidence_score": 92, "min_confidence_required": 84, "candle_pattern": "rechazo_alcista"},
-            {"rr_estimado": 2.2},
+            {
+                "confidence_score": 92,
+                "min_confidence_required": 84,
+                "candle_pattern": "rechazo_alcista",
+                "riesgo": "Moderado",
+                "indice_alerta_utc": "2026-03-10T15:00:00Z",
+                "mtf_summary": "confirmaciones=1, opuestos=0, neutrales=0",
+            },
+            {"rr_estimado": 2.3, "micro_score": 6, "umbral": 4},
         )
-        medium = sw._signal_strength_label(
-            {"confidence_score": 83, "min_confidence_required": 80, "candle_pattern": "sin_patron"},
-            {"rr_estimado": 1.9},
+        borderline = sw._signal_strength_label(
+            {
+                "confidence_score": 89,
+                "min_confidence_required": 80,
+                "candle_pattern": "rechazo_alcista",
+                "riesgo": "Moderado",
+                "indice_alerta_utc": "2026-03-10T15:00:00Z",
+                "mtf_summary": "confirmaciones=1, opuestos=0, neutrales=1",
+            },
+            {"rr_estimado": 2.2, "micro_score": 5, "umbral": 4},
         )
         weak = sw._signal_strength_label(
-            {"confidence_score": 85, "min_confidence_required": 84, "candle_pattern": "sin_patron"},
-            {"rr_estimado": 1.6},
+            {
+                "confidence_score": 85,
+                "min_confidence_required": 84,
+                "candle_pattern": "sin_patron",
+                "riesgo": "Moderado",
+                "indice_alerta_utc": "2026-03-10T15:00:00Z",
+                "mtf_summary": "confirmaciones=0, opuestos=0, neutrales=1",
+            },
+            {"rr_estimado": 1.6, "micro_score": 4, "umbral": 4},
         )
         self.assertEqual(strong, "FUERTE")
-        self.assertEqual(medium, "MEDIA")
+        self.assertEqual(borderline, "DEBIL")
         self.assertEqual(weak, "DEBIL")
 
     def test_build_alert_payload_includes_pullback_metadata(self):
@@ -136,7 +158,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "dorado_v13": {
                 "micro_score": 6,
                 "umbral": 4,
-                "rr_estimado": 2.1,
+                "rr_estimado": 2.3,
                 "setup_tipo": "pullback_tendencia",
                 "setup_label": "Pullback en tendencia",
                 "zona_pullback": "EMA20",
@@ -147,21 +169,140 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "temporalidad_alerta": "15m",
             "modo_alerta": "Tendencial",
             "precio_alerta": 102345.12,
-            "indice_alerta_utc": "2026-03-13T15:00:00Z",
-            "confidence_score": 88,
+            "indice_alerta_utc": "2026-03-10T15:00:00Z",
+            "confidence_score": 90,
             "min_confidence_required": 72,
             "candle_pattern": "rechazo_alcista",
+            "mtf_summary": "confirmaciones=1, opuestos=0, neutrales=0",
             "alert_profile": "balanceado",
+            "operational_plan": {"rr_ratio": 2.0},
         }
         subject, body = sw._build_alert_payload(cfg, item, estado, "source")
         self.assertIn("BTC-USD | 15m", subject)
+        self.assertIn("Estado de la sesion: Optima", body)
+        self.assertIn("Recomendacion: Operar normal", body)
+        self.assertIn("Hora Col: 2026-03-10 10:00", body)
         self.assertIn("Direccion: ALCISTA", body)
         self.assertIn("Escenario: Continuacion tendencial confirmada", body)
         self.assertIn("Entrada guia: 102345.12", body)
-        self.assertIn("Puntaje tecnico: 88/100", body)
+        self.assertIn("Puntaje tecnico: 90/100", body)
         self.assertIn("Checklist tecnico: 6/4", body)
         self.assertIn("Patron: rechazo_alcista", body)
         self.assertIn("Mentor:", body)
+        self.assertIn("viernes y durante el fin de semana", body)
+
+    def test_session_status_for_alert_marks_weekend_as_not_favorable(self):
+        state, recommendation = sw._session_status_for_alert("2026-03-14T15:00:00Z")
+        self.assertEqual(state, "No favorable")
+        self.assertEqual(recommendation, "No operar")
+
+    def test_session_status_for_alert_marks_friday_as_not_favorable(self):
+        state, recommendation = sw._session_status_for_alert("2026-03-13T15:00:00Z")
+        self.assertEqual(state, "No favorable")
+        self.assertEqual(recommendation, "No operar")
+
+    def test_fetch_data_prioritizes_binance_for_crypto(self):
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTC-USD",
+            td_symbol="BTC/USD",
+            kind="crypto",
+            binance_symbol="BTCUSDT",
+        )
+        binance_df = pd.DataFrame(
+            {
+                "Open": [100.0, 101.0],
+                "High": [101.0, 102.0],
+                "Low": [99.5, 100.5],
+                "Close": [100.8, 101.7],
+                "Volume": [10.0, 12.0],
+            }
+        )
+
+        with (
+            patch.object(sw, "fetch_klines", return_value=(binance_df, None)) as fetch_mock,
+            patch.object(sw, "obtener_datos") as yf_mock,
+        ):
+            df, source, err = sw._fetch_data(item=item, period="5d", interval="15m", cfg={})
+
+        self.assertEqual(source, "binance")
+        self.assertEqual(err, "")
+        self.assertFalse(df.empty)
+        fetch_mock.assert_called_once_with("BTCUSDT", "15m", limit=500)
+        yf_mock.assert_not_called()
+
+    def test_fetch_data_falls_back_to_yfinance_when_binance_fails(self):
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTC-USD",
+            td_symbol="BTC/USD",
+            kind="crypto",
+            binance_symbol="BTCUSDT",
+        )
+        yf_df = pd.DataFrame(
+            {
+                "Open": [100.0, 101.0],
+                "High": [101.0, 102.0],
+                "Low": [99.5, 100.5],
+                "Close": [100.8, 101.7],
+                "Volume": [10.0, 12.0],
+            }
+        )
+
+        with (
+            patch.object(sw, "fetch_klines", return_value=(pd.DataFrame(), "sin datos")) as fetch_mock,
+            patch.object(sw, "obtener_datos", return_value=yf_df) as yf_mock,
+            patch.dict(os.environ, {"TWELVE_DATA_API_KEY": ""}, clear=False),
+        ):
+            df, source, err = sw._fetch_data(item=item, period="5d", interval="15m", cfg={})
+
+        self.assertEqual(source, "yfinance")
+        self.assertEqual(err, "")
+        self.assertFalse(df.empty)
+        fetch_mock.assert_called_once_with("BTCUSDT", "15m", limit=500)
+        yf_mock.assert_called_once_with("BTC-USD", periodo="5d", intervalo="15m")
+
+    def test_format_colombia_alert_time_uses_bogota_timezone(self):
+        self.assertEqual(sw._format_colombia_alert_time("2026-03-28T19:35:00Z"), "2026-03-28 14:35")
+
+    def test_resolve_operational_trade_plan_clamps_risk_to_minimum(self):
+        estado = {"direccion_v13": "ALCISTA", "precio_alerta": 100.0}
+        compute_ctx = {
+            "df_ind": pd.DataFrame(
+                {
+                    "High": [100.2, 100.3, 100.25, 100.15, 100.1],
+                    "Low": [99.95, 99.9, 99.85, 99.8, 99.82],
+                }
+            )
+        }
+
+        plan = sw._resolve_operational_trade_plan(estado=estado, compute_ctx=compute_ctx)
+
+        self.assertTrue(plan["ok"])
+        self.assertEqual(plan["risk_pct"], 0.5)
+        self.assertEqual(plan["risk_pct_structural"], 0.2)
+        self.assertTrue(plan["adjusted_to_min"])
+        self.assertEqual(plan["sl_price"], 99.5)
+        self.assertEqual(plan["tp_price"], 101.0)
+
+    def test_resolve_operational_trade_plan_rejects_risk_above_maximum(self):
+        estado = {"direccion_v13": "BAJISTA", "precio_alerta": 100.0}
+        compute_ctx = {
+            "df_ind": pd.DataFrame(
+                {
+                    "High": [100.5, 100.7, 100.9, 101.1, 101.3],
+                    "Low": [99.8, 99.7, 99.6, 99.5, 99.4],
+                }
+            )
+        }
+
+        plan = sw._resolve_operational_trade_plan(estado=estado, compute_ctx=compute_ctx)
+
+        self.assertFalse(plan["ok"])
+        self.assertEqual(plan["risk_pct"], 1.3)
+        self.assertIn("riesgo_operativo_fuera_marco", plan["reason"])
 
     def test_apply_precision_filters_allows_pullback_with_neutral_mtf(self):
         item = sw.MarketItem(
@@ -189,8 +330,18 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             },
             "setup_tipo": "pullback_tendencia",
             "direccion_v13": "ALCISTA",
+            "precio_alerta": 100.0,
         }
-        compute_ctx = {"interval": "15m", "vol_ratio": 1.0, "df_ind": None}
+        compute_ctx = {
+            "interval": "15m",
+            "vol_ratio": 1.0,
+            "df_ind": pd.DataFrame(
+                {
+                    "High": [100.2, 100.3, 100.25, 100.15, 100.1],
+                    "Low": [99.95, 99.9, 99.85, 99.8, 99.82],
+                }
+            ),
+        }
         mtf_info = {
             "ok": False,
             "score": 0,
@@ -219,6 +370,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertTrue(out["signal_ready"])
         self.assertTrue(out["mtf"]["ok"])
         self.assertEqual(out["mtf"]["override"], "pullback_neutral")
+        self.assertTrue(out["risk_ok"])
         self.assertEqual(out["reasons"], ["filtros_ok"])
 
     def test_apply_precision_filters_keeps_neutral_mtf_block_for_non_pullback(self):
@@ -247,8 +399,18 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             },
             "setup_tipo": "",
             "direccion_v13": "ALCISTA",
+            "precio_alerta": 100.0,
         }
-        compute_ctx = {"interval": "15m", "vol_ratio": 1.0, "df_ind": None}
+        compute_ctx = {
+            "interval": "15m",
+            "vol_ratio": 1.0,
+            "df_ind": pd.DataFrame(
+                {
+                    "High": [100.2, 100.3, 100.25, 100.15, 100.1],
+                    "Low": [99.95, 99.9, 99.85, 99.8, 99.82],
+                }
+            ),
+        }
         mtf_info = {
             "ok": False,
             "score": 0,
@@ -275,6 +437,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
                 precision_cfg=precision_cfg,
             )
         self.assertFalse(out["signal_ready"])
+        self.assertTrue(out["risk_ok"])
         self.assertIn("mtf_no_alineado", out["reasons"])
         self.assertIn("confianza_baja(<72)", out["reasons"])
 
