@@ -2789,13 +2789,16 @@ def _resolve_operational_trade_plan(
         structural_risk_pct = ((structure_price - entry_price) / entry_price) * 100.0
 
     structural_risk_pct = max(0.0, structural_risk_pct)
-    risk_pct = max(OPERATIONAL_SL_MIN_PCT, structural_risk_pct)
-    adjusted_to_min = risk_pct > 0 and risk_pct != structural_risk_pct
+    risk_pct = structural_risk_pct
 
     base["risk_pct_structural"] = round(structural_risk_pct, 4)
     base["risk_pct"] = round(risk_pct, 4)
-    base["adjusted_to_min"] = bool(adjusted_to_min)
+    base["adjusted_to_min"] = False
     base["structure_price"] = round(structure_price, 10)
+
+    if risk_pct < OPERATIONAL_SL_MIN_PCT:
+        base["reason"] = f"riesgo_operativo_fuera_marco(<{OPERATIONAL_SL_MIN_PCT:.2f}%)"
+        return base
 
     if risk_pct > OPERATIONAL_SL_MAX_PCT:
         base["reason"] = f"riesgo_operativo_fuera_marco(>{OPERATIONAL_SL_MAX_PCT:.2f}%)"
@@ -2920,9 +2923,9 @@ def _build_alert_payload(
         f"Direccion: {direction}\n"
         f"Accion: {action_text}\n"
         f"Escenario operativo: {scenario_text}\n"
-        f"Entrada: {precio_alerta_text}\n"
-        f"SL: {sl_text}\n"
-        f"TP: {tp_text}\n"
+        f"➡️ Entrada: {precio_alerta_text}\n"
+        f"🟥 SL: {sl_text}\n"
+        f"🟩 TP: {tp_text}\n"
         f"Fuerza: {strength_label}\n"
         f"Riesgo/beneficio: {rr_text}\n"
         f"Puntaje tecnico: {confidence_text}/100\n"

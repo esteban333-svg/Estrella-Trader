@@ -186,9 +186,9 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertIn("Contexto estructural: Alcista", body)
         self.assertIn("Direccion: ALCISTA", body)
         self.assertIn("Escenario operativo: Pullback alcista de continuidad", body)
-        self.assertIn("Entrada: 102345.12", body)
-        self.assertIn("SL: 101833.39", body)
-        self.assertIn("TP: 103368.57", body)
+        self.assertIn("➡️ Entrada: 102345.12", body)
+        self.assertIn("🟥 SL: 101833.39", body)
+        self.assertIn("🟩 TP: 103368.57", body)
         self.assertIn("Riesgo/beneficio: 1/2.30", body)
         self.assertIn("Puntaje tecnico: 90/100", body)
         self.assertIn("Checklist tecnico: 6/4", body)
@@ -323,7 +323,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
     def test_format_colombia_alert_time_uses_bogota_timezone(self):
         self.assertEqual(sw._format_colombia_alert_time("2026-03-28T19:35:00Z"), "2026-03-28 14:35")
 
-    def test_resolve_operational_trade_plan_clamps_risk_to_minimum(self):
+    def test_resolve_operational_trade_plan_rejects_risk_below_minimum(self):
         estado = {"direccion_v13": "ALCISTA", "precio_alerta": 100.0}
         compute_ctx = {
             "df_ind": pd.DataFrame(
@@ -336,12 +336,11 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
         plan = sw._resolve_operational_trade_plan(estado=estado, compute_ctx=compute_ctx)
 
-        self.assertTrue(plan["ok"])
-        self.assertEqual(plan["risk_pct"], 0.5)
+        self.assertFalse(plan["ok"])
+        self.assertEqual(plan["risk_pct"], 0.2)
         self.assertEqual(plan["risk_pct_structural"], 0.2)
-        self.assertTrue(plan["adjusted_to_min"])
-        self.assertEqual(plan["sl_price"], 99.5)
-        self.assertEqual(plan["tp_price"], 101.0)
+        self.assertFalse(plan["adjusted_to_min"])
+        self.assertIn("riesgo_operativo_fuera_marco(<0.50%)", plan["reason"])
 
     def test_resolve_operational_trade_plan_rejects_risk_above_maximum(self):
         estado = {"direccion_v13": "BAJISTA", "precio_alerta": 100.0}
@@ -393,8 +392,8 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "vol_ratio": 1.0,
             "df_ind": pd.DataFrame(
                 {
-                    "High": [100.2, 100.3, 100.25, 100.15, 100.1],
-                    "Low": [99.95, 99.9, 99.85, 99.8, 99.82],
+                    "High": [100.8, 100.7, 100.6, 100.5, 100.4],
+                    "Low": [99.5, 99.4, 99.45, 99.5, 99.55],
                 }
             ),
         }
@@ -462,8 +461,8 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "vol_ratio": 1.0,
             "df_ind": pd.DataFrame(
                 {
-                    "High": [100.2, 100.3, 100.25, 100.15, 100.1],
-                    "Low": [99.95, 99.9, 99.85, 99.8, 99.82],
+                    "High": [100.8, 100.7, 100.6, 100.5, 100.4],
+                    "Low": [99.5, 99.4, 99.45, 99.5, 99.55],
                 }
             ),
         }
