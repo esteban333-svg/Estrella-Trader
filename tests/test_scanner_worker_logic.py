@@ -189,6 +189,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertIn("Entrada: 102345.12", body)
         self.assertIn("SL: 101833.39", body)
         self.assertIn("TP: 103368.57", body)
+        self.assertIn("Riesgo/beneficio: 1/2.30", body)
         self.assertIn("Puntaje tecnico: 90/100", body)
         self.assertIn("Checklist tecnico: 6/4", body)
         self.assertIn("Patron: rechazo_alcista", body)
@@ -215,6 +216,36 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             },
         }
         self.assertEqual(sw._structural_context_label_from_state(estado), "En transicion")
+
+    def test_open_alert_snapshot_keeps_original_rr_estimado(self):
+        estado = {
+            "direccion_v13": "ALCISTA",
+            "precio_alerta": 100.0,
+            "indice_alerta_utc": "2026-03-10T15:00:00Z",
+            "dorado_v13": {"rr_estimado": 4.4},
+        }
+        precision = {
+            "confidence_score": 88,
+            "reasons": ["filtros_ok"],
+            "operational_plan": {
+                "ok": True,
+                "sl_price": 99.5,
+                "tp_price": 101.0,
+                "rr_ratio": 2.0,
+                "risk_pct": 0.5,
+                "risk_pct_structural": 0.3,
+            },
+        }
+
+        snap = sw._open_alert_snapshot(
+            estado=estado,
+            precision=precision,
+            compute_ctx={"interval": "15m"},
+            precision_cfg={},
+        )
+
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap["rr_estimado"], 4.4)
 
     def test_session_status_for_alert_marks_weekend_as_not_favorable(self):
         state, recommendation = sw._session_status_for_alert("2026-03-14T15:00:00Z")

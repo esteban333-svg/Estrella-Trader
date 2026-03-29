@@ -2343,7 +2343,7 @@ def _open_alert_snapshot(
         "tp_price": round(tp_price, 10),
         "sl_price": round(sl_price, 10),
         "confidence_score": int(precision.get("confidence_score", 0) or 0),
-        "rr_estimado": _safe_float(operational_plan.get("rr_ratio"), OPERATIONAL_TP_R_MULT),
+        "rr_estimado": _safe_float((estado.get("dorado_v13") or {}).get("rr_estimado"), _safe_float(operational_plan.get("rr_ratio"), OPERATIONAL_TP_R_MULT)),
         "risk_pct_operativo": _safe_float(operational_plan.get("risk_pct"), 0.0),
         "risk_pct_structural": _safe_float(operational_plan.get("risk_pct_structural"), 0.0),
         "reasons": list(precision.get("reasons", [])),
@@ -2872,7 +2872,7 @@ def _build_alert_payload(
     score = dorado.get("micro_score")
     umbral = dorado.get("umbral")
     operational_plan = estado.get("operational_plan", {}) if isinstance(estado.get("operational_plan", {}), dict) else {}
-    rr = operational_plan.get("rr_ratio", OPERATIONAL_TP_R_MULT)
+    rr = dorado.get("rr_estimado", operational_plan.get("rr_ratio", OPERATIONAL_TP_R_MULT))
     direction = estado.get("direccion_v13", "")
     temporalidad = str(estado.get("temporalidad_alerta", "")).strip()
     modo = str(estado.get("modo_alerta", "Tendencial")).strip() or "Tendencial"
@@ -3326,7 +3326,7 @@ def _apply_precision_filters(
     require_price_action = enabled and bool(effective_cfg.get("require_price_action_confirmation", True))
     candle_ok = bool(candle_info.get("aligned", False)) if require_price_action else (str(candle_info.get("bias")) != _opposite_direction(direction))
 
-    rr_min = _safe_float(effective_cfg.get("min_rr", 1.8), 1.8) if enabled else 0.0
+    rr_min = max(2.0, _safe_float(effective_cfg.get("min_rr", 1.8), 1.8)) if enabled else 0.0
     rr_ok = rr >= rr_min
 
     confidence_score = _compute_signal_confidence(estado=estado, mtf_info=mtf_info, candle_info=candle_info)
