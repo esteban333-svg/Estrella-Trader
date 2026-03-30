@@ -2109,9 +2109,7 @@ def recuperar_sesion_local():
     cookie_mgr = _cookie_manager()
     if _HAS_COOKIE_MANAGER and not _cookie_manager_ready(cookie_mgr):
         attempts = int(st.session_state.get("auth_cookie_boot_attempts", 0))
-        if attempts < 1:
-            st.session_state["auth_cookie_boot_attempts"] = attempts + 1
-            rerun_app()
+        st.session_state["auth_cookie_boot_attempts"] = attempts + 1
         return _usuario_invitado()
     st.session_state["auth_cookie_boot_attempts"] = 0
 
@@ -2824,7 +2822,6 @@ with st.sidebar.expander("Cuenta", expanded=True):
                     st.session_state["play_login_intro"] = True
                     guardar_sesion_local(user_public.get("id"))
                     st.success(msg)
-                    rerun_app()
                 else:
                     st.error(msg)
         else:
@@ -2848,7 +2845,6 @@ with st.sidebar.expander("Cuenta", expanded=True):
                         st.session_state["play_login_intro"] = True
                         guardar_sesion_local(user_public.get("id"))
                         st.success(msg)
-                        rerun_app()
                     else:
                         st.error(msg)
     else:
