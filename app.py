@@ -19,6 +19,7 @@ import random
 import base64
 import json
 import hashlib
+import hmac
 import smtplib
 import logging
 from email.message import EmailMessage
@@ -1309,6 +1310,7 @@ if not AUTH_COOKIE_PASSWORD:
         "Configuralo en produccion para sesiones persistentes y seguras."
     )
 AUTH_COOKIE_USER_KEY = "uid"
+AUTH_QUERY_SESSION_KEY = "et_session"
 PREMIUM_ACCESS_CODE = os.getenv("PREMIUM_ACCESS_CODE", "").strip()
 
 
@@ -1942,6 +1944,93 @@ def _escribir_cookie_uid_retry(uid: str, retries: int = 6, delay_sec: float = 0.
     return False
 
 
+def _firmar_session_uid(uid: str) -> str:
+    raw_uid = str(uid or "").strip()
+    if not raw_uid:
+        return ""
+    digest = hmac.new(
+        AUTH_COOKIE_PASSWORD.encode("utf-8"),
+        raw_uid.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return digest[:32]
+
+
+def _crear_session_token(uid: str) -> str:
+    raw_uid = str(uid or "").strip()
+    if not raw_uid:
+        return ""
+    signature = _firmar_session_uid(raw_uid)
+    if not signature:
+        return ""
+    return f"{raw_uid}.{signature}"
+
+
+def _validar_session_token(token: str) -> str:
+    raw = str(token or "").strip()
+    if not raw or "." not in raw:
+        return ""
+    uid, signature = raw.rsplit(".", 1)
+    uid = str(uid or "").strip()
+    signature = str(signature or "").strip().lower()
+    if not uid or not signature:
+        return ""
+    expected = _firmar_session_uid(uid).lower()
+    if not expected:
+        return ""
+    if hmac.compare_digest(signature, expected):
+        return uid
+    return ""
+
+
+def _leer_query_param_text(key: str) -> str:
+    try:
+        raw = st.query_params.get(key, "")
+        if isinstance(raw, list):
+            raw = raw[-1] if raw else ""
+        return str(raw or "").strip()
+    except Exception:
+        try:
+            raw = (st.experimental_get_query_params().get(key) or [""])[-1]
+            return str(raw or "").strip()
+        except Exception:
+            return ""
+
+
+def _escribir_query_session_token(uid: str) -> None:
+    token = _crear_session_token(uid)
+    current_token = _leer_query_param_text(AUTH_QUERY_SESSION_KEY)
+    if token == current_token:
+        return
+
+    idle_raw = _leer_query_param_text("idle")
+    params: dict[str, str] = {}
+    if idle_raw:
+        params["idle"] = idle_raw
+    if token:
+        params[AUTH_QUERY_SESSION_KEY] = token
+
+    try:
+        st.experimental_set_query_params(**params)
+    except Exception:
+        try:
+            qp = st.query_params
+            for key in list(qp.keys()):
+                if key not in params:
+                    del qp[key]
+            for key, value in params.items():
+                qp[key] = value
+        except Exception:
+            pass
+
+
+def _leer_uid_desde_session_token() -> str:
+    token = _leer_query_param_text(AUTH_QUERY_SESSION_KEY)
+    if not token:
+        return ""
+    return _validar_session_token(token)
+
+
 # ============================================================
 # BLOQUE: AUTH - MODELO PUBLICO DE USUARIO
 # ============================================================
@@ -2088,11 +2177,13 @@ def guardar_sesion_local(user_id: str):
         return
     st.session_state["auth_cookie_pending_uid"] = uid
     _sincronizar_cookie_pendiente()
+    _escribir_query_session_token(uid)
 
 
 def limpiar_sesion_local():
     st.session_state["auth_cookie_pending_uid"] = ""
     _sincronizar_cookie_pendiente()
+    _escribir_query_session_token("")
 
 
 def _sincronizar_cookie_pendiente():
@@ -2110,19 +2201,25 @@ def recuperar_sesion_local():
     if _HAS_COOKIE_MANAGER and not _cookie_manager_ready(cookie_mgr):
         attempts = int(st.session_state.get("auth_cookie_boot_attempts", 0))
         st.session_state["auth_cookie_boot_attempts"] = attempts + 1
-        return _usuario_invitado()
-    st.session_state["auth_cookie_boot_attempts"] = 0
+    else:
+        st.session_state["auth_cookie_boot_attempts"] = 0
 
     _sincronizar_cookie_pendiente()
     uid = _leer_cookie_uid()
+    if not uid:
+        uid = _leer_uid_desde_session_token()
+        if uid and _HAS_COOKIE_MANAGER:
+            _escribir_cookie_uid_retry(uid)
     if not uid:
         return _usuario_invitado()
 
     user_public = recargar_usuario(uid)
     if not user_public.get("autenticado", False):
         limpiar_sesion_local()
-    elif _HAS_COOKIE_MANAGER:
-        _escribir_cookie_uid_retry(uid)
+    else:
+        if _HAS_COOKIE_MANAGER:
+            _escribir_cookie_uid_retry(uid)
+        _escribir_query_session_token(uid)
     return user_public
 
 
