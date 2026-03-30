@@ -2741,9 +2741,13 @@ def render_login_galaxia_fx(usuario_actual: dict):
 
 st.markdown('<div class="et-core-watch" aria-hidden="true"></div>', unsafe_allow_html=True)
 
-# Activa/desactiva modo reposo por inactividad en navegador.
-idle_mode = _leer_idle_query_flag()
-_render_idle_watchdog(idle_mode=idle_mode, timeout_sec=IDLE_TIMEOUT_SEC)
+# Activa/desactiva modo reposo por inactividad solo para sesiones autenticadas.
+# En Safari/iPhone el touchstart del watchdog puede competir con el login y forzar una recarga.
+idle_mode = False
+idle_watchdog_enabled = bool((st.session_state.get("usuario") or {}).get("autenticado", False))
+if idle_watchdog_enabled:
+    idle_mode = _leer_idle_query_flag()
+    _render_idle_watchdog(idle_mode=idle_mode, timeout_sec=IDLE_TIMEOUT_SEC)
 
 if idle_mode:
     prev_color = st.session_state.get("idle_star_color")
