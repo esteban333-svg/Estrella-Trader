@@ -369,7 +369,7 @@ def _default_config() -> Dict[str, Any]:
         "crypto_symbols": list(CRYPTO_MAP.keys()),
         "gold_symbols": list(GOLD_MAP.keys()),
         "notification": {
-            "subject_prefix": "[Estrella Trader]",
+            "subject_prefix": "",
             "email": {
                 "enabled": True,
                 "to": [],
@@ -2912,8 +2912,11 @@ def _build_alert_payload(
     session_note = _session_risk_note()
     hora_col_text = str(estado.get("hora_col", "")).strip() or _format_colombia_alert_time(indice_alerta_utc)
 
-    prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
-    subject = f"{prefix} {item.ticker} | {temporalidad}"
+    prefix = str(cfg.get("notification", {}).get("subject_prefix", "")).strip()
+    subject_parts = [item.ticker, temporalidad]
+    if prefix:
+        subject_parts.insert(0, prefix)
+    subject = " | ".join(subject_parts)
 
     body = (
         f"Estado de la sesion: {session_state}\n"
@@ -2943,14 +2946,17 @@ def _build_replaced_payload(
     replaced_alert: Dict[str, Any],
     estado: Dict[str, Any],
 ) -> Tuple[str, str]:
-    prefix = cfg.get("notification", {}).get("subject_prefix", "[Estrella Trader]")
+    prefix = str(cfg.get("notification", {}).get("subject_prefix", "")).strip()
     temporalidad = str(
         replaced_alert.get("interval")
         or estado.get("temporalidad_alerta")
         or estado.get("analysis_interval")
         or cfg.get("interval", "15m")
     ).strip()
-    subject = f"{prefix} ALERTA REPLACED | {item.ticker} | {temporalidad}"
+    subject_parts = ["ALERTA REPLACED", item.ticker, temporalidad]
+    if prefix:
+        subject_parts.insert(0, prefix)
+    subject = " | ".join(subject_parts)
 
     previous_direction = str(replaced_alert.get("direction", "") or "N/A").strip()
     previous_entry = _format_price(replaced_alert.get("entry_price"))

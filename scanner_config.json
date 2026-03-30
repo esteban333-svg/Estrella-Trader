@@ -83,7 +83,7 @@
     "XAU/USD"
   ],
   "notification": {
-    "subject_prefix": "[Estrella Trader]",
+    "subject_prefix": "",
     "email": {
       "enabled": true,
       "to": []
