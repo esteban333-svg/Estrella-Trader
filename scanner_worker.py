@@ -1363,9 +1363,9 @@ def _fetch_data(
         binance_df, binance_err = fetch_klines(item.binance_symbol, interval, limit=500)
         if binance_df is not None and not binance_df.empty:
             binance_df = _trim_df_for_interval(binance_df, interval=interval, cfg=cfg_safe)
-            return binance_df, "binance", ""
+            return binance_df, "bybit", ""
         logging.warning(
-            "[%s] Binance fallo (%s), usando fallback de datos",
+            "[%s] Bybit futures fallo (%s), usando fallback de datos",
             item.state_key,
             binance_err or "sin detalle",
         )

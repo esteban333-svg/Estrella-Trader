@@ -282,7 +282,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         ):
             df, source, err = sw._fetch_data(item=item, period="5d", interval="15m", cfg={})
 
-        self.assertEqual(source, "binance")
+        self.assertEqual(source, "bybit")
         self.assertEqual(err, "")
         self.assertFalse(df.empty)
         fetch_mock.assert_called_once_with("BTCUSDT", "15m", limit=500)

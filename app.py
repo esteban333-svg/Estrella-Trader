@@ -3186,7 +3186,7 @@ AUTO_REFRESH_SEC = 60
 REFRESH_MS = AUTO_REFRESH_SEC * 1000
 STAR_REFRESH_SEC = AUTO_REFRESH_SEC
 live_mode_enabled = st.sidebar.toggle(
-    "Live Mode con Binance",
+    "Live Mode con Bybit Futures",
     value=st.session_state.get("live_mode_enabled", False),
     disabled=(mercado_nombre != "Cripto")
 )
@@ -3315,7 +3315,7 @@ try:
         st.sidebar.caption("Live Mode se desactiva en lectura estructural 1D+4H.")
     if use_binance_live and not WEBSOCKETS_AVAILABLE:
         live_fallback_reason = "Paquete websockets no disponible en este servidor."
-        logger.warning("Live Binance desactivado: %s", live_fallback_reason)
+        logger.warning("Live Bybit Futures desactivado: %s", live_fallback_reason)
         use_binance_live = False
     if not use_binance_live:
         stop_prev = st.session_state.get("binance_stop")
@@ -3335,8 +3335,8 @@ try:
         if needs_seed:
             seed_df, seed_err = fetch_klines(binance_symbol, binance_interval, limit=500)
             if seed_df is None or seed_df.empty:
-                live_fallback_reason = seed_err or f"Binance REST sin datos para {binance_symbol} {binance_interval}."
-                logger.warning("Live Binance seed fallido: %s", live_fallback_reason)
+                live_fallback_reason = seed_err or f"Bybit Futures REST sin datos para {binance_symbol} {binance_interval}."
+                logger.warning("Live Bybit Futures seed fallido: %s", live_fallback_reason)
                 use_binance_live = False
             else:
                 store.seed(seed_df, binance_symbol, binance_interval)
@@ -3365,8 +3365,8 @@ try:
                     datos = store.get_df()
                 else:
                     ws_err = store.get_last_error() if hasattr(store, "get_last_error") else None
-                    live_fallback_reason = ws_err or retry_err or "No se recibieron velas live desde Binance."
-                    logger.warning("Live Binance sin datos, fallback activado: %s", live_fallback_reason)
+                    live_fallback_reason = ws_err or retry_err or "No se recibieron velas live desde Bybit Futures."
+                    logger.warning("Live Bybit Futures sin datos, fallback activado: %s", live_fallback_reason)
                     use_binance_live = False
     if not use_binance_live:
         stop_prev = st.session_state.get("binance_stop")
@@ -3383,7 +3383,7 @@ try:
             zona_ui=zona,
         )
         if live_mode_requested:
-            st.sidebar.warning("Live Binance no disponible en este servidor. Usando datos alternos (TwelveData/yfinance).")
+            st.sidebar.warning("Live Bybit Futures no disponible en este servidor. Usando datos alternos (TwelveData/yfinance).")
             if live_fallback_reason:
                 st.sidebar.caption(f"Detalle live: {live_fallback_reason[:220]}")
                 st.session_state["binance_live_last_error"] = live_fallback_reason
@@ -3439,7 +3439,7 @@ if (
     effective_live = bool(st.session_state.get("binance_live_effective", False))
     ws_reconnects = int(st.session_state.get("binance_ws_reconnects", 0))
     pill_class = "is-live" if effective_live else "is-fallback"
-    status_label = "LIVE Binance" if effective_live else "Fallback datos"
+    status_label = "LIVE Bybit Futures" if effective_live else "Fallback datos"
     meta_label = (
         f"WS reintentos: {ws_reconnects}"
         if effective_live
