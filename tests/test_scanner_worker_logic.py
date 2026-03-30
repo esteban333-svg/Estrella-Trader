@@ -101,7 +101,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "quality_calibration": {"mode": "neutral"},
         }
         record = {"quality_stats": {"wins": 2, "losses": 4, "timeouts": 2}}
-        out = sw._apply_record_quality_calibration(cfg, record, "Cripto|BTC|BTC-USD|15m")
+        out = sw._apply_record_quality_calibration(cfg, record, "Cripto|BTC|BTCUSDT PERP|15m")
         self.assertEqual(out["quality_calibration"]["scope"], "global_and_record")
         self.assertIn(out["quality_calibration"]["mode"], {"tighten_soft", "tighten_hard"})
         self.assertGreaterEqual(out["min_confidence_score"], 81)
@@ -150,8 +150,8 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         item = sw.MarketItem(
             market="Cripto",
             label="BTC",
-            ticker="BTC-USD",
-            td_symbol="BTC/USD",
+            ticker="BTCUSDT PERP",
+            td_symbol="",
             kind="crypto",
         )
         estado = {
@@ -179,7 +179,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "contexto_estructural": "Alcista",
         }
         subject, body = sw._build_alert_payload(cfg, item, estado, "source")
-        self.assertIn("BTC-USD | 15m", subject)
+        self.assertIn("BTCUSDT PERP | 15m", subject)
         self.assertIn("Estado de la sesion: Optima", body)
         self.assertIn("Recomendacion: Operar normal", body)
         self.assertIn("Hora Col: 2026-03-10 10:00", body)
@@ -261,8 +261,8 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         item = sw.MarketItem(
             market="Cripto",
             label="BTC",
-            ticker="BTC-USD",
-            td_symbol="BTC/USD",
+            ticker="BTCUSDT PERP",
+            td_symbol="",
             kind="crypto",
             binance_symbol="BTCUSDT",
         )
@@ -282,43 +282,33 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         ):
             df, source, err = sw._fetch_data(item=item, period="5d", interval="15m", cfg={})
 
-        self.assertEqual(source, "binance")
+        self.assertEqual(source, "binance_futures")
         self.assertEqual(err, "")
         self.assertFalse(df.empty)
         fetch_mock.assert_called_once_with("BTCUSDT", "15m", limit=500)
         yf_mock.assert_not_called()
 
-    def test_fetch_data_falls_back_to_yfinance_when_binance_fails(self):
+    def test_fetch_data_returns_error_when_binance_fails_for_crypto(self):
         item = sw.MarketItem(
             market="Cripto",
             label="BTC",
-            ticker="BTC-USD",
-            td_symbol="BTC/USD",
+            ticker="BTCUSDT PERP",
+            td_symbol="",
             kind="crypto",
             binance_symbol="BTCUSDT",
-        )
-        yf_df = pd.DataFrame(
-            {
-                "Open": [100.0, 101.0],
-                "High": [101.0, 102.0],
-                "Low": [99.5, 100.5],
-                "Close": [100.8, 101.7],
-                "Volume": [10.0, 12.0],
-            }
         )
 
         with (
             patch.object(sw, "fetch_klines", return_value=(pd.DataFrame(), "sin datos")) as fetch_mock,
-            patch.object(sw, "obtener_datos", return_value=yf_df) as yf_mock,
-            patch.dict(os.environ, {"TWELVE_DATA_API_KEY": ""}, clear=False),
+            patch.object(sw, "obtener_datos") as yf_mock,
         ):
             df, source, err = sw._fetch_data(item=item, period="5d", interval="15m", cfg={})
 
-        self.assertEqual(source, "yfinance")
-        self.assertEqual(err, "")
-        self.assertFalse(df.empty)
+        self.assertIsNone(df)
+        self.assertEqual(source, "")
+        self.assertEqual(err, "sin datos")
         fetch_mock.assert_called_once_with("BTCUSDT", "15m", limit=500)
-        yf_mock.assert_called_once_with("BTC-USD", periodo="5d", intervalo="15m")
+        yf_mock.assert_not_called()
 
     def test_format_colombia_alert_time_uses_bogota_timezone(self):
         self.assertEqual(sw._format_colombia_alert_time("2026-03-28T19:35:00Z"), "2026-03-28 14:35")
@@ -363,8 +353,8 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         item = sw.MarketItem(
             market="Cripto",
             label="BTC",
-            ticker="BTC-USD",
-            td_symbol="BTC/USD",
+            ticker="BTCUSDT PERP",
+            td_symbol="",
             kind="crypto",
         )
         cfg = {"interval": "15m", "cooldown_minutes": 60}
@@ -428,12 +418,100 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertTrue(out["risk_ok"])
         self.assertEqual(out["reasons"], ["filtros_ok"])
 
+    def test_detect_bullish_bias_shift_blocks_bearish_signal(self):
+        df = pd.DataFrame(
+            {
+                "Close": [100.3, 99.8, 99.1, 99.0, 99.2, 100.4],
+                "Low": [99.9, 99.3, 98.8, 98.7, 98.9, 99.8],
+                "EMA_20": [100.4, 100.1, 99.7, 99.2, 99.25, 99.7],
+                "EMA_50": [100.8, 100.6, 100.2, 99.9, 99.8, 99.75],
+                "RSI": [43.0, 40.0, 38.0, 41.0, 47.0, 57.0],
+            }
+        )
+
+        info = sw._detect_bullish_bias_shift(
+            df=df,
+            direction="BAJISTA",
+            estado={},
+            candle_info={"bias": "ALCISTA"},
+            precision_cfg={
+                "block_shorts_on_bullish_bias_shift": True,
+                "bias_shift_lookback_bars": 5,
+                "bias_shift_rsi_min": 52,
+            },
+        )
+
+        self.assertTrue(info["active"])
+        self.assertTrue(info["block_short"])
+        self.assertEqual(info["reason"], "cambio_sesgo_bajista_alcista")
+
+    def test_apply_precision_filters_blocks_short_when_bias_turns_bullish(self):
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTCUSDT PERP",
+            td_symbol="",
+            kind="crypto",
+        )
+        cfg = {"interval": "15m", "cooldown_minutes": 60}
+        precision_cfg = {
+            "enabled": True,
+            "multi_timeframe_filter": True,
+            "require_price_action_confirmation": False,
+            "min_rr": 1.6,
+            "min_confidence_score": 72,
+            "min_mtf_confirmations": 1,
+            "adaptive_threshold": False,
+            "adaptive_cooldown": True,
+            "block_shorts_on_bullish_bias_shift": True,
+        }
+        estado = {
+            "dorado_v13": {
+                "rr_estimado": 2.4,
+                "setup_tipo": "",
+            },
+            "setup_tipo": "",
+            "direccion_v13": "BAJISTA",
+            "precio_alerta": 100.0,
+        }
+        compute_ctx = {
+            "interval": "15m",
+            "vol_ratio": 1.0,
+            "df_ind": pd.DataFrame(
+                {
+                    "High": [100.4, 100.5, 100.6, 100.7, 100.65],
+                    "Low": [99.8, 99.7, 99.6, 99.5, 99.55],
+                }
+            ),
+        }
+        with (
+            patch.object(sw, "_evaluate_mtf_alignment", return_value={"ok": True, "score": 12, "details": [], "summary": "ok", "confirmations": 1, "opposites": 0, "neutrals": 0}),
+            patch.object(sw, "_detect_price_action", return_value={"aligned": True, "bias": "BAJISTA", "pattern": "rechazo_bajista", "score": 8, "description": "ok"}),
+            patch.object(sw, "_detect_bullish_bias_shift", return_value={"enabled": True, "active": True, "block_short": True, "from_bias": "BAJISTA", "to_bias": "ALCISTA", "reason": "cambio_sesgo_bajista_alcista", "summary": "guard"}),
+            patch.object(sw, "_compute_signal_confidence", return_value=88),
+            patch.object(sw, "_compute_dynamic_min_confidence", return_value=72),
+            patch.object(sw, "_compute_adaptive_cooldown_minutes", return_value=36),
+        ):
+            out = sw._apply_precision_filters(
+                item=item,
+                cfg=cfg,
+                estado=estado,
+                compute_ctx=compute_ctx,
+                mtf_cache={},
+                precision_cfg=precision_cfg,
+            )
+
+        self.assertFalse(out["signal_ready"])
+        self.assertTrue(out["risk_ok"])
+        self.assertTrue(out["bias_shift"]["active"])
+        self.assertIn("cambio_sesgo_bajista_alcista", out["reasons"])
+
     def test_apply_precision_filters_keeps_neutral_mtf_block_for_non_pullback(self):
         item = sw.MarketItem(
             market="Cripto",
             label="BTC",
-            ticker="BTC-USD",
-            td_symbol="BTC/USD",
+            ticker="BTCUSDT PERP",
+            td_symbol="",
             kind="crypto",
         )
         cfg = {"interval": "15m", "cooldown_minutes": 60}

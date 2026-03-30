@@ -42,7 +42,7 @@ from sessions import (
 )
 from analysis import advertencia_por_memoria
 from memoria import influencia_de_memoria, recuerdos_relevantes, clasificar_errores
-from live_binance import BinanceLiveStore, fetch_klines, start_stream, WEBSOCKETS_AVAILABLE
+from live_binance import BinanceLiveStore, fetch_klines, fetch_last_price, start_stream, WEBSOCKETS_AVAILABLE
 try:
     from streamlit_autorefresh import st_autorefresh
     _HAS_AUTOREFRESH = True
@@ -2282,14 +2282,14 @@ TD_SYMBOLS = {
 }
 
 CRYPTO_MAP = {
-    "BTC": {"ticker": "BTC-USD", "binance": "BTCUSDT", "td": "BTC/USD"},
-    "ETH": {"ticker": "ETH-USD", "binance": "ETHUSDT", "td": "ETH/USD"},
-    "SOL": {"ticker": "SOL-USD", "binance": "SOLUSDT", "td": "SOL/USD"},
-    "BNB": {"ticker": "BNB-USD", "binance": "BNBUSDT", "td": "BNB/USD"},
-    "XRP": {"ticker": "XRP-USD", "binance": "XRPUSDT", "td": "XRP/USD"},
-    "ADA": {"ticker": "ADA-USD", "binance": "ADAUSDT", "td": "ADA/USD"},
-    "DOGE": {"ticker": "DOGE-USD", "binance": "DOGEUSDT", "td": "DOGE/USD"},
-    "WLD": {"ticker": "WLD-USD", "binance": "WLDUSDT", "td": "WLD/USD"},
+    "BTC": {"ticker": "BTCUSDT PERP", "binance": "BTCUSDT", "td": ""},
+    "ETH": {"ticker": "ETHUSDT PERP", "binance": "ETHUSDT", "td": ""},
+    "SOL": {"ticker": "SOLUSDT PERP", "binance": "SOLUSDT", "td": ""},
+    "BNB": {"ticker": "BNBUSDT PERP", "binance": "BNBUSDT", "td": ""},
+    "XRP": {"ticker": "XRPUSDT PERP", "binance": "XRPUSDT", "td": ""},
+    "ADA": {"ticker": "ADAUSDT PERP", "binance": "ADAUSDT", "td": ""},
+    "DOGE": {"ticker": "DOGEUSDT PERP", "binance": "DOGEUSDT", "td": ""},
+    "WLD": {"ticker": "WLDUSDT PERP", "binance": "WLDUSDT", "td": ""},
 }
 
 
@@ -2376,11 +2376,19 @@ def obtener_datos_procesados_cache(
     td_interval_value: str | None,
     td_api_key_value: str | None,
     zona_ui: str,
+    market_kind: str = "",
+    binance_symbol_value: str | None = None,
 ):
     datos_local = None
+    market_kind_norm = str(market_kind or "").strip().lower()
 
-    # Prioriza TwelveData cuando existe API key (especialmente útil para FX).
-    if td_api_key_value and td_symbol_value and td_interval_value:
+    if market_kind_norm == "crypto" and binance_symbol_value:
+        datos_local, futures_err = fetch_klines(binance_symbol_value, intervalo, limit=500)
+        if datos_local is None or datos_local.empty:
+            raise ValueError(futures_err or f"Binance Futures sin datos para {binance_symbol_value} {intervalo}")
+
+    # Prioriza TwelveData cuando existe API key (especialmente util para FX).
+    if datos_local is None and td_api_key_value and td_symbol_value and td_interval_value:
         td_df = obtener_datos_twelvedata(td_symbol_value, td_interval_value, 500, td_api_key_value)
         if td_df is not None and not td_df.empty:
             datos_local = td_df
@@ -2393,7 +2401,7 @@ def obtener_datos_procesados_cache(
 
     # Fallback para 4H cuando el proveedor no lo soporta nativamente:
     # reconstruye 4H desde 1H para mantener continuidad en la lectura.
-    if (datos_local is None or datos_local.empty) and intervalo == "4h":
+    if (datos_local is None or datos_local.empty) and intervalo == "4h" and market_kind_norm != "crypto":
         try:
             datos_1h = obtener_datos(ticker=ticker, periodo=periodo, intervalo="1h")
             if datos_1h is not None and not datos_1h.empty:
@@ -3089,7 +3097,7 @@ AUTO_REFRESH_SEC = 60
 REFRESH_MS = AUTO_REFRESH_SEC * 1000
 STAR_REFRESH_SEC = AUTO_REFRESH_SEC
 live_mode_enabled = st.sidebar.toggle(
-    "Live Mode con Binance",
+    "Live Mode con Binance Futures",
     value=st.session_state.get("live_mode_enabled", False),
     disabled=(mercado_nombre != "Cripto")
 )
@@ -3207,7 +3215,7 @@ datos_1d = None
 datos_4h = None
 
 # ============================================================
-# BLOQUE: PIPELINE DE CARGA DE DATOS (BINANCE / TWELVEDATA)
+# BLOQUE: PIPELINE DE CARGA DE DATOS (BINANCE FUTURES / OTROS MERCADOS)
 # ============================================================
 try:
     TD_API_KEY = os.getenv("TWELVE_DATA_API_KEY")
@@ -3218,7 +3226,7 @@ try:
         st.sidebar.caption("Live Mode se desactiva en lectura estructural 1D+4H.")
     if use_binance_live and not WEBSOCKETS_AVAILABLE:
         live_fallback_reason = "Paquete websockets no disponible en este servidor."
-        logger.warning("Live Binance desactivado: %s", live_fallback_reason)
+        logger.warning("Live Binance Futures desactivado: %s", live_fallback_reason)
         use_binance_live = False
     if not use_binance_live:
         stop_prev = st.session_state.get("binance_stop")
@@ -3238,8 +3246,8 @@ try:
         if needs_seed:
             seed_df, seed_err = fetch_klines(binance_symbol, binance_interval, limit=500)
             if seed_df is None or seed_df.empty:
-                live_fallback_reason = seed_err or f"Binance REST sin datos para {binance_symbol} {binance_interval}."
-                logger.warning("Live Binance seed fallido: %s", live_fallback_reason)
+                live_fallback_reason = seed_err or f"Binance Futures REST sin datos para {binance_symbol} {binance_interval}."
+                logger.warning("Live Binance Futures seed fallido: %s", live_fallback_reason)
                 use_binance_live = False
             else:
                 store.seed(seed_df, binance_symbol, binance_interval)
@@ -3268,8 +3276,8 @@ try:
                     datos = store.get_df()
                 else:
                     ws_err = store.get_last_error() if hasattr(store, "get_last_error") else None
-                    live_fallback_reason = ws_err or retry_err or "No se recibieron velas live desde Binance."
-                    logger.warning("Live Binance sin datos, fallback activado: %s", live_fallback_reason)
+                    live_fallback_reason = ws_err or retry_err or "No se recibieron velas live desde Binance Futures."
+                    logger.warning("Live Binance Futures sin datos, fallback activado: %s", live_fallback_reason)
                     use_binance_live = False
     if not use_binance_live:
         stop_prev = st.session_state.get("binance_stop")
@@ -3284,9 +3292,11 @@ try:
             td_interval_value=td_interval,
             td_api_key_value=TD_API_KEY,
             zona_ui=zona,
+            market_kind="crypto" if mercado == "Cripto" else "other",
+            binance_symbol_value=binance_symbol,
         )
         if live_mode_requested:
-            st.sidebar.warning("Live Binance no disponible en este servidor. Usando datos alternos (TwelveData/yfinance).")
+            st.sidebar.warning("Live Binance Futures no disponible en este servidor. Usando Binance Futures REST.")
             if live_fallback_reason:
                 st.sidebar.caption(f"Detalle live: {live_fallback_reason[:220]}")
                 st.session_state["binance_live_last_error"] = live_fallback_reason
@@ -3317,6 +3327,8 @@ try:
             td_interval_value=TD_INTERVAL_MAP.get("1d"),
             td_api_key_value=TD_API_KEY,
             zona_ui=zona,
+            market_kind="crypto" if mercado == "Cripto" else "other",
+            binance_symbol_value=binance_symbol,
         )
         datos_4h = obtener_datos_procesados_cache(
             ticker=ticker,
@@ -3326,6 +3338,8 @@ try:
             td_interval_value=TD_INTERVAL_MAP.get("4h"),
             td_api_key_value=TD_API_KEY,
             zona_ui=zona,
+            market_kind="crypto" if mercado == "Cripto" else "other",
+            binance_symbol_value=binance_symbol,
         )
 except ValueError as e:
     st.error(f"No se pudieron obtener datos del mercado: {e}")
@@ -3342,11 +3356,11 @@ if (
     effective_live = bool(st.session_state.get("binance_live_effective", False))
     ws_reconnects = int(st.session_state.get("binance_ws_reconnects", 0))
     pill_class = "is-live" if effective_live else "is-fallback"
-    status_label = "LIVE Binance" if effective_live else "Fallback datos"
+    status_label = "LIVE Binance Futures" if effective_live else "REST Binance Futures"
     meta_label = (
         f"WS reintentos: {ws_reconnects}"
         if effective_live
-        else f"TwelveData/yfinance | WS reintentos: {ws_reconnects}"
+        else f"REST klines | WS reintentos: {ws_reconnects}"
     )
     with st.container(key="live_status_badge"):
         st.markdown(
@@ -4192,11 +4206,16 @@ def _render_main_chart(datos, use_binance_live, ticker, chart_placeholder, merca
         precio_live = float(df["Close"].iloc[-1]) if not df.empty else None
     else:
         precio_live = None
-        td_api_key = os.getenv("TWELVE_DATA_API_KEY")
-        if td_api_key and td_symbol:
-            precio_live = obtener_precio_live_twelvedata(td_symbol, td_api_key)
-        if precio_live is None:
-            precio_live = obtener_precio_live(ticker)
+        if mercado_nombre == "Cripto" and binance_symbol:
+            precio_live, _ = fetch_last_price(binance_symbol)
+            if precio_live is None and not df.empty:
+                precio_live = float(df["Close"].iloc[-1])
+        else:
+            td_api_key = os.getenv("TWELVE_DATA_API_KEY")
+            if td_api_key and td_symbol:
+                precio_live = obtener_precio_live_twelvedata(td_symbol, td_api_key)
+            if precio_live is None:
+                precio_live = obtener_precio_live(ticker)
     if precio_live is not None:
         live_ts = datetime.now(pytz.timezone(TD_TZ_MAP.get(zona, "UTC")))
         fig.add_trace(go.Scatter(
