@@ -60,14 +60,14 @@ TD_INTERVAL_MAP = {
 }
 
 CRYPTO_MAP = {
-    "BTC": {"ticker": "BTCUSDT PERP", "binance": "BTCUSDT", "td": ""},
-    "ETH": {"ticker": "ETHUSDT PERP", "binance": "ETHUSDT", "td": ""},
-    "SOL": {"ticker": "SOLUSDT PERP", "binance": "SOLUSDT", "td": ""},
-    "BNB": {"ticker": "BNBUSDT PERP", "binance": "BNBUSDT", "td": ""},
-    "XRP": {"ticker": "XRPUSDT PERP", "binance": "XRPUSDT", "td": ""},
-    "ADA": {"ticker": "ADAUSDT PERP", "binance": "ADAUSDT", "td": ""},
-    "DOGE": {"ticker": "DOGEUSDT PERP", "binance": "DOGEUSDT", "td": ""},
-    "WLD": {"ticker": "WLDUSDT PERP", "binance": "WLDUSDT", "td": ""},
+    "BTC": {"ticker": "BTC-USD", "binance": "BTCUSDT", "td": "BTC/USD"},
+    "ETH": {"ticker": "ETH-USD", "binance": "ETHUSDT", "td": "ETH/USD"},
+    "SOL": {"ticker": "SOL-USD", "binance": "SOLUSDT", "td": "SOL/USD"},
+    "BNB": {"ticker": "BNB-USD", "binance": "BNBUSDT", "td": "BNB/USD"},
+    "XRP": {"ticker": "XRP-USD", "binance": "XRPUSDT", "td": "XRP/USD"},
+    "ADA": {"ticker": "ADA-USD", "binance": "ADAUSDT", "td": "ADA/USD"},
+    "DOGE": {"ticker": "DOGE-USD", "binance": "DOGEUSDT", "td": "DOGE/USD"},
+    "WLD": {"ticker": "WLD-USD", "binance": "WLDUSDT", "td": "WLD/USD"},
 }
 
 GOLD_MAP = {
@@ -330,9 +330,6 @@ def _default_config() -> Dict[str, Any]:
             "require_closed_candle": True,
             "closed_candle_grace_sec": 10,
             "persistence_bars": 2,
-            "block_shorts_on_bullish_bias_shift": True,
-            "bias_shift_lookback_bars": 5,
-            "bias_shift_rsi_min": 52,
             "multi_timeframe_filter": True,
             "require_price_action_confirmation": True,
             "min_confidence_score": 85,
@@ -380,7 +377,6 @@ def _default_config() -> Dict[str, Any]:
             "telegram": {
                 "enabled": True,
                 "chat_ids": [],
-                "subject_prefix": "[PER-FUTURS]",
                 "parse_mode": "",
                 "send_coin_image": True,
                 "coin_image_urls": {},
@@ -1367,13 +1363,12 @@ def _fetch_data(
         binance_df, binance_err = fetch_klines(item.binance_symbol, interval, limit=500)
         if binance_df is not None and not binance_df.empty:
             binance_df = _trim_df_for_interval(binance_df, interval=interval, cfg=cfg_safe)
-            return binance_df, "binance_futures", ""
+            return binance_df, "binance", ""
         logging.warning(
-            "[%s] Binance Futures fallo (%s). Sin fallback spot para cripto.",
+            "[%s] Binance fallo (%s), usando fallback de datos",
             item.state_key,
             binance_err or "sin detalle",
         )
-        return None, "", binance_err or f"Binance Futures sin datos para {item.binance_symbol} {interval}"
 
     td_key = os.getenv("TWELVE_DATA_API_KEY", "").strip()
     td_key_upper = td_key.upper()
@@ -1633,102 +1628,6 @@ def _detect_price_action(df: pd.DataFrame, direction: str) -> Dict[str, Any]:
         "aligned": aligned,
         "description": description,
     }
-
-
-def _detect_bullish_bias_shift(
-    df: pd.DataFrame | None,
-    direction: str,
-    estado: Dict[str, Any] | None,
-    candle_info: Dict[str, Any] | None,
-    precision_cfg: Dict[str, Any] | None,
-) -> Dict[str, Any]:
-    cfg = precision_cfg if isinstance(precision_cfg, dict) else {}
-    enabled = bool(cfg.get("block_shorts_on_bullish_bias_shift", True))
-    payload = {
-        "enabled": enabled,
-        "active": False,
-        "block_short": False,
-        "from_bias": "BAJISTA",
-        "to_bias": "ALCISTA",
-        "reason": "",
-        "summary": "",
-    }
-    if not enabled:
-        return payload
-
-    direction_norm = str(direction or "").upper().strip()
-    if direction_norm != "BAJISTA":
-        return payload
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return payload
-
-    lookback_bars = max(5, int(cfg.get("bias_shift_lookback_bars", 5) or 5))
-    window = df.tail(lookback_bars).copy()
-    if len(window) < 5:
-        return payload
-
-    required_cols = ("Close", "Low", "EMA_20", "EMA_50", "RSI")
-    if any(col not in window.columns for col in required_cols):
-        return payload
-
-    close = pd.to_numeric(window["Close"], errors="coerce")
-    lows = pd.to_numeric(window["Low"], errors="coerce")
-    ema20 = pd.to_numeric(window["EMA_20"], errors="coerce")
-    ema50 = pd.to_numeric(window["EMA_50"], errors="coerce")
-    rsi = pd.to_numeric(window["RSI"], errors="coerce")
-
-    ref_idx = max(0, len(window) - 4)
-    values = [
-        close.iloc[-1],
-        close.iloc[-2],
-        close.iloc[-3],
-        close.iloc[ref_idx],
-        lows.iloc[-1],
-        lows.iloc[-2],
-        lows.iloc[-3],
-        ema20.iloc[-1],
-        ema20.iloc[-2],
-        ema20.iloc[ref_idx],
-        ema50.iloc[ref_idx],
-        rsi.iloc[-1],
-        rsi.iloc[-2],
-        rsi.iloc[ref_idx],
-    ]
-    if any(pd.isna(v) for v in values):
-        return payload
-
-    bullish_reclaim = close.iloc[-1] > ema20.iloc[-1] and close.iloc[-2] <= ema20.iloc[-2]
-    ema20_turn_up = ema20.iloc[-1] > ema20.iloc[-2]
-    rsi_min = _safe_float(cfg.get("bias_shift_rsi_min", 52.0), 52.0)
-    rsi_turn_up = rsi.iloc[-1] >= rsi_min and rsi.iloc[-1] > rsi.iloc[-2]
-    higher_lows = lows.iloc[-1] > lows.iloc[-2] > lows.iloc[-3]
-    higher_closes = close.iloc[-1] > close.iloc[-2] > close.iloc[-3]
-    bullish_candle = str((candle_info or {}).get("bias", "")).upper().strip() == "ALCISTA"
-    change_flag = bool((estado or {}).get("cambio_tendencia", False))
-    prior_bearish_context = (
-        close.iloc[ref_idx] < ema20.iloc[ref_idx]
-        or ema20.iloc[ref_idx] <= ema50.iloc[ref_idx]
-        or rsi.iloc[ref_idx] <= 48.0
-    )
-
-    active = bool(
-        prior_bearish_context
-        and bullish_reclaim
-        and ema20_turn_up
-        and rsi_turn_up
-        and (higher_lows or higher_closes or bullish_candle or change_flag)
-    )
-    if not active:
-        return payload
-
-    payload["active"] = True
-    payload["block_short"] = True
-    payload["reason"] = "cambio_sesgo_bajista_alcista"
-    payload["summary"] = (
-        "Cambio de sesgo bajista->alcista detectado: precio recupera EMA20, RSI gira al alza "
-        "y aparece estructura local de reversal. Se bloquea short."
-    )
-    return payload
 
 
 def _opposite_direction(direction: str) -> str:
@@ -3240,27 +3139,6 @@ def _send_email_alert(
         return False, _redact_text(str(exc))
 
 
-def _strip_subject_prefix(subject: str) -> str:
-    text = str(subject or "").strip()
-    if text.startswith("["):
-        close_idx = text.find("]")
-        if close_idx != -1:
-            stripped = text[close_idx + 1 :].strip()
-            if stripped:
-                return stripped
-    return text
-
-
-def _telegram_subject(cfg: Dict[str, Any], subject: str) -> str:
-    notif = cfg.get("notification", {}) if isinstance(cfg.get("notification", {}), dict) else {}
-    telegram_cfg = notif.get("telegram", {}) if isinstance(notif.get("telegram", {}), dict) else {}
-    prefix = str(telegram_cfg.get("subject_prefix", "[PER-FUTURS]") or "[PER-FUTURS]").strip()
-    base_subject = _strip_subject_prefix(subject)
-    if not prefix:
-        return base_subject
-    return f"{prefix} {base_subject}".strip()
-
-
 def _send_telegram_alert(
     cfg: Dict[str, Any],
     subject: str,
@@ -3279,8 +3157,7 @@ def _send_telegram_alert(
         return False, "Sin chat_ids (notification.telegram.chat_ids / ALERT_TELEGRAM_CHAT_IDS)."
 
     parse_mode = str((cfg.get("notification", {}).get("telegram", {}) or {}).get("parse_mode", "")).strip()
-    telegram_subject = _telegram_subject(cfg, subject)
-    message = f"{telegram_subject}\n\n{body}"
+    message = f"{subject}\n\n{body}"
     caption = message if len(message) <= 1024 else f"{message[:1000]}..."
     photo_url = _coin_image_url_for_telegram(cfg, item)
 
@@ -3449,13 +3326,6 @@ def _apply_precision_filters(
         }
 
     candle_info = _detect_price_action(df_ind, direction)
-    bias_shift = _detect_bullish_bias_shift(
-        df=df_ind,
-        direction=direction,
-        estado=estado,
-        candle_info=candle_info,
-        precision_cfg=effective_cfg,
-    )
     require_price_action = enabled and bool(effective_cfg.get("require_price_action_confirmation", True))
     candle_ok = bool(candle_info.get("aligned", False)) if require_price_action else (str(candle_info.get("bias")) != _opposite_direction(direction))
 
@@ -3497,14 +3367,11 @@ def _apply_precision_filters(
     ) if enabled else max(1, int(cfg.get("cooldown_minutes", 60)))
 
     mtf_ok = bool(mtf_info.get("ok", True))
-    bias_shift_block = bool(bias_shift.get("block_short", False))
-    signal_ready = dorado_now and risk_ok and not bias_shift_block and (not enabled or (mtf_ok and candle_ok and rr_ok and confidence_ok))
+    signal_ready = dorado_now and risk_ok and (not enabled or (mtf_ok and candle_ok and rr_ok and confidence_ok))
 
     reasons: List[str] = []
     if not dorado_now:
         reasons.append("dorado_inactivo")
-    if bias_shift_block:
-        reasons.append(str(bias_shift.get("reason", "cambio_sesgo_bajista_alcista")) or "cambio_sesgo_bajista_alcista")
     if enabled and not mtf_ok:
         reasons.append("mtf_no_alineado")
     if enabled and not candle_ok:
@@ -3547,7 +3414,6 @@ def _apply_precision_filters(
         "risk_ok": risk_ok,
         "mtf": mtf_info,
         "candle": candle_info,
-        "bias_shift": bias_shift,
         "cooldown_minutes": cooldown_effective,
         "reasons": reasons,
         "interval": interval,
@@ -3760,7 +3626,6 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             estado["mtf_details"] = precision.get("mtf", {}).get("details", [])
             estado["candle_pattern"] = precision.get("candle", {}).get("pattern", "sin_patron")
             estado["candle_pattern_desc"] = precision.get("candle", {}).get("description", "")
-            estado["bias_shift_guard"] = precision.get("bias_shift", {})
             estado["cooldown_minutes_effective"] = precision.get("cooldown_minutes")
             estado["vol_ratio"] = round(_safe_float(precision.get("vol_ratio", estado.get("vol_ratio", 1.0)), 1.0), 4)
             estado["filtros_precision"] = precision.get("reasons", [])
@@ -3782,7 +3647,6 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             record["last_rr"] = precision.get("rr")
             record["last_operational_risk_pct"] = precision.get("operational_plan", {}).get("risk_pct")
             record["last_candle_pattern"] = precision.get("candle", {}).get("pattern", "sin_patron")
-            record["last_bias_shift_guard"] = precision.get("bias_shift", {})
             record["last_mtf_summary"] = precision.get("mtf", {}).get("summary", "")
             quality_stats = record.get("quality_stats", {}) if isinstance(record.get("quality_stats", {}), dict) else {}
             estado["quality_accuracy_pct"] = quality_stats.get("accuracy_pct", 0.0)

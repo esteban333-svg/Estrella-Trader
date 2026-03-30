@@ -12,10 +12,6 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-BINANCE_FUTURES_REST_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
-BINANCE_FUTURES_REST_TICKER_URL = "https://fapi.binance.com/fapi/v1/ticker/price"
-BINANCE_FUTURES_WS_BASE_URL = "wss://fstream.binance.com/ws"
-
 WEBSOCKETS_AVAILABLE = False
 try:
     import websockets  # type: ignore
@@ -98,7 +94,10 @@ class BinanceLiveStore:
 
 def fetch_klines(symbol: str, interval: str, limit: int = 500) -> Tuple[pd.DataFrame, Optional[str]]:
     try:
-        url = f"{BINANCE_FUTURES_REST_KLINES_URL}?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+        url = (
+            "https://api.binance.com/api/v3/klines"
+            f"?symbol={symbol.upper()}&interval={interval}&limit={limit}"
+        )
         with urllib.request.urlopen(url, timeout=10) as resp:
             raw = resp.read()
 
@@ -125,58 +124,26 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> Tuple[pd.DataF
             body = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
-        err = f"Binance Futures REST HTTP {exc.code} {exc.reason}"
+        err = f"Binance REST HTTP {exc.code} {exc.reason}"
         if body:
             err += f" | {body[:220]}"
         logger.warning(err)
         return pd.DataFrame(), err
     except urllib.error.URLError as exc:
-        err = f"Binance Futures REST URL error: {exc}"
+        err = f"Binance REST URL error: {exc}"
         logger.warning(err)
         return pd.DataFrame(), err
     except Exception as exc:
-        err = f"Binance Futures REST unexpected error: {exc}"
+        err = f"Binance REST unexpected error: {exc}"
         logger.exception(err)
         return pd.DataFrame(), err
-
-
-def fetch_last_price(symbol: str) -> Tuple[Optional[float], Optional[str]]:
-    try:
-        url = f"{BINANCE_FUTURES_REST_TICKER_URL}?symbol={symbol.upper()}"
-        with urllib.request.urlopen(url, timeout=10) as resp:
-            raw = resp.read()
-
-        payload = json.loads(raw.decode("utf-8"))
-        price = payload.get("price")
-        if price is None:
-            return None, "Binance Futures ticker sin campo price."
-        return float(price), None
-    except urllib.error.HTTPError as exc:
-        body = ""
-        try:
-            body = exc.read().decode("utf-8", errors="ignore")
-        except Exception:
-            body = ""
-        err = f"Binance Futures ticker HTTP {exc.code} {exc.reason}"
-        if body:
-            err += f" | {body[:220]}"
-        logger.warning(err)
-        return None, err
-    except urllib.error.URLError as exc:
-        err = f"Binance Futures ticker URL error: {exc}"
-        logger.warning(err)
-        return None, err
-    except Exception as exc:
-        err = f"Binance Futures ticker unexpected error: {exc}"
-        logger.exception(err)
-        return None, err
 
 
 async def _ws_consume(symbol: str, interval: str, store: BinanceLiveStore, stop_event: threading.Event) -> None:
     if websockets is None:
         return
 
-    url = f"{BINANCE_FUTURES_WS_BASE_URL}/{symbol.lower()}@kline_{interval}"
+    url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@kline_{interval}"
     while not stop_event.is_set():
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
@@ -188,7 +155,7 @@ async def _ws_consume(symbol: str, interval: str, store: BinanceLiveStore, stop_
                     if k:
                         store.update_from_kline(k)
         except Exception as exc:
-            err = f"Binance Futures WS error ({symbol}@{interval}): {exc}"
+            err = f"Binance WS error ({symbol}@{interval}): {exc}"
             logger.warning(err)
             store.set_error(err)
             store.register_ws_reconnect()

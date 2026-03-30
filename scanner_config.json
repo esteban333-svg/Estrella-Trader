@@ -21,9 +21,6 @@
     "require_closed_candle": true,
     "closed_candle_grace_sec": 10,
     "persistence_bars": 2,
-    "block_shorts_on_bullish_bias_shift": true,
-    "bias_shift_lookback_bars": 5,
-    "bias_shift_rsi_min": 52,
     "multi_timeframe_filter": true,
     "require_price_action_confirmation": false,
     "min_confidence_score": 72,
@@ -94,7 +91,6 @@
     "telegram": {
       "enabled": true,
       "chat_ids": [],
-      "subject_prefix": "[PER-FUTURS]",
       "parse_mode": "",
       "bot_username": "Estrella_TraderBot"
     },
