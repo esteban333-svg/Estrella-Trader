@@ -98,7 +98,7 @@ Edita `scanner_config.json`:
   - `quality_calibration_scope`: `global`, `record` o `global_and_record` (recomendado).
   - `quality_calibration_record_enabled`: activa ajuste por simbolo/timeframe.
   - `quality_calibration_record_min_resolved`: minimo de historico por simbolo/timeframe para calibrar.
-  - `max_alerts_per_symbol_day`: tope diario por simbolo para evitar sobre-alerta.
+  - No hay tope diario global de alertas del scanner. El limite diario aplica solo a usuarios `free` al momento de entregar alertas de mercado.
   - `quality_window_bars` / `quality_window_bars_by_interval`: ventana para medir acierto de alerta
     con regla `+1R antes de -1R`.
 

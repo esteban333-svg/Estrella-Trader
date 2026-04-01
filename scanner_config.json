@@ -32,7 +32,6 @@
     "quality_calibration_scope": "global_and_record",
     "quality_calibration_record_enabled": true,
     "quality_calibration_record_min_resolved": 8,
-    "max_alerts_per_symbol_day": 2,
     "min_mtf_confirmations": 1,
     "quality_window_bars": 12,
     "quality_window_bars_by_interval": {

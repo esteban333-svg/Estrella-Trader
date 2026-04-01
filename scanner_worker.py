@@ -341,7 +341,6 @@ def _default_config() -> Dict[str, Any]:
             "quality_calibration_scope": "global_and_record",
             "quality_calibration_record_enabled": True,
             "quality_calibration_record_min_resolved": 8,
-            "max_alerts_per_symbol_day": 2,
             "min_mtf_confirmations": 2,
             "quality_window_bars": 12,
             "quality_window_bars_by_interval": {
@@ -2430,7 +2429,7 @@ def _should_alert(
     signal_ready: bool,
     cooldown_minutes: int,
     persistence_bars: int,
-    max_alerts_per_symbol_day: int,
+    max_alerts_per_symbol_day: int | None = None,
 ) -> bool:
     if not signal_ready:
         return False
@@ -2441,9 +2440,6 @@ def _should_alert(
 
     was_dorado = bool(record.get("dorado_active", False))
     if was_dorado:
-        return False
-
-    if max_alerts_per_symbol_day > 0 and _daily_alert_count(record) >= max_alerts_per_symbol_day:
         return False
 
     last_alert_iso = str(record.get("last_alert_utc", "")).strip()
@@ -3507,7 +3503,6 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
     cycle_metrics["rss_peak_mb"] = float(cycle_metrics.get("rss_start_mb", 0.0) or 0.0)
     precision_cfg = _resolve_effective_precision_cfg(cfg, state)
     persistence_bars = max(1, int(precision_cfg.get("persistence_bars", 1)))
-    max_alerts_per_symbol_day = max(0, int(precision_cfg.get("max_alerts_per_symbol_day", 0)))
     watchlist = _build_watchlist(cfg)
     scan_targets = _resolve_scan_targets(cfg)
     cycle_metrics["watchlist_size"] = len(watchlist)
@@ -3663,7 +3658,6 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                 signal_ready=signal_ready,
                 cooldown_minutes=int(precision.get("cooldown_minutes", cfg.get("cooldown_minutes", 60))),
                 persistence_bars=persistence_bars,
-                max_alerts_per_symbol_day=max_alerts_per_symbol_day,
             ):
                 cycle_metrics["alerts_triggered"] = int(cycle_metrics.get("alerts_triggered", 0) or 0) + 1
                 structural_context_label = _resolve_structural_context_label(
