@@ -178,17 +178,18 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "operational_plan": {"rr_ratio": 2.0, "sl_price": 101833.3944, "tp_price": 103368.5712},
             "contexto_estructural": "Alcista",
         }
-        subject, body = sw._build_alert_payload(cfg, item, estado, "source")
-        self.assertIn("BTC-USD | 15m", subject)
+        subject, body = sw._build_alert_payload(cfg, item, estado, "bybit")
+        self.assertIn("Bybit/perp-futures BTC-USD | 15m", subject)
+        self.assertIn("Bybit/perp-futures BTC-USD | 15m", body)
         self.assertIn("Estado de la sesion: Optima", body)
         self.assertIn("Recomendacion: Operar normal", body)
         self.assertIn("Hora Col: 2026-03-10 10:00", body)
         self.assertIn("Contexto estructural: Alcista", body)
         self.assertIn("Direccion: ALCISTA", body)
         self.assertIn("Escenario operativo: Pullback alcista de continuidad", body)
-        self.assertIn("➡️ Entrada: 102345.12", body)
-        self.assertIn("🟥 SL: 101833.39", body)
-        self.assertIn("🟩 TP: 103368.57", body)
+        self.assertIn("➡️ Entrada Guia: 102345.12", body)
+        self.assertIn("🟥 SL Guia: 101833.39", body)
+        self.assertIn("🟩 TP Guia: 103368.57", body)
         self.assertIn("Riesgo/beneficio: 1/2.30", body)
         self.assertIn("Puntaje tecnico: 90/100", body)
         self.assertIn("Checklist tecnico: 6/4", body)
@@ -323,7 +324,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
     def test_format_colombia_alert_time_uses_bogota_timezone(self):
         self.assertEqual(sw._format_colombia_alert_time("2026-03-28T19:35:00Z"), "2026-03-28 14:35")
 
-    def test_resolve_operational_trade_plan_rejects_risk_below_minimum(self):
+    def test_resolve_operational_trade_plan_keeps_tight_risk_as_guide(self):
         estado = {"direccion_v13": "ALCISTA", "precio_alerta": 100.0}
         compute_ctx = {
             "df_ind": pd.DataFrame(
@@ -336,13 +337,15 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
         plan = sw._resolve_operational_trade_plan(estado=estado, compute_ctx=compute_ctx)
 
-        self.assertFalse(plan["ok"])
+        self.assertTrue(plan["ok"])
         self.assertEqual(plan["risk_pct"], 0.2)
         self.assertEqual(plan["risk_pct_structural"], 0.2)
         self.assertFalse(plan["adjusted_to_min"])
-        self.assertIn("riesgo_operativo_fuera_marco(<0.50%)", plan["reason"])
+        self.assertEqual(plan["reason"], "")
+        self.assertEqual(plan["sl_price"], 99.8)
+        self.assertEqual(plan["tp_price"], 100.4)
 
-    def test_resolve_operational_trade_plan_rejects_risk_above_maximum(self):
+    def test_resolve_operational_trade_plan_keeps_wide_risk_as_guide(self):
         estado = {"direccion_v13": "BAJISTA", "precio_alerta": 100.0}
         compute_ctx = {
             "df_ind": pd.DataFrame(
@@ -355,9 +358,11 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
         plan = sw._resolve_operational_trade_plan(estado=estado, compute_ctx=compute_ctx)
 
-        self.assertFalse(plan["ok"])
+        self.assertTrue(plan["ok"])
         self.assertEqual(plan["risk_pct"], 1.3)
-        self.assertIn("riesgo_operativo_fuera_marco", plan["reason"])
+        self.assertEqual(plan["reason"], "")
+        self.assertEqual(plan["sl_price"], 101.3)
+        self.assertEqual(plan["tp_price"], 97.4)
 
     def test_apply_precision_filters_allows_pullback_with_neutral_mtf(self):
         item = sw.MarketItem(

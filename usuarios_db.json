@@ -14,6 +14,21 @@
         "fecha": "2026-03-03T04:43:11Z",
         "dias": 30
       }
+    },
+    {
+      "id": "32a85df1-d5a7-4963-9d5b-fdf014e8d082",
+      "username": "telegram_6135243544",
+      "email": "",
+      "telegram_chat_id": "6135243544",
+      "password_hash": "",
+      "es_premium": true,
+      "premium_until": "2027-04-02T00:55:57Z",
+      "created_at": "2026-04-02T00:55:57Z",
+      "updated_at": "2026-04-02T00:55:57Z",
+      "last_purchase": {
+        "fecha": "2026-04-02T00:55:57Z",
+        "dias": 365
+      }
     }
   ]
 }

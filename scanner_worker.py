@@ -45,8 +45,6 @@ TELEGRAM_USER_CHAT_LINKS_KEY = "telegram_user_chat_links"
 NY_TZ = pytz.timezone("America/New_York")
 BOGOTA_TZ = pytz.timezone("America/Bogota")
 
-OPERATIONAL_SL_MIN_PCT = 0.5
-OPERATIONAL_SL_MAX_PCT = 1.0
 OPERATIONAL_TP_R_MULT = 2.0
 
 TD_INTERVAL_MAP = {
@@ -2547,6 +2545,19 @@ def _human_direction_label(direction: str) -> str:
     return "No claro"
 
 
+def _alert_market_header(item: MarketItem, temporalidad: str, source: Any) -> str:
+    source_text = str(source or "").strip().lower()
+    if item.kind == "crypto":
+        if "bybit" in source_text:
+            provider = "Bybit/perp-futures"
+        elif "yfinance" in source_text:
+            provider = "Yahoo Finance/fallback"
+        else:
+            provider = "Cripto"
+        return f"{provider} {item.ticker} | {temporalidad}"
+    return f"{item.ticker} | {temporalidad}"
+
+
 def _structural_context_label_from_state(estado: Dict[str, Any]) -> str:
     estructura = estado.get("estructura_1d_4h", {}) if isinstance(estado.get("estructura_1d_4h", {}), dict) else {}
     macro_direction = str(estructura.get("direccion_1d") or estado.get("direccion_v13", "")).upper().strip()
@@ -2792,14 +2803,6 @@ def _resolve_operational_trade_plan(
     base["adjusted_to_min"] = False
     base["structure_price"] = round(structure_price, 10)
 
-    if risk_pct < OPERATIONAL_SL_MIN_PCT:
-        base["reason"] = f"riesgo_operativo_fuera_marco(<{OPERATIONAL_SL_MIN_PCT:.2f}%)"
-        return base
-
-    if risk_pct > OPERATIONAL_SL_MAX_PCT:
-        base["reason"] = f"riesgo_operativo_fuera_marco(>{OPERATIONAL_SL_MAX_PCT:.2f}%)"
-        return base
-
     if direction == "ALCISTA":
         sl_price = entry_price * (1.0 - (risk_pct / 100.0))
         tp_price = entry_price * (1.0 + ((risk_pct * OPERATIONAL_TP_R_MULT) / 100.0))
@@ -2908,13 +2911,15 @@ def _build_alert_payload(
     session_note = _session_risk_note()
     hora_col_text = str(estado.get("hora_col", "")).strip() or _format_colombia_alert_time(indice_alerta_utc)
 
+    market_header = _alert_market_header(item=item, temporalidad=temporalidad, source=source)
     prefix = str(cfg.get("notification", {}).get("subject_prefix", "")).strip()
-    subject_parts = [item.ticker, temporalidad]
+    subject_parts = [market_header]
     if prefix:
         subject_parts.insert(0, prefix)
     subject = " | ".join(subject_parts)
 
     body = (
+        f"{market_header}\n"
         f"Estado de la sesion: {session_state}\n"
         f"Recomendacion: {session_recommendation}\n"
         f"Hora Col: {hora_col_text}\n"
@@ -2922,9 +2927,9 @@ def _build_alert_payload(
         f"Direccion: {direction}\n"
         f"Accion: {action_text}\n"
         f"Escenario operativo: {scenario_text}\n"
-        f"➡️ Entrada: {precio_alerta_text}\n"
-        f"🟥 SL: {sl_text}\n"
-        f"🟩 TP: {tp_text}\n"
+        f"➡️ Entrada Guia: {precio_alerta_text}\n"
+        f"🟥 SL Guia: {sl_text}\n"
+        f"🟩 TP Guia: {tp_text}\n"
         f"Fuerza: {strength_label}\n"
         f"Riesgo/beneficio: {rr_text}\n"
         f"Puntaje tecnico: {confidence_text}/100\n"
