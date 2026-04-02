@@ -2907,7 +2907,7 @@ def _build_alert_payload(
         modo=modo,
     )
     mentor_text = _mentor_block(direction=direction, strength=strength_label)
-    session_state, session_recommendation = _session_status_for_alert(indice_alerta_utc)
+    session_state, _ = _session_status_for_alert(indice_alerta_utc)
     session_note = _session_risk_note()
     hora_col_text = str(estado.get("hora_col", "")).strip() or _format_colombia_alert_time(indice_alerta_utc)
 
@@ -2919,9 +2919,7 @@ def _build_alert_payload(
     subject = " | ".join(subject_parts)
 
     body = (
-        f"{market_header}\n"
         f"Estado de la sesion: {session_state}\n"
-        f"Recomendacion: {session_recommendation}\n"
         f"Hora Col: {hora_col_text}\n"
         f"Contexto estructural: {context_text}\n"
         f"Direccion: {direction}\n"

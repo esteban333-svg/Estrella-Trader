@@ -180,9 +180,9 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         }
         subject, body = sw._build_alert_payload(cfg, item, estado, "bybit")
         self.assertIn("Bybit/perp-futures BTC-USD | 15m", subject)
-        self.assertIn("Bybit/perp-futures BTC-USD | 15m", body)
         self.assertIn("Estado de la sesion: Optima", body)
-        self.assertIn("Recomendacion: Operar normal", body)
+        self.assertNotIn("Bybit/perp-futures BTC-USD | 15m", body)
+        self.assertNotIn("Recomendacion:", body)
         self.assertIn("Hora Col: 2026-03-10 10:00", body)
         self.assertIn("Contexto estructural: Alcista", body)
         self.assertIn("Direccion: ALCISTA", body)
