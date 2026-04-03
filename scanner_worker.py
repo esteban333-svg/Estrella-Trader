@@ -11,9 +11,10 @@ import re
 import smtplib
 import subprocess
 import time
+from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -1545,6 +1546,193 @@ def _candle_metrics(row: pd.Series) -> Dict[str, float]:
     }
 
 
+def _price_action_result(
+    pattern: str,
+    bias: str,
+    score: int,
+    description: str,
+    direction: str,
+) -> Dict[str, Any]:
+    direction_norm = str(direction or "").upper().strip()
+    bias_norm = str(bias or "NEUTRAL").upper().strip() or "NEUTRAL"
+    aligned = bias_norm == direction_norm and bias_norm in {"ALCISTA", "BAJISTA"}
+    final_score = int(score or 0)
+    if bias_norm in {"ALCISTA", "BAJISTA"} and not aligned:
+        final_score = 0
+    return {
+        "pattern": pattern,
+        "bias": bias_norm,
+        "score": final_score,
+        "aligned": aligned,
+        "description": description,
+    }
+
+
+def _detect_false_breakout_pattern(df: pd.DataFrame, atr: float, direction: str) -> Dict[str, Any] | None:
+    if df is None or df.empty or len(df) < 7 or atr <= 0:
+        return None
+    base = df.iloc[-7:-2]
+    if base.empty:
+        return None
+
+    resistance = _safe_float(pd.to_numeric(base["High"], errors="coerce").max(), default=float("nan"))
+    support = _safe_float(pd.to_numeric(base["Low"], errors="coerce").min(), default=float("nan"))
+    if pd.isna(resistance) or pd.isna(support):
+        return None
+
+    prev = df.iloc[-2]
+    last = df.iloc[-1]
+    prev_close = _safe_float(prev.get("Close"), default=float("nan"))
+    last_close = _safe_float(last.get("Close"), default=float("nan"))
+    tol = max(atr * 0.12, 1e-9)
+    if pd.isna(prev_close) or pd.isna(last_close):
+        return None
+
+    if prev_close < support - tol and last_close > support + (tol * 0.1):
+        return _price_action_result(
+            pattern="ruptura_falsa_alcista",
+            bias="ALCISTA",
+            score=10,
+            description="Ruptura falsa bajista detectada con recuperacion del soporte.",
+            direction=direction,
+        )
+    if prev_close > resistance + tol and last_close < resistance - (tol * 0.1):
+        return _price_action_result(
+            pattern="ruptura_falsa_bajista",
+            bias="BAJISTA",
+            score=10,
+            description="Ruptura falsa alcista detectada con rechazo bajo resistencia.",
+            direction=direction,
+        )
+    return None
+
+
+def _detect_liquidity_sweep_pattern(df: pd.DataFrame, atr: float, direction: str) -> Dict[str, Any] | None:
+    if df is None or df.empty or len(df) < 6 or atr <= 0:
+        return None
+    base = df.iloc[-6:-1]
+    if base.empty:
+        return None
+
+    support = _safe_float(pd.to_numeric(base["Low"], errors="coerce").min(), default=float("nan"))
+    resistance = _safe_float(pd.to_numeric(base["High"], errors="coerce").max(), default=float("nan"))
+    if pd.isna(support) or pd.isna(resistance):
+        return None
+
+    last = df.iloc[-1]
+    last_m = _candle_metrics(last)
+    low = _safe_float(last.get("Low"), default=float("nan"))
+    high = _safe_float(last.get("High"), default=float("nan"))
+    close = _safe_float(last.get("Close"), default=float("nan"))
+    tol = max(atr * 0.12, 1e-9)
+    wick_floor = max(last_m["body"] * 1.5, last_m["range"] * 0.35)
+    if pd.isna(low) or pd.isna(high) or pd.isna(close):
+        return None
+
+    if low < support - tol and close >= support and last_m["lower_wick"] >= wick_floor:
+        return _price_action_result(
+            pattern="barrida_liquidez_alcista",
+            bias="ALCISTA",
+            score=10,
+            description="Barrida de liquidez bajista con cierre de recuperacion.",
+            direction=direction,
+        )
+    if high > resistance + tol and close <= resistance and last_m["upper_wick"] >= wick_floor:
+        return _price_action_result(
+            pattern="barrida_liquidez_bajista",
+            bias="BAJISTA",
+            score=10,
+            description="Barrida de liquidez alcista con cierre de rechazo.",
+            direction=direction,
+        )
+    return None
+
+
+def _detect_double_structure_pattern(df: pd.DataFrame, atr: float, direction: str) -> Dict[str, Any] | None:
+    if df is None or df.empty or len(df) < 8 or atr <= 0:
+        return None
+    window = df.tail(8)
+    split = len(window) // 2
+    if split < 3:
+        return None
+
+    highs = pd.to_numeric(window["High"], errors="coerce")
+    lows = pd.to_numeric(window["Low"], errors="coerce")
+    opens = pd.to_numeric(window["Open"], errors="coerce")
+    closes = pd.to_numeric(window["Close"], errors="coerce")
+    first_high = _safe_float(highs.iloc[:split].max(), default=float("nan"))
+    second_high = _safe_float(highs.iloc[split:].max(), default=float("nan"))
+    first_low = _safe_float(lows.iloc[:split].min(), default=float("nan"))
+    second_low = _safe_float(lows.iloc[split:].min(), default=float("nan"))
+    last_open = _safe_float(opens.iloc[-1], default=float("nan"))
+    last_close = _safe_float(closes.iloc[-1], default=float("nan"))
+    if any(pd.isna(v) for v in (first_high, second_high, first_low, second_low, last_open, last_close)):
+        return None
+
+    peak_tol = max(atr * 0.35, (abs(first_high + second_high) / 2.0) * 0.002)
+    trough_tol = max(atr * 0.35, (abs(first_low + second_low) / 2.0) * 0.002)
+    if abs(first_high - second_high) <= peak_tol and last_close < last_open:
+        if last_close <= min(first_high, second_high) - max(atr * 0.25, peak_tol * 0.5):
+            return _price_action_result(
+                pattern="doble_techo",
+                bias="BAJISTA",
+                score=9,
+                description="Doble techo detectado con rechazo en la segunda visita.",
+                direction=direction,
+            )
+    if abs(first_low - second_low) <= trough_tol and last_close > last_open:
+        if last_close >= max(first_low, second_low) + max(atr * 0.25, trough_tol * 0.5):
+            return _price_action_result(
+                pattern="doble_suelo",
+                bias="ALCISTA",
+                score=9,
+                description="Doble suelo detectado con recuperacion tras la segunda visita.",
+                direction=direction,
+            )
+    return None
+
+
+def _detect_retest_pattern(df: pd.DataFrame, atr: float, direction: str) -> Dict[str, Any] | None:
+    if df is None or df.empty or len(df) < 7 or atr <= 0:
+        return None
+    base = df.iloc[-7:-2]
+    if base.empty:
+        return None
+
+    resistance = _safe_float(pd.to_numeric(base["High"], errors="coerce").max(), default=float("nan"))
+    support = _safe_float(pd.to_numeric(base["Low"], errors="coerce").min(), default=float("nan"))
+    if pd.isna(resistance) or pd.isna(support):
+        return None
+
+    prev = df.iloc[-2]
+    last = df.iloc[-1]
+    prev_close = _safe_float(prev.get("Close"), default=float("nan"))
+    last_close = _safe_float(last.get("Close"), default=float("nan"))
+    last_low = _safe_float(last.get("Low"), default=float("nan"))
+    last_high = _safe_float(last.get("High"), default=float("nan"))
+    tol = max(atr * 0.15, 1e-9)
+    if any(pd.isna(v) for v in (prev_close, last_close, last_low, last_high)):
+        return None
+
+    if prev_close > resistance + tol and last_low <= resistance + tol and last_close >= resistance:
+        return _price_action_result(
+            pattern="retest_alcista",
+            bias="ALCISTA",
+            score=8,
+            description="Retest alcista validando la zona de ruptura.",
+            direction=direction,
+        )
+    if prev_close < support - tol and last_high >= support - tol and last_close <= support:
+        return _price_action_result(
+            pattern="retest_bajista",
+            bias="BAJISTA",
+            score=8,
+            description="Retest bajista validando la zona perdida.",
+            direction=direction,
+        )
+    return None
+
+
 def _detect_price_action(df: pd.DataFrame, direction: str) -> Dict[str, Any]:
     if df is None or df.empty or len(df) < 3:
         return {
@@ -1558,6 +1746,7 @@ def _detect_price_action(df: pd.DataFrame, direction: str) -> Dict[str, Any]:
     last = df.iloc[-1]
     prev_m = _candle_metrics(prev)
     last_m = _candle_metrics(last)
+    atr = _atr14_from_df(df)
 
     prev_bull = prev_m["close"] > prev_m["open"]
     prev_bear = prev_m["close"] < prev_m["open"]
@@ -1588,42 +1777,55 @@ def _detect_price_action(df: pd.DataFrame, direction: str) -> Dict[str, Any]:
         and last_m["close"] <= (last_m["open"] + 1e-9)
     )
 
-    pattern = "sin_patron"
-    bias = "NEUTRAL"
-    description = "Sin patron de confirmacion fuerte."
-    score = 2
-    if bullish_engulfing:
-        pattern = "envolvente_alcista"
-        bias = "ALCISTA"
-        score = 10
-        description = "Vela envolvente alcista detectada."
-    elif bearish_engulfing:
-        pattern = "envolvente_bajista"
-        bias = "BAJISTA"
-        score = 10
-        description = "Vela envolvente bajista detectada."
-    elif bullish_rejection:
-        pattern = "rechazo_alcista"
-        bias = "ALCISTA"
-        score = 8
-        description = "Vela de rechazo alcista (mecha inferior dominante)."
-    elif bearish_rejection:
-        pattern = "rechazo_bajista"
-        bias = "BAJISTA"
-        score = 8
-        description = "Vela de rechazo bajista (mecha superior dominante)."
+    for detector in (
+        _detect_false_breakout_pattern,
+        _detect_liquidity_sweep_pattern,
+        _detect_double_structure_pattern,
+        _detect_retest_pattern,
+    ):
+        payload = detector(df, atr, direction)
+        if payload is not None:
+            return payload
 
-    direction_norm = str(direction or "").upper().strip()
-    aligned = bias == direction_norm and bias in {"ALCISTA", "BAJISTA"}
-    if bias in {"ALCISTA", "BAJISTA"} and not aligned:
-        score = 0
+    if bullish_engulfing:
+        return _price_action_result(
+            pattern="envolvente_alcista",
+            bias="ALCISTA",
+            score=10,
+            description="Vela envolvente alcista detectada.",
+            direction=direction,
+        )
+    if bearish_engulfing:
+        return _price_action_result(
+            pattern="envolvente_bajista",
+            bias="BAJISTA",
+            score=10,
+            description="Vela envolvente bajista detectada.",
+            direction=direction,
+        )
+    if bullish_rejection:
+        return _price_action_result(
+            pattern="rechazo_alcista",
+            bias="ALCISTA",
+            score=8,
+            description="Vela de rechazo alcista (mecha inferior dominante).",
+            direction=direction,
+        )
+    if bearish_rejection:
+        return _price_action_result(
+            pattern="rechazo_bajista",
+            bias="BAJISTA",
+            score=8,
+            description="Vela de rechazo bajista (mecha superior dominante).",
+            direction=direction,
+        )
 
     return {
-        "pattern": pattern,
-        "bias": bias,
-        "score": score,
-        "aligned": aligned,
-        "description": description,
+        "pattern": "sin_patron",
+        "bias": "NEUTRAL",
+        "score": 2,
+        "aligned": False,
+        "description": "Sin patron de confirmacion fuerte.",
     }
 
 
@@ -2725,6 +2927,8 @@ def _mentor_block(direction: str, strength: str) -> str:
 def _session_status_for_alert(alert_bar_utc: str) -> Tuple[str, str]:
     bar_dt = _parse_iso_utc(str(alert_bar_utc or "").strip())
     ref_dt = bar_dt if bar_dt is not None else datetime.now(pytz.UTC)
+    if _is_colombia_holiday(ref_dt):
+        return "No favorable", "No operar"
     ref_ny = ref_dt.astimezone(NY_TZ)
     weekday = ref_ny.weekday()
 
@@ -2738,6 +2942,68 @@ def _session_risk_note() -> str:
         "Nota de sesion: los viernes y durante el fin de semana el mercado suele mostrar menos liquidez, "
         "mas barridas y liquidaciones rapidas; si la estructura se ensucia, reduce riesgo o no operes."
     )
+
+
+def _continuity_read_label(session_state: str) -> str:
+    if str(session_state or "").strip() == "No favorable":
+        return "Degradada por contexto"
+    return "Normal"
+
+
+def _easter_sunday(year: int) -> date:
+    # Gregorian computus.
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return date(year, month, day)
+
+
+def _next_monday_on_or_after(value: date) -> date:
+    if value.weekday() == 0:
+        return value
+    return value + timedelta(days=(7 - value.weekday()))
+
+
+@lru_cache(maxsize=32)
+def _colombia_holidays(year: int) -> frozenset[date]:
+    easter = _easter_sunday(year)
+    holidays = {
+        date(year, 1, 1),
+        date(year, 5, 1),
+        date(year, 7, 20),
+        date(year, 8, 7),
+        date(year, 12, 8),
+        date(year, 12, 25),
+        easter - timedelta(days=3),  # Jueves Santo
+        easter - timedelta(days=2),  # Viernes Santo
+        _next_monday_on_or_after(date(year, 1, 6)),   # Reyes Magos
+        _next_monday_on_or_after(date(year, 3, 19)),  # San Jose
+        easter + timedelta(days=43),                  # Ascension observada
+        easter + timedelta(days=64),                  # Corpus Christi observado
+        easter + timedelta(days=71),                  # Sagrado Corazon observado
+        _next_monday_on_or_after(date(year, 6, 29)),  # San Pedro y San Pablo
+        _next_monday_on_or_after(date(year, 8, 15)),  # Asuncion
+        _next_monday_on_or_after(date(year, 10, 12)), # Dia de la Raza
+        _next_monday_on_or_after(date(year, 11, 1)),  # Todos los Santos
+        _next_monday_on_or_after(date(year, 11, 11)), # Cartagena
+    }
+    return frozenset(holidays)
+
+
+def _is_colombia_holiday(ref_dt: datetime) -> bool:
+    ref_bogota = ref_dt.astimezone(BOGOTA_TZ)
+    return ref_bogota.date() in _colombia_holidays(ref_bogota.year)
 
 
 def _format_colombia_alert_time(alert_bar_utc: str) -> str:
@@ -2871,8 +3137,6 @@ def _build_alert_payload(
     structural_context_label: str | None = None,
 ) -> Tuple[str, str]:
     dorado = estado.get("dorado_v13") or {}
-    score = dorado.get("micro_score")
-    umbral = dorado.get("umbral")
     operational_plan = estado.get("operational_plan", {}) if isinstance(estado.get("operational_plan", {}), dict) else {}
     rr = dorado.get("rr_estimado", operational_plan.get("rr_ratio", OPERATIONAL_TP_R_MULT))
     direction = estado.get("direccion_v13", "")
@@ -2883,8 +3147,6 @@ def _build_alert_payload(
 
     rr_value = _safe_float(rr, 0.0)
     rr_text = f"1/{rr_value:.2f}" if rr_value > 0 else "N/A"
-    score_text = str(score).strip() if score is not None else "N/A"
-    umbral_text = str(umbral).strip() if umbral is not None else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
     sl_text = _format_price(operational_plan.get("sl_price"))
     tp_text = _format_price(operational_plan.get("tp_price"))
@@ -2909,6 +3171,7 @@ def _build_alert_payload(
     mentor_text = _mentor_block(direction=direction, strength=strength_label)
     session_state, _ = _session_status_for_alert(indice_alerta_utc)
     session_note = _session_risk_note()
+    continuity_read = _continuity_read_label(session_state)
     hora_col_text = str(estado.get("hora_col", "")).strip() or _format_colombia_alert_time(indice_alerta_utc)
 
     market_header = _alert_market_header(item=item, temporalidad=temporalidad, source=source)
@@ -2931,11 +3194,12 @@ def _build_alert_payload(
         f"Fuerza: {strength_label}\n"
         f"Riesgo/beneficio: {rr_text}\n"
         f"Puntaje tecnico: {confidence_text}/100\n"
-        f"Checklist tecnico: {score_text}/{umbral_text}\n"
+        f"Lectura de continuidad: {continuity_read}\n"
         f"Patron: {pattern_text}\n\n"
-        f"{mentor_text}\n\n"
-        f"{session_note}"
+        f"{mentor_text}"
     )
+    if session_state == "No favorable":
+        body = f"{body}\n\n{session_note}"
     return subject, body
 
 

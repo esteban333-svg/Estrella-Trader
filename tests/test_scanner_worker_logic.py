@@ -10,6 +10,9 @@ import scanner_worker as sw
 
 
 class ScannerWorkerLogicTests(unittest.TestCase):
+    def _ohlc_df(self, rows):
+        return pd.DataFrame(rows, columns=["Open", "High", "Low", "Close"])
+
     def test_normalize_alert_profile(self):
         self.assertEqual(sw._normalize_alert_profile("conservative"), "conservador")
         self.assertEqual(sw._normalize_alert_profile("aggressive"), "agresivo")
@@ -145,6 +148,107 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertEqual(borderline, "DEBIL")
         self.assertEqual(weak, "DEBIL")
 
+    def test_detect_price_action_identifies_false_breakout_bearish(self):
+        df = self._ohlc_df(
+            [
+                {"Open": 9.8, "High": 10.0, "Low": 9.6, "Close": 9.9},
+                {"Open": 9.9, "High": 10.2, "Low": 9.7, "Close": 10.0},
+                {"Open": 10.0, "High": 10.1, "Low": 9.8, "Close": 9.95},
+                {"Open": 9.95, "High": 10.3, "Low": 9.7, "Close": 10.1},
+                {"Open": 10.1, "High": 10.2, "Low": 9.8, "Close": 10.0},
+                {"Open": 10.4, "High": 10.7, "Low": 10.1, "Close": 10.6},
+                {"Open": 10.55, "High": 10.6, "Low": 10.0, "Close": 10.15},
+            ]
+        )
+
+        out = sw._detect_price_action(df, "BAJISTA")
+
+        self.assertEqual(out["pattern"], "ruptura_falsa_bajista")
+        self.assertEqual(out["bias"], "BAJISTA")
+        self.assertTrue(out["aligned"])
+        self.assertEqual(out["score"], 10)
+
+    def test_detect_price_action_identifies_liquidity_sweep_bullish(self):
+        df = self._ohlc_df(
+            [
+                {"Open": 9.8, "High": 10.0, "Low": 9.72, "Close": 9.9},
+                {"Open": 9.9, "High": 10.05, "Low": 9.78, "Close": 9.95},
+                {"Open": 9.95, "High": 10.1, "Low": 9.8, "Close": 9.88},
+                {"Open": 9.88, "High": 10.08, "Low": 9.76, "Close": 9.92},
+                {"Open": 9.92, "High": 10.0, "Low": 9.74, "Close": 9.85},
+                {"Open": 9.78, "High": 9.95, "Low": 9.5, "Close": 9.9},
+            ]
+        )
+
+        out = sw._detect_price_action(df, "ALCISTA")
+
+        self.assertEqual(out["pattern"], "barrida_liquidez_alcista")
+        self.assertEqual(out["bias"], "ALCISTA")
+        self.assertTrue(out["aligned"])
+        self.assertEqual(out["score"], 10)
+
+    def test_detect_price_action_identifies_retest_bullish(self):
+        df = self._ohlc_df(
+            [
+                {"Open": 9.4, "High": 9.7, "Low": 9.1, "Close": 9.5},
+                {"Open": 9.5, "High": 9.8, "Low": 9.2, "Close": 9.6},
+                {"Open": 9.6, "High": 9.9, "Low": 9.3, "Close": 9.7},
+                {"Open": 9.7, "High": 10.0, "Low": 9.4, "Close": 9.85},
+                {"Open": 9.85, "High": 9.95, "Low": 9.5, "Close": 9.8},
+                {"Open": 10.05, "High": 10.4, "Low": 10.0, "Close": 10.3},
+                {"Open": 10.2, "High": 10.25, "Low": 9.98, "Close": 10.12},
+            ]
+        )
+
+        out = sw._detect_price_action(df, "ALCISTA")
+
+        self.assertEqual(out["pattern"], "retest_alcista")
+        self.assertEqual(out["bias"], "ALCISTA")
+        self.assertTrue(out["aligned"])
+        self.assertEqual(out["score"], 8)
+
+    def test_detect_price_action_identifies_double_top(self):
+        df = self._ohlc_df(
+            [
+                {"Open": 10.10, "High": 10.35, "Low": 9.90, "Close": 10.20},
+                {"Open": 10.20, "High": 10.50, "Low": 10.00, "Close": 10.30},
+                {"Open": 10.25, "High": 10.40, "Low": 10.05, "Close": 10.15},
+                {"Open": 10.15, "High": 10.30, "Low": 9.95, "Close": 10.05},
+                {"Open": 10.05, "High": 10.28, "Low": 9.92, "Close": 10.12},
+                {"Open": 10.12, "High": 10.52, "Low": 10.00, "Close": 10.34},
+                {"Open": 10.34, "High": 10.38, "Low": 10.18, "Close": 10.30},
+                {"Open": 10.34, "High": 10.40, "Low": 10.08, "Close": 10.20},
+            ]
+        )
+
+        out = sw._detect_price_action(df, "BAJISTA")
+
+        self.assertEqual(out["pattern"], "doble_techo")
+        self.assertEqual(out["bias"], "BAJISTA")
+        self.assertTrue(out["aligned"])
+        self.assertEqual(out["score"], 9)
+
+    def test_detect_price_action_identifies_double_bottom(self):
+        df = self._ohlc_df(
+            [
+                {"Open": 9.30, "High": 9.55, "Low": 9.00, "Close": 9.18},
+                {"Open": 9.18, "High": 9.40, "Low": 8.92, "Close": 9.08},
+                {"Open": 9.08, "High": 9.35, "Low": 9.00, "Close": 9.20},
+                {"Open": 9.20, "High": 9.45, "Low": 9.05, "Close": 9.26},
+                {"Open": 9.26, "High": 9.50, "Low": 9.08, "Close": 9.18},
+                {"Open": 9.18, "High": 9.42, "Low": 8.96, "Close": 9.10},
+                {"Open": 9.10, "High": 9.30, "Low": 9.02, "Close": 9.05},
+                {"Open": 9.05, "High": 9.28, "Low": 9.00, "Close": 9.18},
+            ]
+        )
+
+        out = sw._detect_price_action(df, "ALCISTA")
+
+        self.assertEqual(out["pattern"], "doble_suelo")
+        self.assertEqual(out["bias"], "ALCISTA")
+        self.assertTrue(out["aligned"])
+        self.assertEqual(out["score"], 9)
+
     def test_build_alert_payload_includes_pullback_metadata(self):
         cfg = {"notification": {"subject_prefix": "[Estrella Trader]"}}
         item = sw.MarketItem(
@@ -192,9 +296,40 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertIn("🟩 TP Guia: 103368.57", body)
         self.assertIn("Riesgo/beneficio: 1/2.30", body)
         self.assertIn("Puntaje tecnico: 90/100", body)
-        self.assertIn("Checklist tecnico: 6/4", body)
+        self.assertIn("Lectura de continuidad: Normal", body)
         self.assertIn("Patron: rechazo_alcista", body)
         self.assertIn("Mentor:", body)
+        self.assertNotIn("viernes y durante el fin de semana", body)
+
+    def test_build_alert_payload_shows_session_note_only_when_no_favorable(self):
+        cfg = {"notification": {}}
+        item = sw.MarketItem(
+            market="Cripto",
+            label="DOGE",
+            ticker="DOGE-USD",
+            td_symbol="DOGE/USD",
+            kind="crypto",
+            binance_symbol="DOGEUSDT",
+        )
+        estado = {
+            "dorado_v13": {"micro_score": 4, "umbral": 4, "rr_estimado": 2.42},
+            "direccion_v13": "BAJISTA",
+            "temporalidad_alerta": "1D + 4H",
+            "modo_alerta": "Estructural (1D+4H)",
+            "precio_alerta": 0.09143,
+            "indice_alerta_utc": "2026-04-03T08:00:00Z",
+            "confidence_score": 76,
+            "min_confidence_required": 72,
+            "candle_pattern": "sin_patron",
+            "mtf_summary": "confirmaciones=0, opuestos=0, neutrales=1",
+            "operational_plan": {"rr_ratio": 2.0, "sl_price": 0.09165, "tp_price": 0.09099},
+            "contexto_estructural": "Bajista",
+        }
+
+        _, body = sw._build_alert_payload(cfg, item, estado, "bybit")
+
+        self.assertIn("Estado de la sesion: No favorable", body)
+        self.assertIn("Lectura de continuidad: Degradada por contexto", body)
         self.assertIn("viernes y durante el fin de semana", body)
 
     def test_operational_scenario_label_uses_pullback_for_lower_timeframes(self):
@@ -255,6 +390,16 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
     def test_session_status_for_alert_marks_friday_as_not_favorable(self):
         state, recommendation = sw._session_status_for_alert("2026-03-13T15:00:00Z")
+        self.assertEqual(state, "No favorable")
+        self.assertEqual(recommendation, "No operar")
+
+    def test_session_status_for_alert_marks_holy_thursday_as_not_favorable(self):
+        state, recommendation = sw._session_status_for_alert("2026-04-02T15:00:00Z")
+        self.assertEqual(state, "No favorable")
+        self.assertEqual(recommendation, "No operar")
+
+    def test_session_status_for_alert_marks_emiliani_monday_holiday_as_not_favorable(self):
+        state, recommendation = sw._session_status_for_alert("2026-01-12T15:00:00Z")
         self.assertEqual(state, "No favorable")
         self.assertEqual(recommendation, "No operar")
 
