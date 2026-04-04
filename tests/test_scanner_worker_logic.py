@@ -330,6 +330,8 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
         self.assertIn("Estado de la sesion: No favorable", body)
         self.assertIn("Lectura de continuidad: Degradada por contexto", body)
+        self.assertIn("🟥 SL Guia: 0.09188715", body)
+        self.assertIn("🟩 TP Guia: 0.0905157", body)
         self.assertIn("viernes y durante el fin de semana", body)
 
     def test_operational_scenario_label_uses_pullback_for_lower_timeframes(self):
@@ -508,6 +510,28 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertEqual(plan["reason"], "")
         self.assertEqual(plan["sl_price"], 101.3)
         self.assertEqual(plan["tp_price"], 97.4)
+
+    def test_resolve_guide_trade_levels_clamps_minimum_risk(self):
+        guide = sw._resolve_guide_trade_levels(
+            entry_price=0.09143,
+            direction="BAJISTA",
+            operational_plan={"sl_price": 0.09165, "tp_price": 0.09099},
+        )
+
+        self.assertEqual(guide["risk_pct"], 0.5)
+        self.assertEqual(guide["sl_price"], 0.09188715)
+        self.assertEqual(guide["tp_price"], 0.0905157)
+
+    def test_resolve_guide_trade_levels_clamps_maximum_risk(self):
+        guide = sw._resolve_guide_trade_levels(
+            entry_price=100.0,
+            direction="ALCISTA",
+            operational_plan={"sl_price": 98.4, "tp_price": 104.8},
+        )
+
+        self.assertEqual(guide["risk_pct"], 1.0)
+        self.assertEqual(guide["sl_price"], 99.0)
+        self.assertEqual(guide["tp_price"], 102.0)
 
     def test_apply_precision_filters_allows_pullback_with_neutral_mtf(self):
         item = sw.MarketItem(

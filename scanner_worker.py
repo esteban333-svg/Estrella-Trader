@@ -47,6 +47,9 @@ NY_TZ = pytz.timezone("America/New_York")
 BOGOTA_TZ = pytz.timezone("America/Bogota")
 
 OPERATIONAL_TP_R_MULT = 2.0
+GUIDE_SL_MIN_PCT = 0.5
+GUIDE_SL_MAX_PCT = 1.0
+GUIDE_TP_R_MULT = 2.0
 
 TD_INTERVAL_MAP = {
     "1m": "1min",
@@ -3129,6 +3132,43 @@ def _signal_strength_label(estado: Dict[str, Any], dorado: Dict[str, Any]) -> st
     return "DEBIL"
 
 
+def _resolve_guide_trade_levels(
+    entry_price: float,
+    direction: str,
+    operational_plan: Dict[str, Any],
+) -> Dict[str, float]:
+    base = {
+        "risk_pct": 0.0,
+        "sl_price": _safe_float(operational_plan.get("sl_price"), 0.0),
+        "tp_price": _safe_float(operational_plan.get("tp_price"), 0.0),
+    }
+    direction_norm = str(direction or "").upper().strip()
+    if direction_norm not in {"ALCISTA", "BAJISTA"} or entry_price <= 0:
+        return base
+
+    risk_pct = _safe_float(operational_plan.get("risk_pct"), 0.0)
+    if risk_pct <= 0:
+        sl_price = _safe_float(operational_plan.get("sl_price"), 0.0)
+        if sl_price > 0:
+            risk_pct = abs((sl_price - entry_price) / entry_price) * 100.0
+    if risk_pct <= 0:
+        return base
+
+    risk_pct = min(GUIDE_SL_MAX_PCT, max(GUIDE_SL_MIN_PCT, risk_pct))
+    if direction_norm == "ALCISTA":
+        sl_price = entry_price * (1.0 - (risk_pct / 100.0))
+        tp_price = entry_price * (1.0 + ((risk_pct * GUIDE_TP_R_MULT) / 100.0))
+    else:
+        sl_price = entry_price * (1.0 + (risk_pct / 100.0))
+        tp_price = entry_price * (1.0 - ((risk_pct * GUIDE_TP_R_MULT) / 100.0))
+
+    return {
+        "risk_pct": round(risk_pct, 4),
+        "sl_price": round(sl_price, 10),
+        "tp_price": round(tp_price, 10),
+    }
+
+
 def _build_alert_payload(
     cfg: Dict[str, Any],
     item: MarketItem,
@@ -3145,11 +3185,17 @@ def _build_alert_payload(
     if not temporalidad:
         temporalidad = "1D + 4H" if "1d+4h" in modo.lower().replace(" ", "") else str(cfg.get("interval", "15m"))
 
+    entry_price = _safe_float(estado.get("precio_alerta"), 0.0)
+    guide_trade = _resolve_guide_trade_levels(
+        entry_price=entry_price,
+        direction=direction,
+        operational_plan=operational_plan,
+    )
     rr_value = _safe_float(rr, 0.0)
     rr_text = f"1/{rr_value:.2f}" if rr_value > 0 else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
-    sl_text = _format_price(operational_plan.get("sl_price"))
-    tp_text = _format_price(operational_plan.get("tp_price"))
+    sl_text = _format_price(guide_trade.get("sl_price"))
+    tp_text = _format_price(guide_trade.get("tp_price"))
     indice_alerta_utc = str(estado.get("indice_alerta_utc", "")).strip() or "N/A"
     confidence_text = str(estado.get("confidence_score", "N/A")).strip() or "N/A"
     pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
