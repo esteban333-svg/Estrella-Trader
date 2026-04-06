@@ -299,6 +299,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertIn("Lectura de continuidad: Normal", body)
         self.assertIn("Patron: rechazo_alcista", body)
         self.assertIn("Mentor:", body)
+        self.assertNotIn("Estructura amplia", body)
         self.assertNotIn("viernes y durante el fin de semana", body)
 
     def test_build_alert_payload_shows_session_note_only_when_no_favorable(self):
@@ -333,6 +334,43 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertIn("🟥 SL Guia: 0.09188715", body)
         self.assertIn("🟩 TP Guia: 0.0905157", body)
         self.assertIn("viernes y durante el fin de semana", body)
+
+    def test_build_alert_payload_marks_wide_structure_when_structural_risk_exceeds_one_percent(self):
+        cfg = {"notification": {}}
+        item = sw.MarketItem(
+            market="Cripto",
+            label="SOL",
+            ticker="SOL-USD",
+            td_symbol="SOL/USD",
+            kind="crypto",
+            binance_symbol="SOLUSDT",
+        )
+        estado = {
+            "dorado_v13": {"micro_score": 4, "umbral": 4, "rr_estimado": 3.2},
+            "direccion_v13": "BAJISTA",
+            "temporalidad_alerta": "1D + 4H",
+            "modo_alerta": "Estructural (1D+4H)",
+            "precio_alerta": 100.0,
+            "indice_alerta_utc": "2026-04-03T08:00:00Z",
+            "confidence_score": 83,
+            "min_confidence_required": 72,
+            "candle_pattern": "sin_patron",
+            "mtf_summary": "confirmaciones=0, opuestos=0, neutrales=1",
+            "operational_plan": {
+                "rr_ratio": 2.0,
+                "sl_price": 101.6,
+                "tp_price": 96.8,
+                "risk_pct": 1.6,
+                "risk_pct_structural": 1.6,
+            },
+            "contexto_estructural": "Bajista",
+        }
+
+        _, body = sw._build_alert_payload(cfg, item, estado, "bybit")
+
+        self.assertIn("Estructura amplia", body)
+        self.assertIn("🟥 SL Guia: 101", body)
+        self.assertIn("🟩 TP Guia: 98", body)
 
     def test_operational_scenario_label_uses_pullback_for_lower_timeframes(self):
         label = sw._alert_operational_scenario_label(

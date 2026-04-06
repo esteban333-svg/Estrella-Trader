@@ -3191,6 +3191,11 @@ def _build_alert_payload(
         direction=direction,
         operational_plan=operational_plan,
     )
+    structural_risk_pct = _safe_float(
+        operational_plan.get("risk_pct_structural", operational_plan.get("risk_pct", 0.0)),
+        0.0,
+    )
+    wide_structure_line = "Estructura amplia\n" if structural_risk_pct > 1.0 else ""
     rr_value = _safe_float(rr, 0.0)
     rr_text = f"1/{rr_value:.2f}" if rr_value > 0 else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
@@ -3237,6 +3242,7 @@ def _build_alert_payload(
         f"➡️ Entrada Guia: {precio_alerta_text}\n"
         f"🟥 SL Guia: {sl_text}\n"
         f"🟩 TP Guia: {tp_text}\n"
+        f"{wide_structure_line}"
         f"Fuerza: {strength_label}\n"
         f"Riesgo/beneficio: {rr_text}\n"
         f"Puntaje tecnico: {confidence_text}/100\n"
