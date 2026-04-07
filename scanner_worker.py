@@ -1364,9 +1364,9 @@ def _fetch_data(
         binance_df, binance_err = fetch_klines(item.binance_symbol, interval, limit=500)
         if binance_df is not None and not binance_df.empty:
             binance_df = _trim_df_for_interval(binance_df, interval=interval, cfg=cfg_safe)
-            return binance_df, "bybit", ""
+            return binance_df, "binance", ""
         logging.warning(
-            "[%s] Bybit futures fallo (%s), usando fallback de datos",
+            "[%s] Binance spot fallo (%s), usando fallback de datos",
             item.state_key,
             binance_err or "sin detalle",
         )
@@ -2370,7 +2370,8 @@ def _compute_signal_confidence(
     score_component = min(1.0, micro_score / max(umbral + 2.0, 1.0)) * 45.0
     rr_component = min(1.0, rr / 2.5) * 25.0
     mtf_component = _safe_float(mtf_info.get("score"), 0.0)
-    candle_component = _safe_float(candle_info.get("score"), 0.0)
+    # Los patrones quedan como guia visual/pedagogica, sin peso operativo.
+    candle_component = 0.0
 
     raw = score_component + rr_component + mtf_component + candle_component
     return max(0, min(100, int(round(raw))))
@@ -2753,8 +2754,8 @@ def _human_direction_label(direction: str) -> str:
 def _alert_market_header(item: MarketItem, temporalidad: str, source: Any) -> str:
     source_text = str(source or "").strip().lower()
     if item.kind == "crypto":
-        if "bybit" in source_text:
-            provider = "Bybit/perp-futures"
+        if "binance" in source_text:
+            provider = "Binance/spot"
         elif "yfinance" in source_text:
             provider = "Yahoo Finance/fallback"
         else:
@@ -2767,7 +2768,17 @@ def _structural_context_label_from_state(estado: Dict[str, Any]) -> str:
     estructura = estado.get("estructura_1d_4h", {}) if isinstance(estado.get("estructura_1d_4h", {}), dict) else {}
     macro_direction = str(estructura.get("direccion_1d") or estado.get("direccion_v13", "")).upper().strip()
     alignment = str(estructura.get("alineacion", "")).upper().strip()
+    regime_phase = str(estado.get("regime_phase", "")).upper().strip()
+    regime_new_direction = str(estado.get("regime_new_direction", "")).upper().strip()
 
+    if regime_phase in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
+        if regime_new_direction in {"ALCISTA", "BAJISTA"}:
+            return f"Cambio {_human_direction_label(regime_new_direction).lower()} confirmado"
+        return "Cambio estructural confirmado"
+    if regime_phase in {"GIRO_ALCISTA_EN_DESARROLLO", "GIRO_BAJISTA_EN_DESARROLLO"}:
+        if regime_new_direction in {"ALCISTA", "BAJISTA"}:
+            return f"Cambio {_human_direction_label(regime_new_direction).lower()} en desarrollo"
+        return "Cambio estructural en desarrollo"
     if alignment == "CONFLICTO":
         return "En transicion"
     if macro_direction in {"ALCISTA", "BAJISTA"}:
@@ -3113,13 +3124,11 @@ def _signal_strength_label(estado: Dict[str, Any], dorado: Dict[str, Any]) -> st
     rr = _safe_float(dorado.get("rr_estimado"), 0.0)
     micro_score = _safe_float(dorado.get("micro_score"), 0.0)
     umbral = _safe_float(dorado.get("umbral"), 0.0)
-    pattern = str(estado.get("candle_pattern", "sin_patron")).strip().lower()
     riesgo = str(estado.get("riesgo", "")).strip().lower()
     session_state, _ = _session_status_for_alert(str(estado.get("indice_alerta_utc", "")).strip())
     confirmations, opposites, neutrals = _parse_mtf_summary_counts(estado.get("mtf_summary", ""))
     if (
         session_state == "Optima"
-        and pattern != "sin_patron"
         and confidence >= max(min_conf + 8.0, 88.0)
         and rr >= 2.2
         and micro_score >= max(umbral + 1.0, 5.0)
@@ -3219,6 +3228,8 @@ def _build_alert_payload(
         temporalidad=temporalidad,
         modo=modo,
     )
+    regime_text = str(estado.get("regime_label", "")).strip()
+    regime_line = f"Cambio tendencial: {regime_text}\n" if regime_text else ""
     mentor_text = _mentor_block(direction=direction, strength=strength_label)
     session_state, _ = _session_status_for_alert(indice_alerta_utc)
     session_note = _session_risk_note()
@@ -3236,6 +3247,7 @@ def _build_alert_payload(
         f"Estado de la sesion: {session_state}\n"
         f"Hora Col: {hora_col_text}\n"
         f"Contexto estructural: {context_text}\n"
+        f"{regime_line}"
         f"Direccion: {direction}\n"
         f"Accion: {action_text}\n"
         f"Escenario operativo: {scenario_text}\n"
@@ -3647,8 +3659,7 @@ def _apply_precision_filters(
         }
 
     candle_info = _detect_price_action(df_ind, direction)
-    require_price_action = enabled and bool(effective_cfg.get("require_price_action_confirmation", True))
-    candle_ok = bool(candle_info.get("aligned", False)) if require_price_action else (str(candle_info.get("bias")) != _opposite_direction(direction))
+    candle_ok = True
 
     rr_min = max(2.0, _safe_float(effective_cfg.get("min_rr", 1.8), 1.8)) if enabled else 0.0
     rr_ok = rr >= rr_min
@@ -3695,8 +3706,6 @@ def _apply_precision_filters(
         reasons.append("dorado_inactivo")
     if enabled and not mtf_ok:
         reasons.append("mtf_no_alineado")
-    if enabled and not candle_ok:
-        reasons.append("vela_sin_confirmacion")
     if enabled and not rr_ok:
         reasons.append(f"rr_bajo(<{rr_min})")
     if enabled and not confidence_ok:

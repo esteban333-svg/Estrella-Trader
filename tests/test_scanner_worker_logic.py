@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pandas as pd
 import pytz
 
+import analysis as an
 import scanner_worker as sw
 
 
@@ -282,10 +283,10 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "operational_plan": {"rr_ratio": 2.0, "sl_price": 101833.3944, "tp_price": 103368.5712},
             "contexto_estructural": "Alcista",
         }
-        subject, body = sw._build_alert_payload(cfg, item, estado, "bybit")
-        self.assertIn("Bybit/perp-futures BTC-USD | 15m", subject)
+        subject, body = sw._build_alert_payload(cfg, item, estado, "binance")
+        self.assertIn("Binance/spot BTC-USD | 15m", subject)
         self.assertIn("Estado de la sesion: Optima", body)
-        self.assertNotIn("Bybit/perp-futures BTC-USD | 15m", body)
+        self.assertNotIn("Binance/spot BTC-USD | 15m", body)
         self.assertNotIn("Recomendacion:", body)
         self.assertIn("Hora Col: 2026-03-10 10:00", body)
         self.assertIn("Contexto estructural: Alcista", body)
@@ -327,7 +328,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "contexto_estructural": "Bajista",
         }
 
-        _, body = sw._build_alert_payload(cfg, item, estado, "bybit")
+        _, body = sw._build_alert_payload(cfg, item, estado, "binance")
 
         self.assertIn("Estado de la sesion: No favorable", body)
         self.assertIn("Lectura de continuidad: Degradada por contexto", body)
@@ -366,7 +367,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "contexto_estructural": "Bajista",
         }
 
-        _, body = sw._build_alert_payload(cfg, item, estado, "bybit")
+        _, body = sw._build_alert_payload(cfg, item, estado, "binance")
 
         self.assertIn("Estructura amplia", body)
         self.assertIn("🟥 SL Guia: 101", body)
@@ -468,11 +469,126 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         ):
             df, source, err = sw._fetch_data(item=item, period="5d", interval="15m", cfg={})
 
-        self.assertEqual(source, "bybit")
+        self.assertEqual(source, "binance")
         self.assertEqual(err, "")
         self.assertFalse(df.empty)
         fetch_mock.assert_called_once_with("BTCUSDT", "15m", limit=500)
         yf_mock.assert_not_called()
+
+    def test_compute_signal_confidence_ignores_candle_score(self):
+        estado = {
+            "dorado_v13": {
+                "micro_score": 6,
+                "umbral": 4,
+                "rr_estimado": 2.1,
+            }
+        }
+        mtf_info = {"score": 12}
+
+        low_pattern = sw._compute_signal_confidence(estado, mtf_info, {"score": 0})
+        high_pattern = sw._compute_signal_confidence(estado, mtf_info, {"score": 10})
+
+        self.assertEqual(low_pattern, high_pattern)
+
+    def test_apply_precision_filters_ignores_candle_alignment(self):
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTC-USD",
+            td_symbol="BTC/USD",
+            kind="crypto",
+        )
+        cfg = {"interval": "15m", "cooldown_minutes": 60}
+        precision_cfg = {
+            "enabled": True,
+            "multi_timeframe_filter": True,
+            "require_price_action_confirmation": True,
+            "min_rr": 1.6,
+            "min_confidence_score": 72,
+            "min_mtf_confirmations": 1,
+            "adaptive_threshold": False,
+            "adaptive_cooldown": True,
+        }
+        estado = {
+            "dorado_v13": {
+                "rr_estimado": 2.4,
+                "setup_tipo": "",
+            },
+            "setup_tipo": "",
+            "direccion_v13": "ALCISTA",
+            "precio_alerta": 100.0,
+        }
+        compute_ctx = {
+            "interval": "15m",
+            "vol_ratio": 1.0,
+            "df_ind": pd.DataFrame(
+                {
+                    "High": [100.8, 100.7, 100.6, 100.5, 100.4],
+                    "Low": [99.5, 99.4, 99.45, 99.5, 99.55],
+                }
+            ),
+        }
+        mtf_info = {
+            "ok": True,
+            "score": 12,
+            "details": ["30m:ALCISTA"],
+            "summary": "confirmaciones=1, opuestos=0, neutrales=0",
+            "confirmations": 1,
+            "opposites": 0,
+            "neutrals": 0,
+        }
+        candle_info = {"aligned": False, "bias": "BAJISTA", "pattern": "doble_techo", "score": 10}
+        with (
+            patch.object(sw, "_evaluate_mtf_alignment", return_value=mtf_info),
+            patch.object(sw, "_detect_price_action", return_value=candle_info),
+            patch.object(sw, "_compute_signal_confidence", return_value=80),
+            patch.object(sw, "_compute_dynamic_min_confidence", return_value=72),
+            patch.object(sw, "_compute_adaptive_cooldown_minutes", return_value=36),
+        ):
+            out = sw._apply_precision_filters(
+                item=item,
+                cfg=cfg,
+                estado=estado,
+                compute_ctx=compute_ctx,
+                mtf_cache={},
+                precision_cfg=precision_cfg,
+            )
+
+        self.assertTrue(out["signal_ready"])
+        self.assertNotIn("vela_sin_confirmacion", out["reasons"])
+
+    def test_detectar_cambio_tendencial_identifies_bullish_shift(self):
+        datos_1d = pd.DataFrame(
+            {
+                "High": [110.0, 108.0, 106.0, 104.0, 102.0],
+                "Low": [105.0, 103.0, 101.0, 99.0, 97.0],
+                "Close": [106.0, 104.0, 102.0, 100.0, 98.0],
+                "EMA_20": [108.0, 107.0, 106.0, 105.0, 104.0],
+                "EMA_50": [110.0, 109.0, 108.0, 107.0, 106.0],
+                "EMA_200": [115.0, 114.0, 113.0, 112.0, 111.0],
+            }
+        )
+        datos_4h = pd.DataFrame(
+            {
+                "High": [100.0, 99.5, 99.0, 98.5, 98.0, 97.5, 97.0, 96.5, 96.0, 95.5, 95.0, 94.5, 96.0, 98.0, 100.5, 102.5, 103.5, 104.5],
+                "Low": [98.5, 98.0, 97.5, 97.0, 96.5, 96.0, 95.5, 95.0, 94.5, 94.0, 93.5, 90.0, 93.0, 94.0, 95.0, 96.0, 97.0, 98.0],
+                "Close": [99.0, 98.5, 98.0, 97.5, 97.0, 96.5, 96.0, 95.5, 95.0, 94.5, 94.0, 91.5, 95.0, 97.5, 100.8, 102.0, 103.0, 104.0],
+                "EMA_20": [99.0, 98.7, 98.4, 98.1, 97.8, 97.5, 97.2, 96.9, 96.6, 96.3, 96.0, 95.7, 95.9, 96.4, 97.4, 98.6, 99.8, 101.0],
+                "EMA_50": [100.5, 100.2, 99.9, 99.6, 99.3, 99.0, 98.7, 98.4, 98.1, 97.8, 97.5, 97.2, 97.1, 97.2, 97.6, 98.2, 98.9, 99.6],
+                "EMA_200": [110.0] * 18,
+            }
+        )
+
+        regime = an.detectar_cambio_tendencial(
+            datos_1d=datos_1d,
+            datos_4h=datos_4h,
+            direccion_1d="BAJISTA",
+            direccion_4h="ALCISTA",
+        )
+
+        self.assertEqual(regime["new_direction"], "ALCISTA")
+        self.assertIn(regime["phase"], {"GIRO_ALCISTA_EN_DESARROLLO", "GIRO_ALCISTA_CONFIRMADO"})
+        self.assertGreaterEqual(regime["score"], 5)
 
     def test_fetch_data_falls_back_to_yfinance_when_binance_fails(self):
         item = sw.MarketItem(

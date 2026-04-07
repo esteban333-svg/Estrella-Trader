@@ -11,17 +11,6 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-BYBIT_REST_URL = "https://api.bybit.com/v5/market/kline"
-BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
-BYBIT_INTERVAL_MAP = {
-    "5m": "5",
-    "15m": "15",
-    "30m": "30",
-    "1h": "60",
-    "4h": "240",
-    "1d": "D",
-}
-
 WEBSOCKETS_AVAILABLE = False
 try:
     import websockets  # type: ignore
@@ -52,24 +41,14 @@ class BinanceLiveStore:
 
     def update_from_kline(self, k: dict) -> None:
         try:
-            if "start" in k:
-                ts = datetime.fromtimestamp(k.get("start", 0) / 1000, tz=timezone.utc)
-                row = {
-                    "Open": float(k.get("open")),
-                    "High": float(k.get("high")),
-                    "Low": float(k.get("low")),
-                    "Close": float(k.get("close")),
-                    "Volume": float(k.get("volume")),
-                }
-            else:
-                ts = datetime.fromtimestamp(k.get("t", 0) / 1000, tz=timezone.utc)
-                row = {
-                    "Open": float(k.get("o")),
-                    "High": float(k.get("h")),
-                    "Low": float(k.get("l")),
-                    "Close": float(k.get("c")),
-                    "Volume": float(k.get("v")),
-                }
+            ts = datetime.fromtimestamp(k.get("t", 0) / 1000, tz=timezone.utc)
+            row = {
+                "Open": float(k.get("o")),
+                "High": float(k.get("h")),
+                "Low": float(k.get("l")),
+                "Close": float(k.get("c")),
+                "Volume": float(k.get("v")),
+            }
         except Exception:
             return
 
@@ -114,24 +93,17 @@ class BinanceLiveStore:
 
 def fetch_klines(symbol: str, interval: str, limit: int = 500) -> Tuple[pd.DataFrame, Optional[str]]:
     try:
-        bybit_interval = BYBIT_INTERVAL_MAP.get(interval)
-        if not bybit_interval:
-            return pd.DataFrame(), f"Bybit Futures intervalo no soportado: {interval}"
         url = (
-            f"{BYBIT_REST_URL}?category=linear"
-            f"&symbol={symbol.upper()}&interval={bybit_interval}&limit={limit}"
+            "https://api.binance.com/api/v3/klines"
+            f"?symbol={symbol.upper()}&interval={interval}&limit={limit}"
         )
         with urllib.request.urlopen(url, timeout=10) as resp:
             raw = resp.read()
 
-        payload = json.loads(raw.decode("utf-8"))
-        if int(payload.get("retCode", -1)) != 0:
-            msg = str(payload.get("retMsg", "sin detalle")).strip() or "sin detalle"
-            return pd.DataFrame(), f"Bybit Futures API error: {msg}"
-        data = ((payload.get("result") or {}).get("list")) or []
+        data = json.loads(raw.decode("utf-8"))
         rows = []
         for k in data:
-            ts = datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc)
+            ts = datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc)
             rows.append(
                 {
                     "ts": ts,
@@ -143,10 +115,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> Tuple[pd.DataF
                 }
             )
 
-        if not rows:
-            return pd.DataFrame(), f"Bybit Futures sin velas para {symbol.upper()} {interval}"
-
-        df = pd.DataFrame(rows).sort_values("ts").set_index("ts")
+        df = pd.DataFrame(rows).set_index("ts")
         return df, None
     except urllib.error.HTTPError as exc:
         body = ""
@@ -154,17 +123,17 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500) -> Tuple[pd.DataF
             body = exc.read().decode("utf-8", errors="ignore")
         except Exception:
             body = ""
-        err = f"Bybit Futures REST HTTP {exc.code} {exc.reason}"
+        err = f"Binance REST HTTP {exc.code} {exc.reason}"
         if body:
             err += f" | {body[:220]}"
         logger.warning(err)
         return pd.DataFrame(), err
     except urllib.error.URLError as exc:
-        err = f"Bybit Futures REST URL error: {exc}"
+        err = f"Binance REST URL error: {exc}"
         logger.warning(err)
         return pd.DataFrame(), err
     except Exception as exc:
-        err = f"Bybit Futures REST unexpected error: {exc}"
+        err = f"Binance REST unexpected error: {exc}"
         logger.exception(err)
         return pd.DataFrame(), err
 
@@ -173,28 +142,19 @@ async def _ws_consume(symbol: str, interval: str, store: BinanceLiveStore, stop_
     if websockets is None:
         return
 
-    bybit_interval = BYBIT_INTERVAL_MAP.get(interval)
-    if not bybit_interval:
-        store.set_error(f"Bybit Futures intervalo no soportado: {interval}")
-        return
-
+    url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@kline_{interval}"
     while not stop_event.is_set():
         try:
-            async with websockets.connect(BYBIT_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                topic = f"kline.{bybit_interval}.{symbol.upper()}"
-                await ws.send(json.dumps({"op": "subscribe", "args": [topic]}))
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                 async for message in ws:
                     if stop_event.is_set():
                         break
                     payload = json.loads(message)
-                    data = payload.get("data")
-                    if not isinstance(data, list):
-                        continue
-                    for k in data:
-                        if isinstance(k, dict):
-                            store.update_from_kline(k)
+                    k = payload.get("k")
+                    if k:
+                        store.update_from_kline(k)
         except Exception as exc:
-            err = f"Bybit Futures WS error ({symbol}@{interval}): {exc}"
+            err = f"Binance WS error ({symbol}@{interval}): {exc}"
             logger.warning(err)
             store.set_error(err)
             store.register_ws_reconnect()
@@ -207,6 +167,6 @@ def start_stream(symbol: str, interval: str, store: BinanceLiveStore) -> Tuple[t
     def runner() -> None:
         asyncio.run(_ws_consume(symbol, interval, store, stop_event))
 
-    thread = threading.Thread(target=runner, name="bybit-ws", daemon=True)
+    thread = threading.Thread(target=runner, name="binance-ws", daemon=True)
     thread.start()
     return thread, stop_event

@@ -1103,6 +1103,203 @@ def _classify_dorado_setup(
     return meta
 
 
+def _regime_defaults() -> Dict[str, Any]:
+    return {
+        "phase": "NO_EVALUADO",
+        "label": "No evaluado",
+        "previous_direction": "NEUTRAL",
+        "new_direction": "NEUTRAL",
+        "score": 0,
+        "confirmed": False,
+        "key_level": 0.0,
+        "motivos": [],
+    }
+
+
+def _regime_label(phase: str, direction: str) -> str:
+    phase_norm = str(phase or "").upper().strip()
+    direction_norm = str(direction or "").upper().strip()
+    direction_txt = direction_norm.lower()
+
+    if phase_norm == "GIRO_ALCISTA_CONFIRMADO":
+        return "Giro alcista confirmado"
+    if phase_norm == "GIRO_BAJISTA_CONFIRMADO":
+        return "Giro bajista confirmado"
+    if phase_norm == "GIRO_ALCISTA_EN_DESARROLLO":
+        return "Giro alcista en desarrollo"
+    if phase_norm == "GIRO_BAJISTA_EN_DESARROLLO":
+        return "Giro bajista en desarrollo"
+    if phase_norm == "TRANSICION":
+        return "Transicion estructural"
+    if phase_norm == "CONTINUACION" and direction_norm in {"ALCISTA", "BAJISTA"}:
+        return f"Continuacion {direction_txt}"
+    return "Sin sesgo claro"
+
+
+def detectar_cambio_tendencial(
+        datos_1d: pd.DataFrame,
+        datos_4h: pd.DataFrame,
+        direccion_1d: str,
+        direccion_4h: str,
+        prev_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Detector informativo de cambio de regimen.
+    No decide entradas ni bloquea senales; solo resume si el contexto parece
+    continuidad, transicion o giro de tendencia.
+    """
+    del prev_state  # reservado para persistencia futura
+
+    out = _regime_defaults()
+    direction_1d = (direccion_1d or "NEUTRAL").upper().strip()
+    direction_4h = (direccion_4h or "NEUTRAL").upper().strip()
+    out["previous_direction"] = direction_1d if direction_1d in ("ALCISTA", "BAJISTA") else direction_4h
+    out["new_direction"] = direction_4h if direction_4h in ("ALCISTA", "BAJISTA") else out["previous_direction"]
+
+    required_cols = {"High", "Low", "Close", "EMA_20", "EMA_50", "EMA_200"}
+    if (
+        datos_1d is None or datos_4h is None
+        or datos_1d.empty or datos_4h.empty
+        or not required_cols.issubset(set(datos_4h.columns))
+    ):
+        out["label"] = _regime_label(out["phase"], out["new_direction"])
+        return out
+
+    d4 = datos_4h.copy()
+    for col in required_cols:
+        d4[col] = pd.to_numeric(d4[col], errors="coerce")
+    d4 = d4.dropna(subset=["High", "Low", "Close", "EMA_20", "EMA_50", "EMA_200"])
+    if len(d4) < 18:
+        out["label"] = _regime_label(out["phase"], out["new_direction"])
+        return out
+
+    atr_4h = max(_atr14(d4), 1e-9)
+    recent = d4.tail(6)
+    prior = d4.tail(18).iloc[:-6]
+    if prior.empty:
+        out["label"] = _regime_label(out["phase"], out["new_direction"])
+        return out
+
+    close_4h = _to_float_or_nan(d4["Close"].iloc[-1])
+    ema20_4h = _to_float_or_nan(d4["EMA_20"].iloc[-1])
+    ema50_4h = _to_float_or_nan(d4["EMA_50"].iloc[-1])
+    ema20_prev = _to_float_or_nan(d4["EMA_20"].iloc[-4]) if len(d4) >= 4 else ema20_4h
+    ema50_prev = _to_float_or_nan(d4["EMA_50"].iloc[-4]) if len(d4) >= 4 else ema50_4h
+    ema20_slope = ema20_4h - ema20_prev
+    ema50_slope = ema50_4h - ema50_prev
+
+    recent_high = _to_float_or_nan(pd.to_numeric(recent["High"], errors="coerce").max())
+    recent_low = _to_float_or_nan(pd.to_numeric(recent["Low"], errors="coerce").min())
+    prior_high = _to_float_or_nan(pd.to_numeric(prior["High"], errors="coerce").max())
+    prior_low = _to_float_or_nan(pd.to_numeric(prior["Low"], errors="coerce").min())
+    breakout_tol = atr_4h * 0.12
+    structure_tol = atr_4h * 0.15
+
+    bullish_score = 0
+    bearish_score = 0
+    bullish_reasons: List[str] = []
+    bearish_reasons: List[str] = []
+
+    if close_4h > prior_high + breakout_tol:
+        bullish_score += 3
+        bullish_reasons.append("4H rompe el ultimo techo operativo relevante.")
+    if recent_low > prior_low + structure_tol:
+        bullish_score += 2
+        bullish_reasons.append("4H deja un piso mas alto que la referencia previa.")
+    if ema20_4h > ema50_4h:
+        bullish_score += 2
+        bullish_reasons.append("EMA20 4H se sostiene sobre EMA50.")
+    elif ema20_slope > 0 and close_4h > ema20_4h:
+        bullish_score += 1
+        bullish_reasons.append("EMA20 4H empieza a girar al alza con aceptacion del precio.")
+    if direction_4h == "ALCISTA":
+        bullish_score += 1
+        bullish_reasons.append("La direccion 4H ya es alcista.")
+    if direction_1d != "BAJISTA":
+        bullish_score += 1
+        bullish_reasons.append("El marco 1D dejo de empujar en contra.")
+    if ema50_slope > 0:
+        bullish_score += 1
+        bullish_reasons.append("EMA50 4H empieza a acompanar el giro.")
+
+    if close_4h < prior_low - breakout_tol:
+        bearish_score += 3
+        bearish_reasons.append("4H rompe el ultimo piso operativo relevante.")
+    if recent_high < prior_high - structure_tol:
+        bearish_score += 2
+        bearish_reasons.append("4H deja un techo mas bajo que la referencia previa.")
+    if ema20_4h < ema50_4h:
+        bearish_score += 2
+        bearish_reasons.append("EMA20 4H se sostiene bajo EMA50.")
+    elif ema20_slope < 0 and close_4h < ema20_4h:
+        bearish_score += 1
+        bearish_reasons.append("EMA20 4H gira a la baja con aceptacion del precio.")
+    if direction_4h == "BAJISTA":
+        bearish_score += 1
+        bearish_reasons.append("La direccion 4H ya es bajista.")
+    if direction_1d != "ALCISTA":
+        bearish_score += 1
+        bearish_reasons.append("El marco 1D dejo de empujar en contra.")
+    if ema50_slope < 0:
+        bearish_score += 1
+        bearish_reasons.append("EMA50 4H empieza a acompanar el giro.")
+
+    previous_direction = out["previous_direction"]
+    if previous_direction == "BAJISTA":
+        out["key_level"] = round(prior_high, 10)
+        out["new_direction"] = "ALCISTA"
+        out["score"] = min(10, bullish_score)
+        out["motivos"] = bullish_reasons[:4]
+        if bullish_score >= 8 and direction_4h == "ALCISTA":
+            out["phase"] = "GIRO_ALCISTA_CONFIRMADO"
+            out["confirmed"] = True
+        elif bullish_score >= 5:
+            out["phase"] = "GIRO_ALCISTA_EN_DESARROLLO"
+        elif direction_4h != "BAJISTA":
+            out["phase"] = "TRANSICION"
+    elif previous_direction == "ALCISTA":
+        out["key_level"] = round(prior_low, 10)
+        out["new_direction"] = "BAJISTA"
+        out["score"] = min(10, bearish_score)
+        out["motivos"] = bearish_reasons[:4]
+        if bearish_score >= 8 and direction_4h == "BAJISTA":
+            out["phase"] = "GIRO_BAJISTA_CONFIRMADO"
+            out["confirmed"] = True
+        elif bearish_score >= 5:
+            out["phase"] = "GIRO_BAJISTA_EN_DESARROLLO"
+        elif direction_4h != "ALCISTA":
+            out["phase"] = "TRANSICION"
+    else:
+        if direction_1d != direction_4h and "NEUTRAL" not in {direction_1d, direction_4h}:
+            out["phase"] = "TRANSICION"
+            out["score"] = min(10, max(bullish_score, bearish_score))
+            out["motivos"] = ["1D y 4H no comparten el mismo sesgo."]
+        elif bullish_score >= 8 and direction_4h == "ALCISTA":
+            out["phase"] = "GIRO_ALCISTA_CONFIRMADO"
+            out["new_direction"] = "ALCISTA"
+            out["score"] = min(10, bullish_score)
+            out["confirmed"] = True
+            out["key_level"] = round(prior_high, 10)
+            out["motivos"] = bullish_reasons[:4]
+        elif bearish_score >= 8 and direction_4h == "BAJISTA":
+            out["phase"] = "GIRO_BAJISTA_CONFIRMADO"
+            out["new_direction"] = "BAJISTA"
+            out["score"] = min(10, bearish_score)
+            out["confirmed"] = True
+            out["key_level"] = round(prior_low, 10)
+            out["motivos"] = bearish_reasons[:4]
+
+    if out["phase"] == "NO_EVALUADO":
+        out["phase"] = "CONTINUACION"
+        out["new_direction"] = previous_direction if previous_direction in ("ALCISTA", "BAJISTA") else direction_4h
+        out["motivos"] = [
+            "No hay evidencia suficiente de cambio de regimen; la lectura sigue en continuidad."
+        ]
+
+    out["label"] = _regime_label(out["phase"], out["new_direction"])
+    return out
+
+
 def calcular_micro_score_dorado(df: pd.DataFrame, direccion: str) -> Optional[Dict[str, Any]]:
     """
     v1.3 — Dorado (micro-score de ventaja)
@@ -1452,6 +1649,15 @@ def construir_estado_final(
             else "Dirección bajista dominante." if direccion == "BAJISTA"
             else "Dirección neutral: sin ventaja estructural."
         ),
+        "regime_phase": "NO_EVALUADO",
+        "regime_label": "No evaluado",
+        "regime_score": 0,
+        "regime_confirmed": False,
+        "regime_previous_direction": direccion,
+        "regime_new_direction": direccion,
+        "regime_key_level": 0.0,
+        "regime_reasons": [],
+        "cambio_tendencia": False,
     }
 
     if dorado is not None:
@@ -1479,6 +1685,11 @@ def construir_estado_final(
         "dorado_activo": dorado is not None,
         "micro_score_dorado": (dorado or {}).get("micro_score"),
         "rojo": rojo,
+        "regime": {
+            "phase": estado.get("regime_phase"),
+            "label": estado.get("regime_label"),
+            "score": estado.get("regime_score"),
+        },
     }
     return estado
 
@@ -1542,7 +1753,34 @@ def construir_estado_final_estructural(
             "direccion_4h": direccion_4h,
             "alineacion": alineacion,
         },
+        "regime_phase": "NO_EVALUADO",
+        "regime_label": "No evaluado",
+        "regime_score": 0,
+        "regime_confirmed": False,
+        "regime_previous_direction": direccion_1d,
+        "regime_new_direction": direccion_4h,
+        "regime_key_level": 0.0,
+        "regime_reasons": [],
+        "cambio_tendencia": False,
     }
+
+    regime = detectar_cambio_tendencial(
+        datos_1d=datos_1d,
+        datos_4h=datos_4h,
+        direccion_1d=direccion_1d,
+        direccion_4h=direccion_4h,
+    )
+    estado.update({
+        "regime_phase": regime.get("phase", "NO_EVALUADO"),
+        "regime_label": regime.get("label", "No evaluado"),
+        "regime_score": int(regime.get("score", 0) or 0),
+        "regime_confirmed": bool(regime.get("confirmed", False)),
+        "regime_previous_direction": regime.get("previous_direction", direccion_1d),
+        "regime_new_direction": regime.get("new_direction", direccion_4h),
+        "regime_key_level": regime.get("key_level", 0.0),
+        "regime_reasons": regime.get("motivos", [])[:4],
+        "cambio_tendencia": str(regime.get("phase", "")).upper().startswith("GIRO_"),
+    })
 
     # Conflicto fuerte de marcos: bloqueo de ejecucion.
     if alineacion == "CONFLICTO":
@@ -1611,6 +1849,7 @@ def construir_estado_final_estructural(
         "dorado_activo": estado.get("dorado") is not None,
         "micro_score_dorado": (estado.get("dorado") or {}).get("micro_score"),
         "rojo": estado.get("rojo"),
+        "regime": regime,
     }
     return estado
 
@@ -1946,6 +2185,12 @@ def resumen_estado_humano(estado: Dict[str, Any], usuario: Dict[str, Any]) -> Di
             "nivel": rojo_nivel,
             "micro_score": rojo_score,
             "razones": rojo_razones,
+        },
+        "regime": {
+            "phase": estado.get("regime_phase"),
+            "label": estado.get("regime_label"),
+            "score": estado.get("regime_score"),
+            "confirmed": bool(estado.get("regime_confirmed", False)),
         },
         "ensenar": {
             "activo": ensenar_activo,
