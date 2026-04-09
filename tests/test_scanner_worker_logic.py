@@ -285,21 +285,24 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         }
         subject, body = sw._build_alert_payload(cfg, item, estado, "binance")
         self.assertIn("Binance/spot BTC-USD | 15m", subject)
-        self.assertIn("Estado de la sesion: Optima", body)
+        self.assertIn(
+            "El contexto mayor sigue alcista y este timeframe esta dando timing a favor de la continuidad.",
+            body,
+        )
         self.assertNotIn("Binance/spot BTC-USD | 15m", body)
-        self.assertNotIn("Recomendacion:", body)
+        self.assertIn("Se habilita si sostiene aceptacion alcista en esta zona.", body)
         self.assertIn("Hora Col: 2026-03-10 10:00", body)
-        self.assertIn("Contexto estructural: Alcista", body)
-        self.assertIn("Direccion: ALCISTA", body)
-        self.assertIn("Escenario operativo: Pullback alcista de continuidad", body)
-        self.assertIn("➡️ Entrada Guia: 102345.12", body)
-        self.assertIn("🟥 SL Guia: 101833.39", body)
-        self.assertIn("🟩 TP Guia: 103368.57", body)
-        self.assertIn("Riesgo/beneficio: 1/2.30", body)
-        self.assertIn("Puntaje tecnico: 90/100", body)
-        self.assertIn("Lectura de continuidad: Normal", body)
+        self.assertIn("Pierde validez si falla el timing y rompe la estructura inmediata.", body)
+        self.assertIn("\u27a1\ufe0f Entrada Guia: 102345.12", body)
+        self.assertIn("\U0001F7E5 SL Guia: 101833.39", body)
+        self.assertIn("\U0001F7E9 TP Guia: 103368.57", body)
+        self.assertIn("Risk/Reward: 1/2.30", body)
+        self.assertIn("Estructura: Normal", body)
         self.assertIn("Patron: rechazo_alcista", body)
-        self.assertIn("Mentor:", body)
+        self.assertNotIn("Estado de la sesion", body)
+        self.assertNotIn("Contexto estructural", body)
+        self.assertNotIn("Puntaje tecnico", body)
+        self.assertNotIn("Mentor:", body)
         self.assertNotIn("Estructura amplia", body)
         self.assertNotIn("viernes y durante el fin de semana", body)
 
@@ -330,10 +333,10 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
         _, body = sw._build_alert_payload(cfg, item, estado, "binance")
 
-        self.assertIn("Estado de la sesion: No favorable", body)
-        self.assertIn("Lectura de continuidad: Degradada por contexto", body)
-        self.assertIn("🟥 SL Guia: 0.09188715", body)
-        self.assertIn("🟩 TP Guia: 0.0905157", body)
+        self.assertNotIn("Estado de la sesion", body)
+        self.assertIn("Estructura: Normal", body)
+        self.assertIn("\U0001F7E5 SL Guia: 0.09188715", body)
+        self.assertIn("\U0001F7E9 TP Guia: 0.0905157", body)
         self.assertIn("viernes y durante el fin de semana", body)
 
     def test_build_alert_payload_marks_wide_structure_when_structural_risk_exceeds_one_percent(self):
@@ -369,9 +372,9 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
         _, body = sw._build_alert_payload(cfg, item, estado, "binance")
 
-        self.assertIn("Estructura amplia", body)
-        self.assertIn("🟥 SL Guia: 101", body)
-        self.assertIn("🟩 TP Guia: 98", body)
+        self.assertIn("Estructura: Amplia", body)
+        self.assertIn("\U0001F7E5 SL Guia: 101", body)
+        self.assertIn("\U0001F7E9 TP Guia: 98", body)
 
     def test_operational_scenario_label_uses_pullback_for_lower_timeframes(self):
         label = sw._alert_operational_scenario_label(

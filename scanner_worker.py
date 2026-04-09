@@ -3082,6 +3082,86 @@ def _mentor_block(direction: str, strength: str) -> str:
     )
 
 
+def _is_structural_alert_mode(temporalidad: str, modo: str) -> bool:
+    temporalidad_norm = str(temporalidad or "").strip().lower()
+    modo_norm = str(modo or "").strip().lower().replace(" ", "")
+    return temporalidad_norm == "1d + 4h" or "estructural" in modo_norm or "1d+4h" in modo_norm
+
+
+def _alert_structure_label(structural_risk_pct: float) -> str:
+    return "Amplia" if _safe_float(structural_risk_pct, 0.0) > 1.0 else "Normal"
+
+
+def _alert_message_copy(
+    direction: str,
+    temporalidad: str,
+    modo: str,
+    regime_phase: str,
+) -> Tuple[str, str, str]:
+    direction_norm = str(direction or "").upper().strip()
+    regime_norm = str(regime_phase or "").upper().strip()
+    structural_mode = _is_structural_alert_mode(temporalidad=temporalidad, modo=modo)
+    bullish = direction_norm == "ALCISTA"
+
+    if regime_norm in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
+        if structural_mode:
+            if bullish:
+                return (
+                    "El cambio de regimen ya esta confirmado y el mercado empieza a favorecer compras. "
+                    "La prioridad ahora es esperar una zona valida, no entrar por impulso.",
+                    "Se habilita si confirma continuidad del nuevo lado sobre soporte recuperado.",
+                    "Pierde validez si pierde la estructura nueva y debilita el giro.",
+                )
+            return (
+                "El cambio de regimen ya esta confirmado y el mercado empieza a favorecer ventas. "
+                "La prioridad ahora es esperar una zona valida, no entrar por impulso.",
+                "Se habilita si confirma continuidad del nuevo lado sobre resistencia recuperada.",
+                "Pierde validez si recupera la estructura nueva y debilita el giro.",
+            )
+        if bullish:
+            return (
+                "El cambio de regimen ya fue confirmado arriba y este timeframe esta dando timing para sumarse "
+                "al nuevo sesgo alcista. La prioridad es esperar confirmacion en zona, no perseguir precio.",
+                "Se habilita si sostiene soporte recuperado y deja continuacion limpia.",
+                "Pierde validez si pierde la estructura inmediata y debilita el giro.",
+            )
+        return (
+            "El cambio de regimen ya fue confirmado arriba y este timeframe esta dando timing para sumarse "
+            "al nuevo sesgo bajista. La prioridad es esperar confirmacion en zona, no perseguir precio.",
+            "Se habilita si sostiene resistencia recuperada y deja continuacion limpia.",
+            "Pierde validez si recupera la estructura inmediata y debilita el giro.",
+        )
+
+    if structural_mode:
+        if bullish:
+            return (
+                "El contexto se mantiene alcista y la continuidad sigue limpia. "
+                "Busca compras solo si el precio confirma intencion en zona; no persigas el movimiento.",
+                "Se habilita si aparece aceptacion alcista y continuidad sobre la zona valida.",
+                "Pierde validez si pierde la estructura que sostiene la continuidad.",
+            )
+        return (
+            "El contexto se mantiene bajista y la continuidad sigue limpia. "
+            "Busca ventas solo si el precio confirma intencion en zona; no persigas el movimiento.",
+            "Se habilita si aparece aceptacion bajista y continuidad sobre la zona valida.",
+            "Pierde validez si recupera la estructura que sostiene la continuidad.",
+        )
+
+    if bullish:
+        return (
+            "El contexto mayor sigue alcista y este timeframe esta dando timing a favor de la continuidad. "
+            "La idea es ejecutar en zona, no comprar por impulso.",
+            "Se habilita si sostiene aceptacion alcista en esta zona.",
+            "Pierde validez si falla el timing y rompe la estructura inmediata.",
+        )
+    return (
+        "El contexto mayor sigue bajista y este timeframe esta dando timing a favor de la continuidad. "
+        "La idea es ejecutar en zona, no vender por impulso.",
+        "Se habilita si sostiene aceptacion bajista en esta zona.",
+        "Pierde validez si falla el timing y recupera la estructura inmediata.",
+    )
+
+
 def _session_status_for_alert(alert_bar_utc: str) -> Tuple[str, str]:
     bar_dt = _parse_iso_utc(str(alert_bar_utc or "").strip())
     ref_dt = bar_dt if bar_dt is not None else datetime.now(pytz.UTC)
@@ -3329,12 +3409,14 @@ def _build_alert_payload(
     source: str,
     structural_context_label: str | None = None,
 ) -> Tuple[str, str]:
+    _ = structural_context_label
     dorado = estado.get("dorado_v13") or {}
     operational_plan = estado.get("operational_plan", {}) if isinstance(estado.get("operational_plan", {}), dict) else {}
     rr = dorado.get("rr_estimado", operational_plan.get("rr_ratio", OPERATIONAL_TP_R_MULT))
     direction = estado.get("direccion_v13", "")
     temporalidad = str(estado.get("temporalidad_alerta", "")).strip()
     modo = str(estado.get("modo_alerta", "Tendencial")).strip() or "Tendencial"
+    regime_phase = str(estado.get("regime_phase", "")).strip()
     if not temporalidad:
         temporalidad = "1D + 4H" if "1d+4h" in modo.lower().replace(" ", "") else str(cfg.get("interval", "15m"))
 
@@ -3348,38 +3430,23 @@ def _build_alert_payload(
         operational_plan.get("risk_pct_structural", operational_plan.get("risk_pct", 0.0)),
         0.0,
     )
-    wide_structure_line = "Estructura amplia\n" if structural_risk_pct > 1.0 else ""
+    structure_label = _alert_structure_label(structural_risk_pct)
     rr_value = _safe_float(rr, 0.0)
     rr_text = f"1/{rr_value:.2f}" if rr_value > 0 else "N/A"
     precio_alerta_text = _format_price(estado.get("precio_alerta"))
     sl_text = _format_price(guide_trade.get("sl_price"))
     tp_text = _format_price(guide_trade.get("tp_price"))
     indice_alerta_utc = str(estado.get("indice_alerta_utc", "")).strip() or "N/A"
-    confidence_text = str(estado.get("confidence_score", "N/A")).strip() or "N/A"
     pattern_text = str(estado.get("candle_pattern", "sin_patron")).strip()
-    setup_tipo = str(estado.get("setup_tipo", dorado.get("setup_tipo", ""))).strip().lower()
-    strength_label = _signal_strength_label(estado=estado, dorado=dorado)
-    action_text = _alert_action_label(direction=direction, strength=strength_label)
-    context_text = str(structural_context_label or estado.get("contexto_estructural", "")).strip()
-    if not context_text:
-        context_text = _structural_context_label_from_state(estado)
-    if not context_text or context_text == "No claro":
-        context_text = _human_direction_label(direction) if str(direction or "").upper().strip() in {"ALCISTA", "BAJISTA"} else "No claro"
-    scenario_text = _alert_operational_scenario_label(
-        direction=direction,
-        setup_tipo=setup_tipo,
-        strength=strength_label,
-        temporalidad=temporalidad,
-        modo=modo,
-        regime_phase=str(estado.get("regime_phase", "")).strip(),
-    )
-    regime_text = str(estado.get("regime_label", "")).strip()
-    regime_line = f"Cambio tendencial: {regime_text}\n" if regime_text else ""
-    mentor_text = _mentor_block(direction=direction, strength=strength_label)
     session_state, _ = _session_status_for_alert(indice_alerta_utc)
     session_note = _session_risk_note()
-    continuity_read = _continuity_read_label(session_state)
     hora_col_text = str(estado.get("hora_col", "")).strip() or _format_colombia_alert_time(indice_alerta_utc)
+    intro_text, activation_text, invalidation_text = _alert_message_copy(
+        direction=direction,
+        temporalidad=temporalidad,
+        modo=modo,
+        regime_phase=regime_phase,
+    )
 
     market_header = _alert_market_header(item=item, temporalidad=temporalidad, source=source)
     prefix = str(cfg.get("notification", {}).get("subject_prefix", "")).strip()
@@ -3388,25 +3455,22 @@ def _build_alert_payload(
         subject_parts.insert(0, prefix)
     subject = " | ".join(subject_parts)
 
-    body = (
-        f"Estado de la sesion: {session_state}\n"
-        f"Hora Col: {hora_col_text}\n"
-        f"Contexto estructural: {context_text}\n"
-        f"{regime_line}"
-        f"Direccion: {direction}\n"
-        f"Accion: {action_text}\n"
-        f"Escenario operativo: {scenario_text}\n"
-        f"➡️ Entrada Guia: {precio_alerta_text}\n"
-        f"🟥 SL Guia: {sl_text}\n"
-        f"🟩 TP Guia: {tp_text}\n"
-        f"{wide_structure_line}"
-        f"Fuerza: {strength_label}\n"
-        f"Riesgo/beneficio: {rr_text}\n"
-        f"Puntaje tecnico: {confidence_text}/100\n"
-        f"Lectura de continuidad: {continuity_read}\n"
-        f"Patron: {pattern_text}\n\n"
-        f"{mentor_text}"
-    )
+    body_lines = [
+        f"Hora Col: {hora_col_text}",
+        "",
+        intro_text,
+        "",
+        f"Patron: {pattern_text}",
+        f"Estructura: {structure_label}",
+        activation_text,
+        invalidation_text,
+        "",
+        f"\u27a1\ufe0f Entrada Guia: {precio_alerta_text}",
+        f"\U0001F7E5 SL Guia: {sl_text}",
+        f"\U0001F7E9 TP Guia: {tp_text}",
+        f"Risk/Reward: {rr_text}",
+    ]
+    body = "\n".join(body_lines)
     if session_state == "No favorable":
         body = f"{body}\n\n{session_note}"
     return subject, body
