@@ -42,6 +42,43 @@ def _to_float_or_nan(value: Any) -> float:
     return out
 
 
+def _normalize_interval_token(interval: str | None) -> str:
+    raw = str(interval or "").strip().lower()
+    mapping = {
+        "60m": "1h",
+        "1day": "1d",
+        "1d+4h": "1d_4h",
+        "1d + 4h": "1d_4h",
+    }
+    return mapping.get(raw, raw or "15m")
+
+
+def _structure_window_for_interval(interval: str | None) -> int:
+    interval_norm = _normalize_interval_token(interval)
+    window_map = {
+        "15m": 12,
+        "30m": 10,
+        "1h": 12,
+        "4h": 16,
+        "1d": 20,
+        "1d_4h": 16,
+    }
+    return int(window_map.get(interval_norm, 12))
+
+
+def _setup_bucket_from_phase(phase: str, direction: str) -> str:
+    phase_norm = str(phase or "").upper().strip()
+    direction_norm = str(direction or "").upper().strip()
+    if direction_norm not in {"ALCISTA", "BAJISTA"}:
+        return "sin_setup"
+    side = "alcista" if direction_norm == "ALCISTA" else "bajista"
+    if phase_norm == "CONTINUACION":
+        return f"continuidad_{side}"
+    if phase_norm in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
+        return f"giro_{side}"
+    return "sin_setup"
+
+
 def obtener_datos_robusto(ticker: str, period: str = "5d", interval: str = "15m") -> pd.DataFrame:
     """
     Descarga robusta: evita crasheos cuando yfinance devuelve vacío o falla.
@@ -885,6 +922,121 @@ def calcular_score_azul(data: pd.DataFrame) -> dict:
     }
 
 
+def calcular_score_azul(data: pd.DataFrame, interval: str = "15m") -> dict:
+    """
+    v1.4 - Nucleo Azul con estructura dependiente del timeframe.
+    """
+
+    data = data.copy()
+    interval_norm = _normalize_interval_token(interval)
+    structure_window = _structure_window_for_interval(interval_norm)
+    recent_window = min(structure_window, max(6, len(data) // 2)) if len(data) >= 8 else structure_window
+
+    score_alcista = 0
+    score_bajista = 0
+    atr_base = max(_atr14(data), 1e-9)
+    recent = data.tail(recent_window)
+    prior = data.tail(recent_window * 2).iloc[:-recent_window]
+
+    if not recent.empty and not prior.empty:
+        recent_high = _to_float_or_nan(pd.to_numeric(recent["High"], errors="coerce").max())
+        recent_low = _to_float_or_nan(pd.to_numeric(recent["Low"], errors="coerce").min())
+        prior_high = _to_float_or_nan(pd.to_numeric(prior["High"], errors="coerce").max())
+        prior_low = _to_float_or_nan(pd.to_numeric(prior["Low"], errors="coerce").min())
+        last_two_closes = pd.to_numeric(data["Close"].tail(2), errors="coerce")
+        structure_tol = atr_base * 0.12
+        acceptance_tol = atr_base * 0.10
+
+        if not any(pd.isna(v) for v in (recent_high, recent_low, prior_high, prior_low)):
+            bullish_break = recent_high > prior_high + structure_tol
+            bearish_break = recent_low < prior_low - structure_tol
+            higher_low = recent_low > prior_low + (structure_tol * 0.50)
+            lower_high = recent_high < prior_high - (structure_tol * 0.50)
+            bullish_acceptance = (
+                len(last_two_closes) >= 2
+                and not last_two_closes.isna().any()
+                and float(last_two_closes.min()) > prior_high - acceptance_tol
+            )
+            bearish_acceptance = (
+                len(last_two_closes) >= 2
+                and not last_two_closes.isna().any()
+                and float(last_two_closes.max()) < prior_low + acceptance_tol
+            )
+
+            if bullish_break:
+                score_alcista += 2
+            if higher_low:
+                score_alcista += 1
+            if bullish_acceptance:
+                score_alcista += 1
+
+            if bearish_break:
+                score_bajista += 2
+            if lower_high:
+                score_bajista += 1
+            if bearish_acceptance:
+                score_bajista += 1
+
+    ema20 = data["EMA_20"].iloc[-1]
+    ema50 = data["EMA_50"].iloc[-1]
+    ema200 = data["EMA_200"].iloc[-1]
+
+    if not (pd.isna(ema20) or pd.isna(ema50) or pd.isna(ema200)):
+        if ema20 > ema50 > ema200:
+            score_alcista += 2
+        elif ema20 < ema50 < ema200:
+            score_bajista += 2
+
+    rsi = data["RSI"].iloc[-1]
+    if not pd.isna(rsi):
+        if rsi > 55:
+            score_alcista += 1
+        elif rsi < 45:
+            score_bajista += 1
+
+    data["TR"] = np.maximum(
+        data["High"] - data["Low"],
+        np.maximum(
+            abs(data["High"] - data["Close"].shift()),
+            abs(data["Low"] - data["Close"].shift())
+        )
+    )
+    data["ATR"] = data["TR"].rolling(14).mean()
+
+    atr_actual = data["ATR"].iloc[-1]
+    atr_media = data["ATR"].rolling(50).mean().iloc[-1]
+    vol_ratio = atr_actual / atr_media if atr_media != 0 else 1
+
+    if vol_ratio > 1.3:
+        umbral = 4
+        volatilidad_nivel = "Alta"
+    elif vol_ratio < 0.7:
+        umbral = 2
+        volatilidad_nivel = "Baja"
+    else:
+        umbral = 3
+        volatilidad_nivel = "Normal"
+
+    diferencia = score_alcista - score_bajista
+    if diferencia >= umbral:
+        direccion = "ALCISTA"
+    elif -diferencia >= umbral:
+        direccion = "BAJISTA"
+    else:
+        direccion = "NEUTRAL"
+
+    return {
+        "score_alcista": score_alcista,
+        "score_bajista": score_bajista,
+        "umbral": umbral,
+        "direccion": direccion,
+        "volatilidad_nivel": volatilidad_nivel,
+        "interval": interval_norm,
+        "structure_window": structure_window,
+        "structure_window_effective": recent_window,
+    }
+
+
 def voz_estrella(estado, tono="mentor"):
     esfera = estado["esfera"]
 
@@ -1292,6 +1444,208 @@ def detectar_cambio_tendencial(
     if out["phase"] == "NO_EVALUADO":
         out["phase"] = "CONTINUACION"
         out["new_direction"] = previous_direction if previous_direction in ("ALCISTA", "BAJISTA") else direction_4h
+        out["motivos"] = [
+            "No hay evidencia suficiente de cambio de regimen; la lectura sigue en continuidad."
+        ]
+
+    out["label"] = _regime_label(out["phase"], out["new_direction"])
+    return out
+
+
+def detectar_cambio_tendencial(
+        datos_1d: pd.DataFrame,
+        datos_4h: pd.DataFrame,
+        direccion_1d: str,
+        direccion_4h: str,
+        prev_state: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    v1.4 - Regimen estructural:
+    CONTINUACION / TRANSICION / GIRO EN DESARROLLO / GIRO CONFIRMADO.
+    """
+    del prev_state
+
+    out = _regime_defaults()
+    direction_1d = (direccion_1d or "NEUTRAL").upper().strip()
+    direction_4h = (direccion_4h or "NEUTRAL").upper().strip()
+    out["previous_direction"] = direction_1d if direction_1d in ("ALCISTA", "BAJISTA") else direction_4h
+    out["new_direction"] = direction_4h if direction_4h in ("ALCISTA", "BAJISTA") else out["previous_direction"]
+
+    required_cols = {"High", "Low", "Close", "EMA_20", "EMA_50", "EMA_200"}
+    if (
+        datos_1d is None or datos_4h is None
+        or datos_1d.empty or datos_4h.empty
+        or not required_cols.issubset(set(datos_4h.columns))
+    ):
+        out["label"] = _regime_label(out["phase"], out["new_direction"])
+        return out
+
+    d4 = datos_4h.copy()
+    for col in required_cols:
+        d4[col] = pd.to_numeric(d4[col], errors="coerce")
+    d4 = d4.dropna(subset=["High", "Low", "Close", "EMA_20", "EMA_50", "EMA_200"])
+
+    structure_window = _structure_window_for_interval("4h")
+    if len(d4) < 18:
+        out["label"] = _regime_label(out["phase"], out["new_direction"])
+        return out
+
+    recent_window = min(structure_window, max(8, len(d4) // 2))
+    recent = d4.tail(recent_window)
+    prior = d4.tail(recent_window * 2).iloc[:-recent_window]
+    if prior.empty:
+        out["label"] = _regime_label(out["phase"], out["new_direction"])
+        return out
+
+    atr_4h = max(_atr14(d4), 1e-9)
+    breakout_tol = atr_4h * 0.12
+    acceptance_tol = atr_4h * 0.10
+    structure_tol = atr_4h * 0.15
+    close_4h = _to_float_or_nan(d4["Close"].iloc[-1])
+    recent_high = _to_float_or_nan(pd.to_numeric(recent["High"], errors="coerce").max())
+    recent_low = _to_float_or_nan(pd.to_numeric(recent["Low"], errors="coerce").min())
+    prior_high = _to_float_or_nan(pd.to_numeric(prior["High"], errors="coerce").max())
+    prior_low = _to_float_or_nan(pd.to_numeric(prior["Low"], errors="coerce").min())
+    last_two_closes = pd.to_numeric(d4["Close"].tail(2), errors="coerce")
+
+    ema20_4h = _to_float_or_nan(d4["EMA_20"].iloc[-1])
+    ema50_4h = _to_float_or_nan(d4["EMA_50"].iloc[-1])
+    ema20_prev = _to_float_or_nan(d4["EMA_20"].iloc[-4]) if len(d4) >= 4 else ema20_4h
+    ema50_prev = _to_float_or_nan(d4["EMA_50"].iloc[-4]) if len(d4) >= 4 else ema50_4h
+    ema20_slope = ema20_4h - ema20_prev
+    ema50_slope = ema50_4h - ema50_prev
+
+    bullish_break = recent_high > prior_high + breakout_tol and close_4h > prior_high - acceptance_tol
+    bearish_break = recent_low < prior_low - breakout_tol and close_4h < prior_low + acceptance_tol
+    bullish_acceptance = (
+        len(last_two_closes) >= 2
+        and not last_two_closes.isna().any()
+        and float(last_two_closes.min()) > prior_high - acceptance_tol
+    )
+    bearish_acceptance = (
+        len(last_two_closes) >= 2
+        and not last_two_closes.isna().any()
+        and float(last_two_closes.max()) < prior_low + acceptance_tol
+    )
+    bullish_retest = recent_low <= prior_high + structure_tol and close_4h > prior_high + (breakout_tol * 0.50)
+    bearish_retest = recent_high >= prior_low - structure_tol and close_4h < prior_low - (breakout_tol * 0.50)
+    higher_low = recent_low > prior_low + (structure_tol * 0.50)
+    lower_high = recent_high < prior_high - (structure_tol * 0.50)
+    ema_bullish = ema20_4h > ema50_4h and ema20_slope > 0
+    ema_bearish = ema20_4h < ema50_4h and ema20_slope < 0
+    ema_turn_up = ema20_slope > 0 and close_4h > ema20_4h
+    ema_turn_down = ema20_slope < 0 and close_4h < ema20_4h
+
+    bullish_score = 0
+    bearish_score = 0
+    bullish_reasons: List[str] = []
+    bearish_reasons: List[str] = []
+
+    if bullish_break:
+        bullish_score += 3
+        bullish_reasons.append("4H rompe contra la tendencia previa.")
+    if bullish_acceptance:
+        bullish_score += 2
+        bullish_reasons.append("4H sostiene aceptacion por encima del nivel roto.")
+    elif bullish_retest:
+        bullish_score += 1
+        bullish_reasons.append("4H retestea el nivel roto sin perderlo.")
+    if higher_low:
+        bullish_score += 2
+        bullish_reasons.append("4H deja un piso mas alto que la referencia previa.")
+    if ema_bullish:
+        bullish_score += 2
+        bullish_reasons.append("EMA20 4H ya gira con EMA50 a favor.")
+    elif ema_turn_up:
+        bullish_score += 1
+        bullish_reasons.append("EMA20 4H gira al alza con aceptacion.")
+    if direction_4h == "ALCISTA":
+        bullish_score += 1
+        bullish_reasons.append("La direccion 4H ya apunta al alza.")
+    if ema50_slope > 0:
+        bullish_score += 1
+        bullish_reasons.append("EMA50 4H deja de caer.")
+
+    if bearish_break:
+        bearish_score += 3
+        bearish_reasons.append("4H rompe contra la tendencia previa.")
+    if bearish_acceptance:
+        bearish_score += 2
+        bearish_reasons.append("4H sostiene aceptacion por debajo del nivel roto.")
+    elif bearish_retest:
+        bearish_score += 1
+        bearish_reasons.append("4H retestea el nivel roto sin recuperarlo.")
+    if lower_high:
+        bearish_score += 2
+        bearish_reasons.append("4H deja un techo mas bajo que la referencia previa.")
+    if ema_bearish:
+        bearish_score += 2
+        bearish_reasons.append("EMA20 4H ya gira con EMA50 a favor.")
+    elif ema_turn_down:
+        bearish_score += 1
+        bearish_reasons.append("EMA20 4H gira a la baja con aceptacion.")
+    if direction_4h == "BAJISTA":
+        bearish_score += 1
+        bearish_reasons.append("La direccion 4H ya apunta a la baja.")
+    if ema50_slope < 0:
+        bearish_score += 1
+        bearish_reasons.append("EMA50 4H deja de subir.")
+
+    bullish_change_ready = bullish_break and (bullish_acceptance or bullish_retest)
+    bearish_change_ready = bearish_break and (bearish_acceptance or bearish_retest)
+    bullish_confirmed = bullish_change_ready and higher_low and ema_bullish and direction_4h == "ALCISTA"
+    bearish_confirmed = bearish_change_ready and lower_high and ema_bearish and direction_4h == "BAJISTA"
+
+    previous_direction = out["previous_direction"]
+    if previous_direction == "BAJISTA":
+        out["key_level"] = round(prior_high, 10)
+        out["new_direction"] = "ALCISTA"
+        out["score"] = min(10, bullish_score)
+        out["motivos"] = bullish_reasons[:4]
+        if bullish_confirmed and bullish_score >= 8:
+            out["phase"] = "GIRO_ALCISTA_CONFIRMADO"
+            out["confirmed"] = True
+        elif bullish_change_ready and bullish_score >= 5 and direction_4h != "BAJISTA":
+            out["phase"] = "GIRO_ALCISTA_EN_DESARROLLO"
+        elif bullish_break or bullish_acceptance or bullish_retest or higher_low or (direction_4h != "BAJISTA" and ema_turn_up):
+            out["phase"] = "TRANSICION"
+    elif previous_direction == "ALCISTA":
+        out["key_level"] = round(prior_low, 10)
+        out["new_direction"] = "BAJISTA"
+        out["score"] = min(10, bearish_score)
+        out["motivos"] = bearish_reasons[:4]
+        if bearish_confirmed and bearish_score >= 8:
+            out["phase"] = "GIRO_BAJISTA_CONFIRMADO"
+            out["confirmed"] = True
+        elif bearish_change_ready and bearish_score >= 5 and direction_4h != "ALCISTA":
+            out["phase"] = "GIRO_BAJISTA_EN_DESARROLLO"
+        elif bearish_break or bearish_acceptance or bearish_retest or lower_high or (direction_4h != "ALCISTA" and ema_turn_down):
+            out["phase"] = "TRANSICION"
+    else:
+        if direction_1d != direction_4h and "NEUTRAL" not in {direction_1d, direction_4h}:
+            out["phase"] = "TRANSICION"
+            out["score"] = min(10, max(bullish_score, bearish_score))
+            out["motivos"] = ["1D y 4H no comparten el mismo sesgo."]
+        elif bullish_confirmed and bullish_score >= 8:
+            out["phase"] = "GIRO_ALCISTA_CONFIRMADO"
+            out["new_direction"] = "ALCISTA"
+            out["score"] = min(10, bullish_score)
+            out["confirmed"] = True
+            out["key_level"] = round(prior_high, 10)
+            out["motivos"] = bullish_reasons[:4]
+        elif bearish_confirmed and bearish_score >= 8:
+            out["phase"] = "GIRO_BAJISTA_CONFIRMADO"
+            out["new_direction"] = "BAJISTA"
+            out["score"] = min(10, bearish_score)
+            out["confirmed"] = True
+            out["key_level"] = round(prior_low, 10)
+            out["motivos"] = bearish_reasons[:4]
+
+    if out["phase"] == "NO_EVALUADO":
+        out["phase"] = "CONTINUACION"
+        if previous_direction in {"ALCISTA", "BAJISTA"}:
+            out["new_direction"] = previous_direction
+        out["score"] = min(10, bullish_score if out["new_direction"] == "ALCISTA" else bearish_score)
         out["motivos"] = [
             "No hay evidencia suficiente de cambio de regimen; la lectura sigue en continuidad."
         ]
@@ -1849,6 +2203,262 @@ def construir_estado_final_estructural(
         "dorado_activo": estado.get("dorado") is not None,
         "micro_score_dorado": (estado.get("dorado") or {}).get("micro_score"),
         "rojo": estado.get("rojo"),
+        "regime": regime,
+    }
+    return estado
+
+
+def construir_estado_final(
+        datos: pd.DataFrame,
+        impacto_memoria: int = 0,
+        analysis_interval: str = "15m"
+) -> Dict[str, Any]:
+    """
+    v1.4 - Estado tendencial con estructura dependiente del timeframe.
+    """
+    interval_norm = _normalize_interval_token(analysis_interval)
+    resultado_azul = calcular_score_azul(datos, interval=interval_norm)
+    direccion = (resultado_azul.get("direccion") or "NEUTRAL").upper().strip()
+    local_phase = "CONTINUACION" if direccion in {"ALCISTA", "BAJISTA"} else "NO_EVALUADO"
+
+    dorado = calcular_micro_score_dorado(datos, direccion)
+    rojo = None
+    if dorado is not None:
+        rojo = calcular_micro_score_rojo(
+            datos,
+            direccion,
+            dorado=dorado,
+            impacto_memoria=impacto_memoria
+        )
+
+    vol = resultado_azul.get("volatilidad_nivel", "Normal")
+    score_alcista = int(resultado_azul.get("score_alcista", 0))
+    score_bajista = int(resultado_azul.get("score_bajista", 0))
+    umbral = int(resultado_azul.get("umbral", 0))
+    setup_bucket = _setup_bucket_from_phase(local_phase, direccion)
+
+    estado = {
+        "version": "v1.4",
+        "analysis_interval": interval_norm,
+        "structure_window": int(resultado_azul.get("structure_window", _structure_window_for_interval(interval_norm))),
+        "direccion_v13": direccion,
+        "volatilidad_v13": vol,
+        "score_alcista_v13": score_alcista,
+        "score_bajista_v13": score_bajista,
+        "umbral": umbral,
+        "dorado_v13": dorado,
+        "rojo_v13": rojo,
+        "setup_tipo": (dorado or {}).get("setup_tipo", ""),
+        "setup_label": (dorado or {}).get("setup_label", ""),
+        "zona_pullback": (dorado or {}).get("zona_pullback", ""),
+        "setup_bucket": setup_bucket,
+        "esfera": "🔵 Azul (análisis)",
+        "decision": "OBSERVAR",
+        "accion": "OBSERVAR",
+        "riesgo": "Bajo",
+        "mensaje": "No hay ventaja suficiente ahora. Mantente en OBSERVAR.",
+        "frase_pedagogica": "No hay ventaja suficiente ahora. Mantente en OBSERVAR.",
+        "mensaje_direccion": (
+            "Dirección alcista dominante." if direccion == "ALCISTA"
+            else "Dirección bajista dominante." if direccion == "BAJISTA"
+            else "Dirección neutral: sin ventaja estructural."
+        ),
+        "regime_phase": local_phase,
+        "regime_label": _regime_label(local_phase, direccion),
+        "regime_score": max(score_alcista, score_bajista),
+        "regime_confirmed": local_phase == "CONTINUACION",
+        "regime_previous_direction": direccion,
+        "regime_new_direction": direccion,
+        "regime_key_level": 0.0,
+        "regime_reasons": [],
+        "cambio_tendencia": False,
+    }
+
+    if dorado is not None:
+        estado.update({
+            "esfera": "🟡 Dorada (criterio y decisión)",
+            "decision": "OPERAR CON DISCIPLINA",
+            "accion": dorado.get("accion", "Posible ventaja"),
+            "riesgo": (rojo or {}).get("nivel", "Moderado"),
+            "mensaje": dorado.get("resumen", "Ventaja detectada. Ejecuta con disciplina."),
+            "frase_pedagogica": dorado.get("resumen", "Ventaja detectada. Ejecuta con disciplina."),
+        })
+
+    if rojo is not None and rojo.get("nivel") in ("Alto", "Muy alto"):
+        estado.update({
+            "esfera": "🔴 Roja (riesgo)",
+            "decision": "NO OPERAR",
+            "accion": "NO OPERAR",
+            "riesgo": rojo.get("nivel", "Alto"),
+            "mensaje": "Riesgo alto detectado. No operar hasta nueva lectura.",
+            "frase_pedagogica": "Riesgo alto detectado. No operar hasta nueva lectura.",
+        })
+
+    estado["debug_v13"] = {
+        "azul": resultado_azul,
+        "dorado_activo": dorado is not None,
+        "micro_score_dorado": (dorado or {}).get("micro_score"),
+        "rojo": rojo,
+        "regime": {
+            "phase": estado.get("regime_phase"),
+            "label": estado.get("regime_label"),
+            "score": estado.get("regime_score"),
+        },
+    }
+    return estado
+
+
+def construir_estado_final_estructural(
+        datos_1d: pd.DataFrame,
+        datos_4h: pd.DataFrame,
+        impacto_memoria: int = 0
+) -> Dict[str, Any]:
+    """
+    v1.4 - 1D define sesgo macro, 4H define continuidad o giro.
+    """
+    azul_1d = calcular_score_azul(datos_1d, interval="1d")
+    azul_4h = calcular_score_azul(datos_4h, interval="4h")
+
+    direccion_1d = (azul_1d.get("direccion") or "NEUTRAL").upper().strip()
+    direccion_4h = (azul_4h.get("direccion") or "NEUTRAL").upper().strip()
+    if direccion_1d == "NEUTRAL":
+        alineacion = "SIN_SESGO_MACRO"
+    elif direccion_4h == direccion_1d:
+        alineacion = "ALINEADO"
+    elif direccion_4h == "NEUTRAL":
+        alineacion = "RETROCESO_O_PAUSA"
+    else:
+        alineacion = "CONFLICTO"
+
+    regime = detectar_cambio_tendencial(
+        datos_1d=datos_1d,
+        datos_4h=datos_4h,
+        direccion_1d=direccion_1d,
+        direccion_4h=direccion_4h,
+    )
+    regime_phase = str(regime.get("phase", "NO_EVALUADO")).upper().strip()
+    regime_direction = str(regime.get("new_direction", direccion_4h)).upper().strip()
+    effective_direction = direccion_1d
+    if regime_phase in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO", "GIRO_ALCISTA_EN_DESARROLLO", "GIRO_BAJISTA_EN_DESARROLLO"}:
+        effective_direction = regime_direction if regime_direction in {"ALCISTA", "BAJISTA"} else direccion_4h
+    elif effective_direction not in {"ALCISTA", "BAJISTA"}:
+        effective_direction = direccion_4h
+
+    setup_bucket = _setup_bucket_from_phase(regime_phase, effective_direction)
+    vol_4h = azul_4h.get("volatilidad_nivel", "Normal")
+    score_alcista_1d = int(azul_1d.get("score_alcista", 0))
+    score_bajista_1d = int(azul_1d.get("score_bajista", 0))
+    umbral_1d = int(azul_1d.get("umbral", 0))
+
+    estado = {
+        "version": "v1.4",
+        "modo_lectura": "estructural_1d_4h",
+        "analysis_interval": "4h",
+        "structure_window": int(azul_4h.get("structure_window", _structure_window_for_interval("4h"))),
+        "direccion_v13": effective_direction,
+        "volatilidad_v13": vol_4h,
+        "score_alcista_v13": score_alcista_1d,
+        "score_bajista_v13": score_bajista_1d,
+        "umbral": umbral_1d,
+        "dorado_v13": None,
+        "rojo_v13": None,
+        "setup_tipo": "",
+        "setup_label": "",
+        "zona_pullback": "",
+        "setup_bucket": setup_bucket,
+        "esfera": "🔵 Azul (análisis)",
+        "decision": "OBSERVAR",
+        "accion": "OBSERVAR",
+        "riesgo": "Bajo",
+        "mensaje": "No hay ventaja suficiente ahora. Mantente en OBSERVAR.",
+        "frase_pedagogica": "No hay ventaja suficiente ahora. Mantente en OBSERVAR.",
+        "mensaje_direccion": (
+            "Direccion alcista dominante (macro 1D)." if direccion_1d == "ALCISTA"
+            else "Direccion bajista dominante (macro 1D)." if direccion_1d == "BAJISTA"
+            else "Direccion neutral en 1D: sin sesgo estructural."
+        ),
+        "estructura_1d_4h": {
+            "direccion_1d": direccion_1d,
+            "direccion_4h": direccion_4h,
+            "alineacion": alineacion,
+        },
+        "regime_phase": regime_phase,
+        "regime_label": regime.get("label", "No evaluado"),
+        "regime_score": int(regime.get("score", 0) or 0),
+        "regime_confirmed": bool(regime.get("confirmed", False)),
+        "regime_previous_direction": regime.get("previous_direction", direccion_1d),
+        "regime_new_direction": regime_direction,
+        "regime_key_level": regime.get("key_level", 0.0),
+        "regime_reasons": regime.get("motivos", [])[:4],
+        "cambio_tendencia": regime_phase.startswith("GIRO_"),
+    }
+
+    if regime_phase == "TRANSICION":
+        estado["mensaje"] = (
+            "El 4H dejo de sostener la continuidad previa, pero aun no confirma un nuevo giro. "
+            "Mantente en OBSERVAR."
+        )
+        estado["frase_pedagogica"] = estado["mensaje"]
+    elif regime_phase in {"GIRO_ALCISTA_EN_DESARROLLO", "GIRO_BAJISTA_EN_DESARROLLO"}:
+        estado["mensaje"] = (
+            "Hay evidencia inicial de giro, pero aun no es confirmacion estructural. "
+            "Mantente en OBSERVAR."
+        )
+        estado["frase_pedagogica"] = estado["mensaje"]
+    elif regime_phase == "CONTINUACION" and direccion_1d not in {"ALCISTA", "BAJISTA"}:
+        estado["mensaje"] = "El 1D aun no define sesgo macro. Mantente en OBSERVAR."
+        estado["frase_pedagogica"] = estado["mensaje"]
+    elif regime_phase == "CONTINUACION" and alineacion != "ALINEADO":
+        estado["mensaje"] = "1D y 4H no sostienen continuidad limpia. Mantente en OBSERVAR."
+        estado["frase_pedagogica"] = estado["mensaje"]
+    elif effective_direction in {"ALCISTA", "BAJISTA"}:
+        dorado = calcular_micro_score_dorado(datos_4h, effective_direction)
+        estado["dorado_v13"] = dorado
+        if dorado is not None:
+            rojo = calcular_micro_score_rojo(
+                datos_4h,
+                effective_direction,
+                dorado=dorado,
+                impacto_memoria=impacto_memoria
+            )
+            estado["rojo_v13"] = rojo
+            estado["setup_tipo"] = dorado.get("setup_tipo", "")
+            estado["setup_label"] = dorado.get("setup_label", "")
+            estado["zona_pullback"] = dorado.get("zona_pullback", "")
+            estado.update({
+                "esfera": "🟡 Dorada (criterio y decisión)",
+                "decision": "OPERAR CON DISCIPLINA",
+                "accion": dorado.get("accion", "Posible ventaja"),
+                "riesgo": (rojo or {}).get("nivel", "Moderado"),
+                "mensaje": dorado.get("resumen", "Ventaja detectada. Ejecuta con disciplina."),
+                "frase_pedagogica": dorado.get("resumen", "Ventaja detectada. Ejecuta con disciplina."),
+            })
+            if rojo is not None and rojo.get("nivel") in ("Alto", "Muy alto"):
+                estado.update({
+                    "esfera": "🔴 Roja (riesgo)",
+                    "decision": "NO OPERAR",
+                    "accion": "NO OPERAR",
+                    "riesgo": rojo.get("nivel", "Alto"),
+                    "mensaje": "Riesgo alto detectado. No operar hasta nueva lectura.",
+                    "frase_pedagogica": "Riesgo alto detectado. No operar hasta nueva lectura.",
+                })
+        else:
+            if regime_phase in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
+                estado["mensaje"] = (
+                    "El giro ya esta confirmado en 4H, pero aun falta un pullback/aceptacion limpia para ejecutar."
+                )
+            else:
+                estado["mensaje"] = "La continuidad esta sana, pero aun no hay ventaja de ejecucion."
+            estado["frase_pedagogica"] = estado["mensaje"]
+
+    estado["debug_v13"] = {
+        "modo_lectura": "estructural_1d_4h",
+        "azul_1d": azul_1d,
+        "azul_4h": azul_4h,
+        "alineacion": alineacion,
+        "dorado_activo": estado.get("dorado_v13") is not None,
+        "micro_score_dorado": (estado.get("dorado_v13") or {}).get("micro_score"),
+        "rojo": estado.get("rojo_v13"),
         "regime": regime,
     }
     return estado

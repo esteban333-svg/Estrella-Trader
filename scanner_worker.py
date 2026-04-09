@@ -1888,8 +1888,13 @@ def _apply_profile_to_precision_cfg(precision_cfg: Dict[str, Any]) -> Dict[str, 
     return cfg
 
 
-def _quality_metrics_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
+def _quality_metrics_from_record(record: Dict[str, Any], setup_bucket: str = "") -> Dict[str, Any]:
     stats = record.get("quality_stats", {})
+    bucket = str(setup_bucket or "").strip().lower()
+    if bucket:
+        raw_by_setup = record.get("quality_stats_by_setup", {})
+        if isinstance(raw_by_setup, dict):
+            stats = raw_by_setup.get(bucket, {})
     if not isinstance(stats, dict):
         stats = {}
     wins = int(stats.get("wins", 0) or 0)
@@ -1908,6 +1913,8 @@ def _quality_metrics_from_record(record: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(history, list):
         for event in history:
             if not isinstance(event, dict):
+                continue
+            if bucket and str(event.get("setup_bucket", "")).strip().lower() != bucket:
                 continue
             status = str(event.get("status", "")).strip().lower()
             if status not in {"win", "loss", "timeout"}:
@@ -2188,7 +2195,7 @@ def _compute_interval_direction(
 
     try:
         df_ind = calcular_indicadores(df_ready)
-        estado = construir_estado_final(df_ind, impacto_memoria=0)
+        estado = construir_estado_final(df_ind, impacto_memoria=0, analysis_interval=interval)
         direction = str(estado.get("direccion_v13", "NEUTRAL")).upper().strip() or "NEUTRAL"
     except Exception as exc:
         payload = {
@@ -2302,6 +2309,81 @@ def _evaluate_mtf_alignment(
         "opposites": opposites,
         "neutrals": neutrals,
     }
+
+
+def _setup_bucket_from_regime_phase(regime_phase: str, direction: str) -> str:
+    phase = str(regime_phase or "").upper().strip()
+    direction_norm = str(direction or "").upper().strip()
+    if direction_norm not in {"ALCISTA", "BAJISTA"}:
+        return "sin_setup"
+    side = "alcista" if direction_norm == "ALCISTA" else "bajista"
+    if phase == "CONTINUACION":
+        return f"continuidad_{side}"
+    if phase in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
+        return f"giro_{side}"
+    return "sin_setup"
+
+
+def _load_structural_state(
+    item: MarketItem,
+    cfg: Dict[str, Any],
+    precision_cfg: Dict[str, Any],
+    cache: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    cache_key = str(item.state_key or item.ticker or item.label).strip()
+    if cache_key in cache:
+        return cache[cache_key]
+
+    require_closed_candle = bool(precision_cfg.get("require_closed_candle", True))
+    grace_seconds = int(precision_cfg.get("closed_candle_grace_sec", 10))
+    payload: Dict[str, Any]
+    try:
+        df_1d, _, err_1d = _fetch_data(item, period="3y", interval="1d", cfg=cfg)
+        df_4h, _, err_4h = _fetch_data(item, period="12mo", interval="4h", cfg=cfg)
+        if (
+            err_1d
+            or err_4h
+            or df_1d is None
+            or df_4h is None
+            or df_1d.empty
+            or df_4h.empty
+        ):
+            raise ValueError(err_1d or err_4h or "structural_context_fetch_failed")
+
+        df_1d_ready, ok_1d, _ = _prepare_df_for_closed_candle(
+            df_1d,
+            interval="1d",
+            require_closed_candle=require_closed_candle,
+            grace_seconds=grace_seconds,
+        )
+        df_4h_ready, ok_4h, _ = _prepare_df_for_closed_candle(
+            df_4h,
+            interval="4h",
+            require_closed_candle=require_closed_candle,
+            grace_seconds=grace_seconds,
+        )
+        if not ok_1d or not ok_4h or df_1d_ready.empty or df_4h_ready.empty:
+            raise ValueError("structural_context_no_closed_candles")
+
+        structural_state = construir_estado_final_estructural(
+            calcular_indicadores(df_1d_ready),
+            calcular_indicadores(df_4h_ready),
+            impacto_memoria=0,
+        )
+        payload = {
+            "ok": True,
+            "state": structural_state,
+            "error": "",
+        }
+    except Exception as exc:
+        payload = {
+            "ok": False,
+            "state": {},
+            "error": _redact_text(str(exc)),
+        }
+
+    cache[cache_key] = payload
+    return payload
 
 
 def _compute_dynamic_min_confidence(
@@ -2464,7 +2546,7 @@ def _append_quality_event(record: Dict[str, Any], event: Dict[str, Any]) -> None
     record["quality_history"] = history[-120:]
 
 
-def _update_quality_stats(record: Dict[str, Any], outcome: str) -> None:
+def _update_quality_stats(record: Dict[str, Any], outcome: str, setup_bucket: str = "") -> None:
     stats = record.get("quality_stats", {})
     if not isinstance(stats, dict):
         stats = {}
@@ -2509,6 +2591,58 @@ def _update_quality_stats(record: Dict[str, Any], outcome: str) -> None:
     stats["noise_pct"] = _safe_float(metrics.get("noise_pct"), 0.0)
     record["quality_stats"] = stats
 
+    bucket = str(setup_bucket or "").strip().lower()
+    if not bucket or bucket == "sin_setup":
+        return
+
+    by_setup = record.get("quality_stats_by_setup", {})
+    if not isinstance(by_setup, dict):
+        by_setup = {}
+    bucket_stats = by_setup.get(bucket, {})
+    if not isinstance(bucket_stats, dict):
+        bucket_stats = {}
+
+    bucket_total = int(bucket_stats.get("total", 0) or 0) + 1
+    bucket_wins = int(bucket_stats.get("wins", 0) or 0)
+    bucket_losses = int(bucket_stats.get("losses", 0) or 0)
+    bucket_timeouts = int(bucket_stats.get("timeouts", 0) or 0)
+    bucket_replaced = int(bucket_stats.get("replaced", 0) or 0)
+
+    if outcome == "win":
+        bucket_wins += 1
+    elif outcome == "loss":
+        bucket_losses += 1
+    elif outcome == "timeout":
+        bucket_timeouts += 1
+    elif outcome == "replaced":
+        bucket_replaced += 1
+
+    bucket_resolved = bucket_wins + bucket_losses + bucket_timeouts
+    bucket_accuracy = (bucket_wins / bucket_resolved * 100.0) if bucket_resolved > 0 else 0.0
+    bucket_timeout_pct = (bucket_timeouts / bucket_resolved * 100.0) if bucket_resolved > 0 else 0.0
+    bucket_noise_pct = ((bucket_losses + bucket_timeouts) / bucket_resolved * 100.0) if bucket_resolved > 0 else 0.0
+    bucket_stats.update(
+        {
+            "total": bucket_total,
+            "wins": bucket_wins,
+            "losses": bucket_losses,
+            "timeouts": bucket_timeouts,
+            "replaced": bucket_replaced,
+            "resolved": bucket_resolved,
+            "accuracy_pct": round(bucket_accuracy, 2),
+            "timeout_pct": round(bucket_timeout_pct, 2),
+            "noise_pct": round(bucket_noise_pct, 2),
+            "updated_utc": _now_iso_utc(),
+        }
+    )
+    bucket_metrics = _quality_metrics_from_record(record, setup_bucket=bucket)
+    bucket_stats["rr_avg"] = _safe_float(bucket_metrics.get("rr_avg"), 0.0)
+    bucket_stats["rr_samples"] = int(bucket_metrics.get("rr_samples", 0) or 0)
+    bucket_stats["timeout_pct"] = _safe_float(bucket_metrics.get("timeout_pct"), 0.0)
+    bucket_stats["noise_pct"] = _safe_float(bucket_metrics.get("noise_pct"), 0.0)
+    by_setup[bucket] = bucket_stats
+    record["quality_stats_by_setup"] = by_setup
+
 
 def _open_alert_snapshot(
     estado: Dict[str, Any],
@@ -2549,6 +2683,7 @@ def _open_alert_snapshot(
         "rr_estimado": _safe_float((estado.get("dorado_v13") or {}).get("rr_estimado"), _safe_float(operational_plan.get("rr_ratio"), OPERATIONAL_TP_R_MULT)),
         "risk_pct_operativo": _safe_float(operational_plan.get("risk_pct"), 0.0),
         "risk_pct_structural": _safe_float(operational_plan.get("risk_pct_structural"), 0.0),
+        "setup_bucket": str(precision.get("setup_bucket", estado.get("setup_bucket", "sin_setup"))).strip().lower() or "sin_setup",
         "reasons": list(precision.get("reasons", [])),
     }
 
@@ -2623,7 +2758,7 @@ def _evaluate_open_alert_outcome(
     open_alert["outcome_note"] = note
 
     _append_quality_event(record, dict(open_alert))
-    _update_quality_stats(record, outcome)
+    _update_quality_stats(record, outcome, setup_bucket=str(open_alert.get("setup_bucket", "")))
     record["last_quality_outcome"] = outcome
     record["open_alert"] = None
 
@@ -2861,14 +2996,23 @@ def _alert_operational_scenario_label(
     strength: str,
     temporalidad: str,
     modo: str,
+    regime_phase: str = "",
 ) -> str:
     direction = str(direction or "").upper().strip()
     setup_tipo = str(setup_tipo or "").strip().lower()
     strength = str(strength or "").upper().strip()
     temporalidad = str(temporalidad or "").strip().lower()
     modo = str(modo or "").strip().lower()
+    regime_phase = str(regime_phase or "").upper().strip()
     direction_text = str(direction or "").lower().strip()
     structural_mode = temporalidad == "1d + 4h" or "estructural" in modo or "1d+4h" in modo
+
+    if regime_phase == "TRANSICION":
+        return "Transicion estructural"
+    if regime_phase in {"GIRO_ALCISTA_EN_DESARROLLO", "GIRO_BAJISTA_EN_DESARROLLO"}:
+        return f"Giro {direction_text} en desarrollo" if direction_text else "Giro en desarrollo"
+    if regime_phase in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
+        return f"Giro {direction_text} confirmado" if direction_text else "Giro confirmado"
 
     if direction not in {"ALCISTA", "BAJISTA"}:
         return "Cambio estructural en desarrollo" if structural_mode else "Cambio local en desarrollo"
@@ -3227,6 +3371,7 @@ def _build_alert_payload(
         strength=strength_label,
         temporalidad=temporalidad,
         modo=modo,
+        regime_phase=str(estado.get("regime_phase", "")).strip(),
     )
     regime_text = str(estado.get("regime_label", "")).strip()
     regime_line = f"Cambio tendencial: {regime_text}\n" if regime_text else ""
@@ -3401,7 +3546,7 @@ def _compute_estado(
 
     try:
         df_ind = calcular_indicadores(df_ready)
-        estado = construir_estado_final(df_ind, impacto_memoria=0)
+        estado = construir_estado_final(df_ind, impacto_memoria=0, analysis_interval=interval)
     except Exception as exc:
         return None, "", f"Error calculando estado: {exc}", {}
 
@@ -3608,6 +3753,7 @@ def _apply_precision_filters(
     estado: Dict[str, Any],
     compute_ctx: Dict[str, Any],
     mtf_cache: Dict[str, Dict[str, Any]],
+    structural_cache: Dict[str, Dict[str, Any]] | None = None,
     precision_cfg: Dict[str, Any] | None = None,
     record: Dict[str, Any] | None = None,
     record_key: str = "",
@@ -3615,6 +3761,7 @@ def _apply_precision_filters(
     if not isinstance(precision_cfg, dict):
         precision_cfg = _resolve_precision_cfg(cfg)
 
+    structural_cache_ref = structural_cache if isinstance(structural_cache, dict) else {}
     effective_cfg = dict(precision_cfg)
     if isinstance(record, dict):
         effective_cfg = _apply_record_quality_calibration(
@@ -3637,6 +3784,71 @@ def _apply_precision_filters(
     rr = _safe_float(dorado.get("rr_estimado"), 0.0)
     operational_plan = _resolve_operational_trade_plan(estado=estado, compute_ctx=compute_ctx)
     risk_ok = bool(operational_plan.get("ok", False))
+
+    modo_alerta = str(estado.get("modo_alerta", "")).strip().lower()
+    if "estructural" in modo_alerta or str(estado.get("temporalidad_alerta", "")).strip() == "1D + 4H":
+        structural_payload = {"ok": True, "state": estado, "error": ""}
+    else:
+        structural_payload = _load_structural_state(
+            item=item,
+            cfg=cfg,
+            precision_cfg=effective_cfg,
+            cache=structural_cache_ref,
+        )
+
+    structural_state = structural_payload.get("state", {}) if isinstance(structural_payload, dict) else {}
+    if not isinstance(structural_state, dict):
+        structural_state = {}
+    if structural_state and not str(estado.get("contexto_estructural", "")).strip():
+        estado["contexto_estructural"] = _structural_context_label_from_state(structural_state)
+
+    regime_phase = str(structural_state.get("regime_phase", estado.get("regime_phase", "NO_EVALUADO"))).upper().strip()
+    regime_direction = str(
+        structural_state.get(
+            "regime_new_direction",
+            structural_state.get("direccion_v13", direction),
+        )
+    ).upper().strip()
+    if regime_direction not in {"ALCISTA", "BAJISTA"}:
+        regime_direction = str(structural_state.get("direccion_v13", direction)).upper().strip()
+
+    estado["regime_phase"] = regime_phase
+    estado["regime_label"] = str(structural_state.get("regime_label", estado.get("regime_label", ""))).strip()
+    estado["regime_new_direction"] = regime_direction
+
+    setup_bucket = "sin_setup"
+    regime_block_reason = ""
+    regime_conf_floor = int(effective_cfg.get("min_confidence_score", 0) or 0)
+    regime_rr_floor = _safe_float(effective_cfg.get("min_rr", 1.8), 1.8)
+    persistence_effective = max(1, int(effective_cfg.get("persistence_bars", 1) or 1))
+
+    if not bool(structural_payload.get("ok", False)) and interval in {"15m", "30m", "1h", "4h"}:
+        regime_block_reason = "contexto_estructural_no_disponible"
+    elif regime_phase == "TRANSICION":
+        regime_block_reason = "regime_transicion"
+    elif regime_phase in {"GIRO_ALCISTA_EN_DESARROLLO", "GIRO_BAJISTA_EN_DESARROLLO"}:
+        regime_block_reason = "regime_giro_en_desarrollo"
+    elif regime_phase == "CONTINUACION":
+        expected_direction = str(structural_state.get("direccion_v13", regime_direction)).upper().strip()
+        setup_bucket = _setup_bucket_from_regime_phase(regime_phase, expected_direction)
+        regime_conf_floor = max(78, regime_conf_floor)
+        regime_rr_floor = max(1.6, regime_rr_floor)
+        persistence_effective = max(2, persistence_effective)
+        if expected_direction not in {"ALCISTA", "BAJISTA"}:
+            regime_block_reason = "contexto_macro_sin_sesgo"
+        elif direction != expected_direction:
+            regime_block_reason = "continuidad_contraria_contexto"
+    elif regime_phase in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
+        setup_bucket = _setup_bucket_from_regime_phase(regime_phase, regime_direction)
+        regime_conf_floor = max(80, regime_conf_floor)
+        regime_rr_floor = max(1.8, regime_rr_floor)
+        persistence_effective = max(2, persistence_effective)
+        if regime_direction not in {"ALCISTA", "BAJISTA"}:
+            regime_block_reason = "giro_confirmado_sin_direccion"
+        elif direction != regime_direction:
+            regime_block_reason = "giro_confirmado_contrario"
+    elif direction in {"ALCISTA", "BAJISTA"}:
+        setup_bucket = _setup_bucket_from_regime_phase("CONTINUACION", direction)
 
     mtf_enabled = enabled and bool(effective_cfg.get("multi_timeframe_filter", True))
     if mtf_enabled:
@@ -3661,7 +3873,7 @@ def _apply_precision_filters(
     candle_info = _detect_price_action(df_ind, direction)
     candle_ok = True
 
-    rr_min = max(2.0, _safe_float(effective_cfg.get("min_rr", 1.8), 1.8)) if enabled else 0.0
+    rr_min = max(regime_rr_floor, _safe_float(effective_cfg.get("min_rr", 1.8), 1.8)) if enabled else 0.0
     rr_ok = rr >= rr_min
 
     confidence_score = _compute_signal_confidence(estado=estado, mtf_info=mtf_info, candle_info=candle_info)
@@ -3670,8 +3882,9 @@ def _apply_precision_filters(
         vol_ratio=vol_ratio,
         precision_cfg=effective_cfg,
     ) if enabled else 0
+    min_confidence = max(int(min_confidence or 0), int(regime_conf_floor or 0))
     confidence_ok = confidence_score >= min_confidence
-    pullback_neutral_mtf_ok = enabled and _should_allow_pullback_neutral_mtf(
+    pullback_neutral_mtf_ok = enabled and not regime_block_reason and regime_phase == "CONTINUACION" and _should_allow_pullback_neutral_mtf(
         setup_tipo=setup_tipo,
         base_interval=interval,
         rr=rr,
@@ -3699,9 +3912,12 @@ def _apply_precision_filters(
     ) if enabled else max(1, int(cfg.get("cooldown_minutes", 60)))
 
     mtf_ok = bool(mtf_info.get("ok", True))
-    signal_ready = dorado_now and risk_ok and (not enabled or (mtf_ok and candle_ok and rr_ok and confidence_ok))
+    regime_ok = not regime_block_reason
+    signal_ready = dorado_now and risk_ok and regime_ok and (not enabled or (mtf_ok and candle_ok and rr_ok and confidence_ok))
 
     reasons: List[str] = []
+    if regime_block_reason:
+        reasons.append(regime_block_reason)
     if not dorado_now:
         reasons.append("dorado_inactivo")
     if enabled and not mtf_ok:
@@ -3721,6 +3937,7 @@ def _apply_precision_filters(
         "min_rr": round(rr_min, 3),
         "min_mtf_confirmations": max(1, int(effective_cfg.get("min_mtf_confirmations", 1) or 1)),
         "cooldown_minutes": int(cooldown_effective or 0),
+        "persistence_bars": int(persistence_effective or 1),
     }
 
     return {
@@ -3742,12 +3959,18 @@ def _apply_precision_filters(
         "rr_ok": rr_ok,
         "operational_plan": operational_plan,
         "risk_ok": risk_ok,
+        "regime_phase": regime_phase,
+        "regime_direction": regime_direction,
+        "regime_ok": regime_ok,
+        "setup_bucket": setup_bucket,
+        "persistence_bars": persistence_effective,
         "mtf": mtf_info,
         "candle": candle_info,
         "cooldown_minutes": cooldown_effective,
         "reasons": reasons,
         "interval": interval,
         "vol_ratio": vol_ratio,
+        "structural_error": str(structural_payload.get("error", "")),
     }
 
 
@@ -3870,6 +4093,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
     user_targets = _load_user_targets(telegram_user_chat_links=telegram_user_chat_links)
     mtf_cache: Dict[str, Dict[str, Any]] = {}
     structural_context_cache: Dict[str, str] = {}
+    structural_state_cache: Dict[str, Dict[str, Any]] = {}
 
     def _timed_send(channel: str, fn, *args, **kwargs) -> Tuple[bool, str]:
         started = time.perf_counter()
@@ -3926,6 +4150,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                 estado=estado,
                 compute_ctx=compute_ctx,
                 mtf_cache=mtf_cache,
+                structural_cache=structural_state_cache,
                 precision_cfg=precision_cfg,
                 record=record,
                 record_key=record_key,
@@ -3967,6 +4192,9 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             estado["risk_pct_operativo"] = precision.get("operational_plan", {}).get("risk_pct")
             estado["sl_price_operativo"] = precision.get("operational_plan", {}).get("sl_price")
             estado["tp_price_operativo"] = precision.get("operational_plan", {}).get("tp_price")
+            estado["regime_phase"] = precision.get("regime_phase", estado.get("regime_phase", ""))
+            estado["regime_new_direction"] = precision.get("regime_direction", estado.get("regime_new_direction", ""))
+            estado["setup_bucket"] = precision.get("setup_bucket", estado.get("setup_bucket", "sin_setup"))
             record["last_gate_reasons"] = precision.get("reasons", [])
             record["alert_profile"] = precision.get("profile", "balanceado")
             record["quality_calibration"] = precision.get("calibration", {})
@@ -3985,7 +4213,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                 record=record,
                 signal_ready=signal_ready,
                 cooldown_minutes=int(precision.get("cooldown_minutes", cfg.get("cooldown_minutes", 60))),
-                persistence_bars=persistence_bars,
+                persistence_bars=int(precision.get("persistence_bars", persistence_bars)),
             ):
                 cycle_metrics["alerts_triggered"] = int(cycle_metrics.get("alerts_triggered", 0) or 0) + 1
                 structural_context_label = _resolve_structural_context_label(
@@ -4187,7 +4415,11 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                             existing_open["closed_utc"] = _now_iso_utc()
                             existing_open["outcome_note"] = "reemplazada_por_nueva_alerta"
                             _append_quality_event(record, dict(existing_open))
-                            _update_quality_stats(record, "replaced")
+                            _update_quality_stats(
+                                record,
+                                "replaced",
+                                setup_bucket=str(existing_open.get("setup_bucket", "")),
+                            )
                             replacement_chat_ids = _dedupe_chat_ids(replacement_telegram_chat_ids)
                             if telegram_enabled and replacement_chat_ids:
                                 replaced_subject, replaced_body = _build_replaced_payload(
@@ -4228,7 +4460,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             record["dorado_active"] = _compute_dorado_active_state(
                 signal_ready=signal_ready,
                 current_streak=current_streak,
-                persistence_bars=persistence_bars,
+                persistence_bars=int(precision.get("persistence_bars", persistence_bars)),
             )
             record["last_source"] = source
             record["decision"] = estado.get("decision", "")
@@ -4237,6 +4469,7 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
             record["analysis_interval"] = precision.get("interval")
             record["cooldown_minutes_effective"] = precision.get("cooldown_minutes")
             record["daily_alert_count"] = _daily_alert_count(record)
+            record["last_setup_bucket"] = str(precision.get("setup_bucket", "sin_setup")).strip().lower() or "sin_setup"
             if not record.get("last_error"):
                 record["last_error"] = ""
             symbols_state[record_key] = record

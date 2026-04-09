@@ -2517,8 +2517,8 @@ def obtener_datos_procesados_cache(
 
 
 @st.cache_data(ttl=3, show_spinner=False)
-def construir_estado_final_cache(datos_df):
-    return construir_estado_final(datos_df, impacto_memoria=0)
+def construir_estado_final_cache(datos_df, intervalo_analisis: str):
+    return construir_estado_final(datos_df, impacto_memoria=0, analysis_interval=intervalo_analisis)
 
 
 @st.cache_data(ttl=3, show_spinner=False)
@@ -3544,7 +3544,7 @@ if recalc_estrella:
     if modo_estructural:
         estado = construir_estado_estructural_cache(datos_1d, datos_4h)
     else:
-        estado = construir_estado_final_cache(datos)
+        estado = construir_estado_final_cache(datos, intervalo)
 
     if "dorado_hits" not in st.session_state:
         st.session_state["dorado_hits"] = 0

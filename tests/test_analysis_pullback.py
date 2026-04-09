@@ -4,6 +4,27 @@ import analysis
 
 
 class AnalysisPullbackTests(unittest.TestCase):
+    def test_score_azul_uses_structure_window_by_interval(self):
+        df = analysis.pd.DataFrame(
+            {
+                "High": [100 + i * 0.3 for i in range(24)],
+                "Low": [99 + i * 0.2 for i in range(24)],
+                "Close": [99.5 + i * 0.25 for i in range(24)],
+                "EMA_20": [99 + i * 0.2 for i in range(24)],
+                "EMA_50": [98 + i * 0.15 for i in range(24)],
+                "EMA_200": [95.0] * 24,
+                "RSI": [56.0] * 24,
+            }
+        )
+
+        out_15m = analysis.calcular_score_azul(df, interval="15m")
+        out_1d = analysis.calcular_score_azul(df, interval="1d")
+
+        self.assertEqual(out_15m["structure_window"], 12)
+        self.assertEqual(out_1d["structure_window"], 20)
+        self.assertEqual(out_15m["structure_window_effective"], 12)
+        self.assertEqual(out_1d["structure_window_effective"], 12)
+
     def test_classify_pullback_tendencia_alcista(self):
         setup = analysis._classify_dorado_setup(
             direccion="ALCISTA",

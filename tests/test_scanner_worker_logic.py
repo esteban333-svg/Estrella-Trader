@@ -538,7 +538,14 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "neutrals": 0,
         }
         candle_info = {"aligned": False, "bias": "BAJISTA", "pattern": "doble_techo", "score": 10}
+        structural_state = {
+            "regime_phase": "CONTINUACION",
+            "regime_new_direction": "ALCISTA",
+            "direccion_v13": "ALCISTA",
+            "regime_label": "Continuacion alcista",
+        }
         with (
+            patch.object(sw, "_load_structural_state", return_value={"ok": True, "state": structural_state, "error": ""}),
             patch.object(sw, "_evaluate_mtf_alignment", return_value=mtf_info),
             patch.object(sw, "_detect_price_action", return_value=candle_info),
             patch.object(sw, "_compute_signal_confidence", return_value=80),
@@ -735,10 +742,17 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "neutrals": 1,
         }
         candle_info = {"aligned": False, "bias": "ALCISTA", "pattern": "sin_patron", "score": 0}
+        structural_state = {
+            "regime_phase": "CONTINUACION",
+            "regime_new_direction": "ALCISTA",
+            "direccion_v13": "ALCISTA",
+            "regime_label": "Continuacion alcista",
+        }
         with (
+            patch.object(sw, "_load_structural_state", return_value={"ok": True, "state": structural_state, "error": ""}),
             patch.object(sw, "_evaluate_mtf_alignment", return_value=mtf_info),
             patch.object(sw, "_detect_price_action", return_value=candle_info),
-            patch.object(sw, "_compute_signal_confidence", return_value=68),
+            patch.object(sw, "_compute_signal_confidence", return_value=72),
             patch.object(sw, "_compute_dynamic_min_confidence", return_value=72),
             patch.object(sw, "_compute_adaptive_cooldown_minutes", return_value=36),
         ):
@@ -804,7 +818,14 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             "neutrals": 1,
         }
         candle_info = {"aligned": False, "bias": "ALCISTA", "pattern": "sin_patron", "score": 0}
+        structural_state = {
+            "regime_phase": "CONTINUACION",
+            "regime_new_direction": "ALCISTA",
+            "direccion_v13": "ALCISTA",
+            "regime_label": "Continuacion alcista",
+        }
         with (
+            patch.object(sw, "_load_structural_state", return_value={"ok": True, "state": structural_state, "error": ""}),
             patch.object(sw, "_evaluate_mtf_alignment", return_value=mtf_info),
             patch.object(sw, "_detect_price_action", return_value=candle_info),
             patch.object(sw, "_compute_signal_confidence", return_value=68),
@@ -822,7 +843,81 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertFalse(out["signal_ready"])
         self.assertTrue(out["risk_ok"])
         self.assertIn("mtf_no_alineado", out["reasons"])
-        self.assertIn("confianza_baja(<72)", out["reasons"])
+        self.assertIn("confianza_baja(<78)", out["reasons"])
+
+    def test_apply_precision_filters_blocks_transition_even_with_good_local_signal(self):
+        item = sw.MarketItem(
+            market="Cripto",
+            label="BTC",
+            ticker="BTC-USD",
+            td_symbol="BTC/USD",
+            kind="crypto",
+        )
+        cfg = {"interval": "15m", "cooldown_minutes": 60}
+        precision_cfg = {
+            "enabled": True,
+            "multi_timeframe_filter": True,
+            "require_price_action_confirmation": False,
+            "min_rr": 1.6,
+            "min_confidence_score": 72,
+            "min_mtf_confirmations": 1,
+            "adaptive_threshold": False,
+            "adaptive_cooldown": True,
+        }
+        estado = {
+            "dorado_v13": {
+                "rr_estimado": 2.6,
+                "setup_tipo": "pullback_tendencia",
+            },
+            "setup_tipo": "pullback_tendencia",
+            "direccion_v13": "ALCISTA",
+            "precio_alerta": 100.0,
+        }
+        compute_ctx = {
+            "interval": "15m",
+            "vol_ratio": 1.0,
+            "df_ind": pd.DataFrame(
+                {
+                    "High": [100.8, 100.7, 100.6, 100.5, 100.4],
+                    "Low": [99.5, 99.4, 99.45, 99.5, 99.55],
+                }
+            ),
+        }
+        mtf_info = {
+            "ok": True,
+            "score": 12,
+            "details": ["30m:ALCISTA"],
+            "summary": "confirmaciones=1, opuestos=0, neutrales=0",
+            "confirmations": 1,
+            "opposites": 0,
+            "neutrals": 0,
+        }
+        structural_state = {
+            "regime_phase": "TRANSICION",
+            "regime_new_direction": "ALCISTA",
+            "direccion_v13": "ALCISTA",
+            "regime_label": "Transicion estructural",
+        }
+        with (
+            patch.object(sw, "_load_structural_state", return_value={"ok": True, "state": structural_state, "error": ""}),
+            patch.object(sw, "_evaluate_mtf_alignment", return_value=mtf_info),
+            patch.object(sw, "_detect_price_action", return_value={"pattern": "sin_patron", "score": 0}),
+            patch.object(sw, "_compute_signal_confidence", return_value=90),
+            patch.object(sw, "_compute_dynamic_min_confidence", return_value=72),
+            patch.object(sw, "_compute_adaptive_cooldown_minutes", return_value=36),
+        ):
+            out = sw._apply_precision_filters(
+                item=item,
+                cfg=cfg,
+                estado=estado,
+                compute_ctx=compute_ctx,
+                mtf_cache={},
+                precision_cfg=precision_cfg,
+            )
+
+        self.assertFalse(out["signal_ready"])
+        self.assertIn("regime_transicion", out["reasons"])
+        self.assertEqual(out["setup_bucket"], "sin_setup")
 
     def test_should_alert_respects_cooldown(self):
         record = {
