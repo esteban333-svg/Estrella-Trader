@@ -18,6 +18,7 @@ from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+from uuid import uuid4
 
 import pandas as pd
 import pytz
@@ -39,6 +40,8 @@ DEFAULT_LOG_PATH = ROOT / "scanner.log"
 DEFAULT_HEALTH_PATH = ROOT / "scanner_health.json"
 USERS_DB_PATH = Path(os.getenv("USERS_DB_PATH", str(ROOT / "usuarios_db.json"))).resolve()
 LOCK_PATH = ROOT / "scanner_worker.lock"
+WINDOWS_MUTEX_ALREADY_EXISTS = 183
+_SINGLE_INSTANCE_MUTEX_HANDLE: int | None = None
 TELEGRAM_AUTO_CHAT_IDS_KEY = "telegram_auto_chat_ids"
 TELEGRAM_LAST_UPDATE_ID_KEY = "telegram_last_update_id"
 TELEGRAM_USER_CHAT_LINKS_KEY = "telegram_user_chat_links"
@@ -467,7 +470,60 @@ def _read_lock_pid(lock_path: Path) -> int:
             return 0
 
 
+def _single_instance_mutex_name(lock_path: Path) -> str:
+    raw = str(lock_path.resolve()).strip().lower().encode("utf-8", errors="ignore")
+    digest = hashlib.sha1(raw).hexdigest()[:16]
+    return f"Local\\EstrellaTraderScannerWorker_{digest}"
+
+
+def _acquire_windows_single_instance_mutex(lock_path: Path) -> Tuple[bool, int | None, str]:
+    if os.name != "nt":
+        return True, None, ""
+
+    kernel32 = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+    if kernel32 is None:
+        return True, None, ""
+
+    try:
+        mutex_name = _single_instance_mutex_name(lock_path)
+        handle = int(kernel32.CreateMutexW(None, True, mutex_name) or 0)
+        if handle == 0:
+            return False, None, "No se pudo crear mutex de instancia unica."
+
+        last_error = int(kernel32.GetLastError() or 0)
+        if last_error == WINDOWS_MUTEX_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False, None, "Scanner ya en ejecucion."
+        return True, handle, ""
+    except Exception as exc:
+        return False, None, f"No se pudo crear mutex de instancia unica: {exc}"
+
+
+def _release_windows_single_instance_mutex(handle: int | None) -> None:
+    if os.name != "nt" or not handle:
+        return
+
+    kernel32 = getattr(getattr(ctypes, "windll", None), "kernel32", None)
+    if kernel32 is None:
+        return
+
+    try:
+        kernel32.ReleaseMutex(handle)
+    except Exception:
+        pass
+    try:
+        kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
 def _acquire_single_instance_lock(lock_path: Path) -> Tuple[bool, str]:
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+
+    mutex_ok, mutex_handle, mutex_msg = _acquire_windows_single_instance_mutex(lock_path)
+    if not mutex_ok:
+        return False, mutex_msg
+
     payload = {
         "pid": os.getpid(),
         "started_utc": datetime.now(pytz.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -477,27 +533,36 @@ def _acquire_single_instance_lock(lock_path: Path) -> Tuple[bool, str]:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(json.dumps(payload, ensure_ascii=False))
+            _SINGLE_INSTANCE_MUTEX_HANDLE = mutex_handle
             return True, ""
         except FileExistsError:
             existing_pid = _read_lock_pid(lock_path)
             if existing_pid > 0 and _pid_running(existing_pid):
+                _release_windows_single_instance_mutex(mutex_handle)
                 return False, f"Scanner ya en ejecucion (PID={existing_pid})."
             try:
                 lock_path.unlink(missing_ok=True)
             except Exception as exc:
+                _release_windows_single_instance_mutex(mutex_handle)
                 return False, f"No se pudo limpiar lock huerfano: {exc}"
         except Exception as exc:
+            _release_windows_single_instance_mutex(mutex_handle)
             return False, f"No se pudo crear lock de instancia unica: {exc}"
+    _release_windows_single_instance_mutex(mutex_handle)
     return False, "No se pudo adquirir lock de instancia unica."
 
 
 def _release_single_instance_lock(lock_path: Path) -> None:
+    global _SINGLE_INSTANCE_MUTEX_HANDLE
+
     try:
         existing_pid = _read_lock_pid(lock_path)
         if existing_pid in {0, os.getpid()}:
             lock_path.unlink(missing_ok=True)
     except Exception:
         pass
+    _release_windows_single_instance_mutex(_SINGLE_INSTANCE_MUTEX_HANDLE)
+    _SINGLE_INSTANCE_MUTEX_HANDLE = None
 
 
 def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -605,7 +670,7 @@ def load_state(state_path: Path) -> Dict[str, Any]:
         state[TELEGRAM_LAST_UPDATE_ID_KEY] = int(state.get(TELEGRAM_LAST_UPDATE_ID_KEY, 0) or 0)
     except Exception:
         state[TELEGRAM_LAST_UPDATE_ID_KEY] = 0
-    return _prune_legacy_forex_from_state(state)
+    return _normalize_state_open_alerts(_prune_legacy_forex_from_state(state))
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
@@ -1435,6 +1500,110 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return val
     except Exception:
         return default
+
+
+def _new_alert_id(record_key: str = "", opened_bar_utc: str = "") -> str:
+    record_slug = re.sub(r"[^a-z0-9]+", "-", str(record_key or "").strip().lower()).strip("-")
+    bar_slug = re.sub(r"[^0-9]", "", str(opened_bar_utc or "").strip())
+    prefix_parts = []
+    if record_slug:
+        prefix_parts.append(record_slug[:40])
+    if bar_slug:
+        prefix_parts.append(bar_slug[:14])
+    prefix = "-".join(prefix_parts)
+    suffix = uuid4().hex[:12]
+    return f"{prefix}-{suffix}" if prefix else suffix
+
+
+def _open_alert_fingerprint(alert: Dict[str, Any]) -> Tuple[Any, ...]:
+    return (
+        str(alert.get("opened_utc", "")).strip(),
+        str(alert.get("opened_bar_utc", "")).strip(),
+        str(alert.get("interval", "")).strip(),
+        str(alert.get("direction", "")).upper().strip(),
+        round(_safe_float(alert.get("entry_price"), 0.0), 10),
+        round(_safe_float(alert.get("tp_price"), 0.0), 10),
+        round(_safe_float(alert.get("sl_price"), 0.0), 10),
+    )
+
+
+def _set_record_open_alerts(record: Dict[str, Any], open_alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for alert in open_alerts:
+        if not isinstance(alert, dict):
+            continue
+        if str(alert.get("status", "open")).strip().lower() != "open":
+            continue
+        normalized.append(dict(alert))
+
+    normalized.sort(
+        key=lambda alert: (
+            str(alert.get("opened_utc", "")).strip(),
+            str(alert.get("opened_bar_utc", "")).strip(),
+            str(alert.get("alert_id", "")).strip(),
+        )
+    )
+    record["open_alerts"] = normalized
+    record["open_alert_count"] = len(normalized)
+    record["open_alert"] = dict(normalized[-1]) if normalized else None
+    return normalized
+
+
+def _normalize_record_open_alerts(record: Dict[str, Any], record_key: str = "") -> List[Dict[str, Any]]:
+    if not isinstance(record, dict):
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    raw_open_alerts = record.get("open_alerts", [])
+    if isinstance(raw_open_alerts, list):
+        candidates.extend(alert for alert in raw_open_alerts if isinstance(alert, dict))
+
+    legacy_open = record.get("open_alert")
+    if isinstance(legacy_open, dict):
+        candidates.append(legacy_open)
+
+    normalized: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_fingerprints: set[Tuple[Any, ...]] = set()
+    for raw_alert in candidates:
+        status = str(raw_alert.get("status", "open")).strip().lower()
+        if status and status != "open":
+            continue
+
+        alert = dict(raw_alert)
+        alert["status"] = "open"
+        alert_id = str(alert.get("alert_id", "")).strip()
+        fingerprint = _open_alert_fingerprint(alert)
+
+        if alert_id:
+            if alert_id in seen_ids:
+                continue
+        elif fingerprint in seen_fingerprints:
+            continue
+        else:
+            alert_id = _new_alert_id(
+                record_key=record_key,
+                opened_bar_utc=str(alert.get("opened_bar_utc", "")).strip(),
+            )
+            alert["alert_id"] = alert_id
+
+        seen_ids.add(alert_id)
+        seen_fingerprints.add(fingerprint)
+        normalized.append(alert)
+
+    return _set_record_open_alerts(record, normalized)
+
+
+def _normalize_state_open_alerts(state: Dict[str, Any]) -> Dict[str, Any]:
+    symbols = state.get("symbols", {})
+    if not isinstance(symbols, dict):
+        return state
+
+    for record_key, record in symbols.items():
+        if not isinstance(record, dict):
+            continue
+        _normalize_record_open_alerts(record, record_key=str(record_key))
+    return state
 
 
 def _interval_to_timedelta(interval: str) -> timedelta | None:
@@ -2649,6 +2818,7 @@ def _open_alert_snapshot(
     precision: Dict[str, Any],
     compute_ctx: Dict[str, Any],
     precision_cfg: Dict[str, Any],
+    record_key: str = "",
 ) -> Dict[str, Any] | None:
     direction = str(estado.get("direccion_v13", "")).upper().strip()
     entry_price = _safe_float(estado.get("precio_alerta"), 0.0)
@@ -2667,7 +2837,12 @@ def _open_alert_snapshot(
         return None
 
     return {
+        "alert_id": _new_alert_id(
+            record_key=record_key,
+            opened_bar_utc=str(estado.get("indice_alerta_utc", "")).strip(),
+        ),
         "status": "open",
+        "record_key": record_key,
         "opened_utc": _now_iso_utc(),
         "opened_bar_utc": str(estado.get("indice_alerta_utc", "")).strip(),
         "last_bar_utc": str(estado.get("indice_alerta_utc", "")).strip(),
@@ -2693,10 +2868,8 @@ def _evaluate_open_alert_outcome(
     estado: Dict[str, Any],
     compute_ctx: Dict[str, Any],
 ) -> None:
-    open_alert = record.get("open_alert")
-    if not isinstance(open_alert, dict):
-        return
-    if str(open_alert.get("status", "")).strip().lower() != "open":
+    open_alerts = _normalize_record_open_alerts(record)
+    if not open_alerts:
         return
 
     df_ind = compute_ctx.get("df_ind")
@@ -2708,59 +2881,65 @@ def _evaluate_open_alert_outcome(
     low = _safe_float(last_row.get("Low"), 0.0)
     close = _safe_float(last_row.get("Close"), 0.0)
     bar_utc = str(estado.get("indice_alerta_utc", "")).strip()
-    last_bar = str(open_alert.get("last_bar_utc", "")).strip()
-    bars_elapsed = int(open_alert.get("bars_elapsed", 0) or 0)
+    remaining_open_alerts: List[Dict[str, Any]] = []
+    resolved_outcomes: List[str] = []
+    for open_alert in open_alerts:
+        last_bar = str(open_alert.get("last_bar_utc", "")).strip()
+        bars_elapsed = int(open_alert.get("bars_elapsed", 0) or 0)
 
-    if bar_utc and bar_utc != last_bar:
-        bars_elapsed += 1
-        open_alert["last_bar_utc"] = bar_utc
-    open_alert["bars_elapsed"] = bars_elapsed
-    open_alert["last_price"] = round(close, 10)
+        if bar_utc and bar_utc != last_bar:
+            bars_elapsed += 1
+            open_alert["last_bar_utc"] = bar_utc
+        open_alert["bars_elapsed"] = bars_elapsed
+        open_alert["last_price"] = round(close, 10)
 
-    direction = str(open_alert.get("direction", "")).upper().strip()
-    tp_price = _safe_float(open_alert.get("tp_price"), 0.0)
-    sl_price = _safe_float(open_alert.get("sl_price"), 0.0)
-    max_bars = max(1, int(open_alert.get("max_bars", 12) or 12))
+        direction = str(open_alert.get("direction", "")).upper().strip()
+        tp_price = _safe_float(open_alert.get("tp_price"), 0.0)
+        sl_price = _safe_float(open_alert.get("sl_price"), 0.0)
+        max_bars = max(1, int(open_alert.get("max_bars", 12) or 12))
 
-    win_hit = False
-    loss_hit = False
-    if direction == "ALCISTA":
-        win_hit = high >= tp_price > 0
-        loss_hit = low <= sl_price < tp_price
-    elif direction == "BAJISTA":
-        win_hit = low <= tp_price > 0
-        loss_hit = high >= sl_price > tp_price
+        win_hit = False
+        loss_hit = False
+        if direction == "ALCISTA":
+            win_hit = high >= tp_price > 0
+            loss_hit = low <= sl_price < tp_price
+        elif direction == "BAJISTA":
+            win_hit = low <= tp_price > 0
+            loss_hit = high >= sl_price > tp_price
 
-    outcome = ""
-    note = ""
-    if win_hit and loss_hit:
-        # Conservador: si en la misma vela toca TP y SL, lo marcamos como loss.
-        outcome = "loss"
-        note = "tp_y_sl_misma_vela"
-    elif win_hit:
-        outcome = "win"
-        note = "tp_alcanzado"
-    elif loss_hit:
-        outcome = "loss"
-        note = "sl_alcanzado"
-    elif bars_elapsed >= max_bars:
-        outcome = "timeout"
-        note = "ventana_expirada"
+        outcome = ""
+        note = ""
+        if win_hit and loss_hit:
+            # Conservador: si en la misma vela toca TP y SL, lo marcamos como loss.
+            outcome = "loss"
+            note = "tp_y_sl_misma_vela"
+        elif win_hit:
+            outcome = "win"
+            note = "tp_alcanzado"
+        elif loss_hit:
+            outcome = "loss"
+            note = "sl_alcanzado"
+        elif bars_elapsed >= max_bars:
+            outcome = "timeout"
+            note = "ventana_expirada"
 
-    if not outcome:
-        record["open_alert"] = open_alert
-        return
+        if not outcome:
+            remaining_open_alerts.append(open_alert)
+            continue
 
-    open_alert["status"] = outcome
-    open_alert["closed_utc"] = _now_iso_utc()
-    open_alert["bars_elapsed"] = bars_elapsed
-    open_alert["close_price"] = round(close, 10)
-    open_alert["outcome_note"] = note
+        open_alert["status"] = outcome
+        open_alert["closed_utc"] = _now_iso_utc()
+        open_alert["bars_elapsed"] = bars_elapsed
+        open_alert["close_price"] = round(close, 10)
+        open_alert["outcome_note"] = note
 
-    _append_quality_event(record, dict(open_alert))
-    _update_quality_stats(record, outcome, setup_bucket=str(open_alert.get("setup_bucket", "")))
-    record["last_quality_outcome"] = outcome
-    record["open_alert"] = None
+        _append_quality_event(record, dict(open_alert))
+        _update_quality_stats(record, outcome, setup_bucket=str(open_alert.get("setup_bucket", "")))
+        resolved_outcomes.append(outcome)
+
+    if resolved_outcomes:
+        record["last_quality_outcome"] = resolved_outcomes[-1]
+    _set_record_open_alerts(record, remaining_open_alerts)
 
 
 def _should_alert(
@@ -3936,6 +4115,8 @@ def _apply_precision_filters(
 
     candle_info = _detect_price_action(df_ind, direction)
     candle_ok = True
+    if enabled and bool(effective_cfg.get("require_price_action_confirmation", False)):
+        candle_ok = bool(candle_info.get("aligned", False))
 
     rr_min = max(regime_rr_floor, _safe_float(effective_cfg.get("min_rr", 1.8), 1.8)) if enabled else 0.0
     rr_ok = rr >= rr_min
@@ -3986,6 +4167,8 @@ def _apply_precision_filters(
         reasons.append("dorado_inactivo")
     if enabled and not mtf_ok:
         reasons.append("mtf_no_alineado")
+    if enabled and not candle_ok:
+        reasons.append("vela_sin_confirmacion")
     if enabled and not rr_ok:
         reasons.append(f"rr_bajo(<{rr_min})")
     if enabled and not confidence_ok:
@@ -4023,6 +4206,7 @@ def _apply_precision_filters(
         "rr_ok": rr_ok,
         "operational_plan": operational_plan,
         "risk_ok": risk_ok,
+        "candle_ok": candle_ok,
         "regime_phase": regime_phase,
         "regime_direction": regime_direction,
         "regime_ok": regime_ok,
@@ -4471,49 +4655,12 @@ def run_scan_cycle(cfg: Dict[str, Any], state: Dict[str, Any]) -> Tuple[Dict[str
                         precision=precision,
                         compute_ctx=compute_ctx,
                         precision_cfg=precision_cfg,
+                        record_key=record_key,
                     )
                     if snapshot is not None:
-                        existing_open = record.get("open_alert")
-                        if isinstance(existing_open, dict) and str(existing_open.get("status", "")).strip().lower() == "open":
-                            existing_open["status"] = "replaced"
-                            existing_open["closed_utc"] = _now_iso_utc()
-                            existing_open["outcome_note"] = "reemplazada_por_nueva_alerta"
-                            _append_quality_event(record, dict(existing_open))
-                            _update_quality_stats(
-                                record,
-                                "replaced",
-                                setup_bucket=str(existing_open.get("setup_bucket", "")),
-                            )
-                            replacement_chat_ids = _dedupe_chat_ids(replacement_telegram_chat_ids)
-                            if telegram_enabled and replacement_chat_ids:
-                                replaced_subject, replaced_body = _build_replaced_payload(
-                                    cfg=cfg,
-                                    item=item,
-                                    replaced_alert=existing_open,
-                                    estado=estado,
-                                )
-                                replaced_ok, replaced_err = _timed_send(
-                                    "telegram",
-                                    _send_telegram_alert,
-                                    cfg,
-                                    replaced_subject,
-                                    replaced_body,
-                                    chat_ids_override=replacement_chat_ids,
-                                    item=None,
-                                )
-                                notify_status["telegram_replaced"] = {
-                                    "ok": replaced_ok,
-                                    "error": replaced_err,
-                                    "sent_to": len(replacement_chat_ids),
-                                }
-                                if not replaced_ok:
-                                    logging.warning(
-                                        "[%s|%s] Fallo aviso REPLACED: %s",
-                                        item.state_key,
-                                        target_key,
-                                        replaced_err,
-                                    )
-                        record["open_alert"] = snapshot
+                        open_alerts = _normalize_record_open_alerts(record, record_key=record_key)
+                        open_alerts.append(snapshot)
+                        _set_record_open_alerts(record, open_alerts)
                     logging.info("[%s|%s] Alerta enviada (multicanal).", item.state_key, target_key)
                 else:
                     cycle_metrics["alerts_failed"] = int(cycle_metrics.get("alerts_failed", 0) or 0) + 1

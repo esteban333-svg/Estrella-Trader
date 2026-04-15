@@ -1437,7 +1437,7 @@ def _leer_scanner_state() -> dict:
         with open(SCANNER_STATE_PATH, "r", encoding="utf-8-sig") as f:
             payload = json.load(f)
         if isinstance(payload, dict):
-            return payload
+            return _normalizar_scanner_state(payload)
     except Exception:
         return {}
     return {}
@@ -1465,6 +1465,75 @@ def _parse_scanner_record_key(record_key: str, record: dict) -> tuple[str, str, 
     if not timeframe:
         timeframe = str(record.get("scan_target") or record.get("analysis_interval") or "15m").strip()
     return market, label, ticker, timeframe
+
+
+def _scanner_open_alert_fingerprint(alert: dict) -> tuple:
+    return (
+        str(alert.get("opened_utc", "")).strip(),
+        str(alert.get("opened_bar_utc", "")).strip(),
+        str(alert.get("interval", "")).strip(),
+        str(alert.get("direction", "")).upper().strip(),
+        round(_safe_float_num(alert.get("entry_price"), 0.0), 10),
+        round(_safe_float_num(alert.get("tp_price"), 0.0), 10),
+        round(_safe_float_num(alert.get("sl_price"), 0.0), 10),
+    )
+
+
+def _scanner_open_alerts(record: dict) -> list[dict]:
+    if not isinstance(record, dict):
+        return []
+
+    candidates = []
+    raw_open_alerts = record.get("open_alerts", [])
+    if isinstance(raw_open_alerts, list):
+        candidates.extend(alert for alert in raw_open_alerts if isinstance(alert, dict))
+
+    legacy_open = record.get("open_alert")
+    if isinstance(legacy_open, dict):
+        candidates.append(legacy_open)
+
+    open_alerts = []
+    seen_ids = set()
+    seen_fingerprints = set()
+    for raw_alert in candidates:
+        status = str(raw_alert.get("status", "open")).strip().lower()
+        if status and status != "open":
+            continue
+
+        alert = dict(raw_alert)
+        alert_id = str(alert.get("alert_id", "")).strip()
+        fingerprint = _scanner_open_alert_fingerprint(alert)
+        if alert_id:
+            if alert_id in seen_ids:
+                continue
+        elif fingerprint in seen_fingerprints:
+            continue
+
+        seen_ids.add(alert_id)
+        seen_fingerprints.add(fingerprint)
+        open_alerts.append(alert)
+
+    open_alerts.sort(
+        key=lambda alert: (
+            str(alert.get("opened_utc", "")).strip(),
+            str(alert.get("opened_bar_utc", "")).strip(),
+            str(alert.get("alert_id", "")).strip(),
+        )
+    )
+    record["open_alerts"] = open_alerts
+    record["open_alert_count"] = len(open_alerts)
+    record["open_alert"] = dict(open_alerts[-1]) if open_alerts else None
+    return open_alerts
+
+
+def _normalizar_scanner_state(payload: dict) -> dict:
+    symbols = payload.get("symbols", {})
+    if not isinstance(symbols, dict):
+        return payload
+    for record in symbols.values():
+        if isinstance(record, dict):
+            _scanner_open_alerts(record)
+    return payload
 
 
 def _rr_promedio_record(record: dict) -> tuple[float, int]:
@@ -1505,6 +1574,7 @@ def _scanner_precision_panel_data():
     symbols = state.get("symbols", {})
     if not isinstance(symbols, dict):
         return pd.DataFrame(), pd.DataFrame(), {
+            "open": 0,
             "resolved": 0,
             "wins": 0,
             "losses": 0,
@@ -1519,6 +1589,7 @@ def _scanner_precision_panel_data():
     rows = []
     ranking_acc = {}
     summary = {
+        "open": 0,
         "resolved": 0,
         "wins": 0,
         "losses": 0,
@@ -1538,6 +1609,7 @@ def _scanner_precision_panel_data():
         stats = record.get("quality_stats", {})
         if not isinstance(stats, dict):
             stats = {}
+        open_count = len(_scanner_open_alerts(record))
 
         wins = int(stats.get("wins", 0) or 0)
         losses = int(stats.get("losses", 0) or 0)
@@ -1568,6 +1640,7 @@ def _scanner_precision_panel_data():
                 "Activo": label,
                 "Ticker": ticker,
                 "Timeframe": timeframe,
+                "Abiertas": open_count,
                 "W": wins,
                 "L": losses,
                 "Timeout": timeouts,
@@ -1582,6 +1655,7 @@ def _scanner_precision_panel_data():
             }
         )
 
+        summary["open"] += open_count
         summary["wins"] += wins
         summary["losses"] += losses
         summary["timeouts"] += timeouts
@@ -1601,6 +1675,7 @@ def _scanner_precision_panel_data():
                 "Mercado": market,
                 "Activo": label,
                 "Ticker": ticker,
+                "open": 0,
                 "wins": 0,
                 "losses": 0,
                 "timeouts": 0,
@@ -1612,6 +1687,7 @@ def _scanner_precision_panel_data():
             }
             ranking_acc[agg_key] = agg
 
+        agg["open"] += open_count
         agg["wins"] += wins
         agg["losses"] += losses
         agg["timeouts"] += timeouts
@@ -1647,6 +1723,7 @@ def _scanner_precision_panel_data():
                 "Activo": agg["Activo"],
                 "Ticker": agg["Ticker"],
                 "Mejor timeframe": agg.get("best_timeframe", ""),
+                "Abiertas": int(agg.get("open", 0) or 0),
                 "Resueltas": resolved,
                 "Acierto %": round(accuracy_pct, 2),
                 "RR prom.": round(rr_avg, 3),

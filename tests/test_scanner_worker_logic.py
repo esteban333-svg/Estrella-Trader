@@ -1,6 +1,10 @@
+import json
 import os
+import tempfile
 import unittest
 from datetime import datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pandas as pd
@@ -71,6 +75,66 @@ class ScannerWorkerLogicTests(unittest.TestCase):
         self.assertEqual(out["scan_intervals"], ["15m", "1h"])
         self.assertGreaterEqual(out["poll_interval_sec"], 90)
         self.assertEqual(out["crypto_symbols"], ["BTC", "ETH", "SOL", "BNB"])
+
+    def test_single_instance_mutex_name_is_stable(self):
+        lock_path = Path("C:/tmp/estrella/scanner_worker.lock")
+
+        name_a = sw._single_instance_mutex_name(lock_path)
+        name_b = sw._single_instance_mutex_name(lock_path)
+
+        self.assertEqual(name_a, name_b)
+        self.assertTrue(name_a.startswith("Local\\EstrellaTraderScannerWorker_"))
+
+    def test_acquire_windows_single_instance_mutex_detects_existing_instance(self):
+        class FakeKernel32:
+            def __init__(self):
+                self.closed = []
+
+            def CreateMutexW(self, *_args):
+                return 321
+
+            def GetLastError(self):
+                return sw.WINDOWS_MUTEX_ALREADY_EXISTS
+
+            def CloseHandle(self, handle):
+                self.closed.append(handle)
+                return 1
+
+        fake_kernel32 = FakeKernel32()
+        with (
+            patch.object(sw.os, "name", "nt"),
+            patch.object(sw.ctypes, "windll", SimpleNamespace(kernel32=fake_kernel32), create=True),
+        ):
+            ok, handle, msg = sw._acquire_windows_single_instance_mutex(Path("scanner_worker.lock"))
+
+        self.assertFalse(ok)
+        self.assertIsNone(handle)
+        self.assertIn("ya en ejecucion", msg.lower())
+        self.assertEqual(fake_kernel32.closed, [321])
+
+    def test_release_windows_single_instance_mutex_releases_and_closes_handle(self):
+        class FakeKernel32:
+            def __init__(self):
+                self.released = []
+                self.closed = []
+
+            def ReleaseMutex(self, handle):
+                self.released.append(handle)
+                return 1
+
+            def CloseHandle(self, handle):
+                self.closed.append(handle)
+                return 1
+
+        fake_kernel32 = FakeKernel32()
+        with (
+            patch.object(sw.os, "name", "nt"),
+            patch.object(sw.ctypes, "windll", SimpleNamespace(kernel32=fake_kernel32), create=True),
+        ):
+            sw._release_windows_single_instance_mutex(987)
+
+        self.assertEqual(fake_kernel32.released, [987])
+        self.assertEqual(fake_kernel32.closed, [987])
 
     def test_global_quality_calibration_tighten_hard(self):
         cfg = {
@@ -422,10 +486,111 @@ class ScannerWorkerLogicTests(unittest.TestCase):
             precision=precision,
             compute_ctx={"interval": "15m"},
             precision_cfg={},
+            record_key="Cripto|BTC|BTC-USD|15m",
+        )
+        snap_b = sw._open_alert_snapshot(
+            estado=estado,
+            precision=precision,
+            compute_ctx={"interval": "15m"},
+            precision_cfg={},
+            record_key="Cripto|BTC|BTC-USD|15m",
         )
 
         self.assertIsNotNone(snap)
         self.assertEqual(snap["rr_estimado"], 4.4)
+        self.assertEqual(snap["record_key"], "Cripto|BTC|BTC-USD|15m")
+        self.assertTrue(snap["alert_id"])
+        self.assertNotEqual(snap["alert_id"], snap_b["alert_id"])
+
+    def test_load_state_migrates_legacy_open_alert_to_open_alerts(self):
+        legacy_open = {
+            "status": "open",
+            "opened_utc": "2026-03-10T15:00:00Z",
+            "opened_bar_utc": "2026-03-10T15:00:00Z",
+            "interval": "15m",
+            "direction": "ALCISTA",
+            "entry_price": 100.0,
+            "tp_price": 101.0,
+            "sl_price": 99.5,
+        }
+        payload = {
+            "symbols": {
+                "Cripto|BTC|BTC-USD|15m": {
+                    "open_alert": legacy_open,
+                }
+            }
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "scanner_state.json"
+            state_path.write_text(json.dumps(payload), encoding="utf-8")
+            state = sw.load_state(state_path)
+
+        record = state["symbols"]["Cripto|BTC|BTC-USD|15m"]
+        self.assertEqual(record["open_alert_count"], 1)
+        self.assertEqual(len(record["open_alerts"]), 1)
+        self.assertTrue(record["open_alerts"][0]["alert_id"])
+        self.assertEqual(record["open_alert"]["alert_id"], record["open_alerts"][0]["alert_id"])
+
+    def test_evaluate_open_alert_outcome_resolves_multiple_open_alerts(self):
+        record = {
+            "open_alerts": [
+                {
+                    "alert_id": "a1",
+                    "status": "open",
+                    "opened_utc": "2026-03-10T15:00:00Z",
+                    "opened_bar_utc": "2026-03-10T15:00:00Z",
+                    "last_bar_utc": "2026-03-10T15:00:00Z",
+                    "bars_elapsed": 0,
+                    "max_bars": 12,
+                    "interval": "15m",
+                    "direction": "ALCISTA",
+                    "entry_price": 100.0,
+                    "tp_price": 101.0,
+                    "sl_price": 99.0,
+                    "setup_bucket": "continuidad_alcista",
+                },
+                {
+                    "alert_id": "a2",
+                    "status": "open",
+                    "opened_utc": "2026-03-10T15:05:00Z",
+                    "opened_bar_utc": "2026-03-10T15:00:00Z",
+                    "last_bar_utc": "2026-03-10T15:00:00Z",
+                    "bars_elapsed": 0,
+                    "max_bars": 12,
+                    "interval": "15m",
+                    "direction": "ALCISTA",
+                    "entry_price": 100.2,
+                    "tp_price": 103.0,
+                    "sl_price": 99.8,
+                    "setup_bucket": "continuidad_alcista",
+                },
+            ]
+        }
+        estado = {"indice_alerta_utc": "2026-03-10T15:15:00Z"}
+        compute_ctx = {
+            "df_ind": pd.DataFrame(
+                [
+                    {
+                        "High": 101.2,
+                        "Low": 99.6,
+                        "Close": 100.5,
+                    }
+                ]
+            )
+        }
+
+        sw._evaluate_open_alert_outcome(record=record, estado=estado, compute_ctx=compute_ctx)
+
+        self.assertEqual(record["open_alert_count"], 0)
+        self.assertEqual(record["open_alerts"], [])
+        self.assertIsNone(record["open_alert"])
+        self.assertEqual(record["quality_stats"]["wins"], 1)
+        self.assertEqual(record["quality_stats"]["losses"], 1)
+        self.assertEqual(record["quality_stats"]["resolved"], 2)
+        history_by_id = {event["alert_id"]: event["status"] for event in record["quality_history"]}
+        self.assertEqual(history_by_id["a1"], "win")
+        self.assertEqual(history_by_id["a2"], "loss")
 
     def test_session_status_for_alert_marks_weekend_as_not_favorable(self):
         state, recommendation = sw._session_status_for_alert("2026-03-14T15:00:00Z")
@@ -493,7 +658,7 @@ class ScannerWorkerLogicTests(unittest.TestCase):
 
         self.assertEqual(low_pattern, high_pattern)
 
-    def test_apply_precision_filters_ignores_candle_alignment(self):
+    def test_apply_precision_filters_blocks_signal_without_candle_alignment(self):
         item = sw.MarketItem(
             market="Cripto",
             label="BTC",
@@ -564,8 +729,9 @@ class ScannerWorkerLogicTests(unittest.TestCase):
                 precision_cfg=precision_cfg,
             )
 
-        self.assertTrue(out["signal_ready"])
-        self.assertNotIn("vela_sin_confirmacion", out["reasons"])
+        self.assertFalse(out["signal_ready"])
+        self.assertFalse(out["candle_ok"])
+        self.assertIn("vela_sin_confirmacion", out["reasons"])
 
     def test_detectar_cambio_tendencial_identifies_bullish_shift(self):
         datos_1d = pd.DataFrame(
