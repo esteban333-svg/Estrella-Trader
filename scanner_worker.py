@@ -53,6 +53,7 @@ OPERATIONAL_TP_R_MULT = 2.0
 GUIDE_SL_MIN_PCT = 0.5
 GUIDE_SL_MAX_PCT = 1.0
 GUIDE_TP_R_MULT = 2.0
+SCANNER_CONFIG_VERSION = 2
 
 TD_INTERVAL_MAP = {
     "1m": "1min",
@@ -305,6 +306,7 @@ def _apply_resource_profile(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 def _default_config() -> Dict[str, Any]:
     return {
+        "config_version": SCANNER_CONFIG_VERSION,
         "enabled": True,
         "poll_interval_sec": 60,
         "analysis_mode": "tendencial",
@@ -337,16 +339,16 @@ def _default_config() -> Dict[str, Any]:
             "persistence_bars": 2,
             "multi_timeframe_filter": True,
             "require_price_action_confirmation": True,
-            "min_confidence_score": 85,
-            "min_rr": 1.8,
+            "min_confidence_score": 72,
+            "min_rr": 1.6,
             "adaptive_threshold": True,
             "adaptive_cooldown": True,
             "quality_calibration_enabled": True,
-            "quality_calibration_min_resolved": 20,
+            "quality_calibration_min_resolved": 60,
             "quality_calibration_scope": "global_and_record",
             "quality_calibration_record_enabled": True,
-            "quality_calibration_record_min_resolved": 8,
-            "min_mtf_confirmations": 2,
+            "quality_calibration_record_min_resolved": 12,
+            "min_mtf_confirmations": 1,
             "quality_window_bars": 12,
             "quality_window_bars_by_interval": {
                 "5m": 16,
@@ -645,6 +647,59 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _migrate_precision_filters_v2(raw_precision_cfg: Any) -> Tuple[Dict[str, Any], bool]:
+    cfg = dict(raw_precision_cfg) if isinstance(raw_precision_cfg, dict) else {}
+    changed = False
+    profile = _normalize_alert_profile(cfg.get("alert_profile", "balanceado"))
+
+    if profile == "balanceado":
+        if int(_safe_float(cfg.get("persistence_bars", 2), 2)) >= 3:
+            cfg["persistence_bars"] = 2
+            changed = True
+        if _safe_float(cfg.get("min_confidence_score", 72), 72.0) >= 80.0:
+            cfg["min_confidence_score"] = 72
+            changed = True
+        if _safe_float(cfg.get("min_rr", 1.6), 1.6) >= 1.8:
+            cfg["min_rr"] = 1.6
+            changed = True
+        if int(_safe_float(cfg.get("min_mtf_confirmations", 1), 1)) >= 2:
+            cfg["min_mtf_confirmations"] = 1
+            changed = True
+        if int(_safe_float(cfg.get("quality_calibration_min_resolved", 20), 20)) <= 20:
+            cfg["quality_calibration_min_resolved"] = 60
+            changed = True
+        if int(_safe_float(cfg.get("quality_calibration_record_min_resolved", 8), 8)) <= 8:
+            cfg["quality_calibration_record_min_resolved"] = 12
+            changed = True
+        if not bool(cfg.get("require_price_action_confirmation", False)):
+            cfg["require_price_action_confirmation"] = True
+            changed = True
+        if not bool(cfg.get("adaptive_threshold", False)):
+            cfg["adaptive_threshold"] = True
+            changed = True
+        if not bool(cfg.get("adaptive_cooldown", False)):
+            cfg["adaptive_cooldown"] = True
+            changed = True
+
+    return cfg, changed
+
+
+def _migrate_config(cfg: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
+    migrated = dict(cfg) if isinstance(cfg, dict) else {}
+    current_version = int(_safe_float(migrated.get("config_version", 0), 0.0))
+    changed = False
+
+    if current_version < SCANNER_CONFIG_VERSION:
+        precision_cfg, precision_changed = _migrate_precision_filters_v2(migrated.get("precision_filters", {}))
+        if precision_changed or not isinstance(migrated.get("precision_filters", {}), dict):
+            migrated["precision_filters"] = precision_cfg
+            changed = True
+        migrated["config_version"] = SCANNER_CONFIG_VERSION
+        changed = True
+
+    return migrated, changed
+
+
 def load_config(config_path: Path) -> Dict[str, Any]:
     defaults = _default_config()
     if not config_path.exists():
@@ -652,7 +707,12 @@ def load_config(config_path: Path) -> Dict[str, Any]:
         logging.info("Config creada en %s", config_path)
         return defaults
     user_cfg = _read_json(config_path, {})
-    return _merge_dicts(defaults, _sanitize_legacy_forex_config(user_cfg))
+    merged = _merge_dicts(defaults, _sanitize_legacy_forex_config(user_cfg))
+    migrated, changed = _migrate_config(merged)
+    if changed:
+        _write_json(config_path, migrated)
+        logging.info("Config migrada a version %s en %s", SCANNER_CONFIG_VERSION, config_path)
+    return migrated
 
 
 def load_state(state_path: Path) -> Dict[str, Any]:
@@ -4061,24 +4121,36 @@ def _apply_precision_filters(
 
     setup_bucket = "sin_setup"
     regime_block_reason = ""
+    regime_caution_reason = ""
     regime_conf_floor = int(effective_cfg.get("min_confidence_score", 0) or 0)
     regime_rr_floor = _safe_float(effective_cfg.get("min_rr", 1.8), 1.8)
     persistence_effective = max(1, int(effective_cfg.get("persistence_bars", 1) or 1))
+    regime_setup_direction = regime_direction if regime_direction in {"ALCISTA", "BAJISTA"} else direction
 
     if not bool(structural_payload.get("ok", False)) and interval in {"15m", "30m", "1h", "4h"}:
         regime_block_reason = "contexto_estructural_no_disponible"
     elif regime_phase == "TRANSICION":
-        regime_block_reason = "regime_transicion"
+        setup_bucket = _setup_bucket_from_regime_phase("CONTINUACION", regime_setup_direction)
+        regime_caution_reason = "regime_transicion"
+        regime_conf_floor = max(76, regime_conf_floor)
+        regime_rr_floor = max(1.7, regime_rr_floor)
+        persistence_effective = max(2, persistence_effective)
     elif regime_phase in {"GIRO_ALCISTA_EN_DESARROLLO", "GIRO_BAJISTA_EN_DESARROLLO"}:
-        regime_block_reason = "regime_giro_en_desarrollo"
+        setup_bucket = _setup_bucket_from_regime_phase("CONTINUACION", regime_setup_direction)
+        regime_caution_reason = "regime_giro_en_desarrollo"
+        regime_conf_floor = max(78, regime_conf_floor)
+        regime_rr_floor = max(1.8, regime_rr_floor)
+        persistence_effective = max(2, persistence_effective)
     elif regime_phase == "CONTINUACION":
         expected_direction = str(structural_state.get("direccion_v13", regime_direction)).upper().strip()
-        setup_bucket = _setup_bucket_from_regime_phase(regime_phase, expected_direction)
-        regime_conf_floor = max(78, regime_conf_floor)
+        setup_bucket = _setup_bucket_from_regime_phase(regime_phase, expected_direction if expected_direction in {"ALCISTA", "BAJISTA"} else regime_setup_direction)
+        regime_conf_floor = max(76, regime_conf_floor)
         regime_rr_floor = max(1.6, regime_rr_floor)
         persistence_effective = max(2, persistence_effective)
         if expected_direction not in {"ALCISTA", "BAJISTA"}:
-            regime_block_reason = "contexto_macro_sin_sesgo"
+            regime_caution_reason = "contexto_macro_sin_sesgo"
+            regime_conf_floor = max(78, regime_conf_floor)
+            regime_rr_floor = max(1.8, regime_rr_floor)
         elif direction != expected_direction:
             regime_block_reason = "continuidad_contraria_contexto"
     elif regime_phase in {"GIRO_ALCISTA_CONFIRMADO", "GIRO_BAJISTA_CONFIRMADO"}:
@@ -4163,6 +4235,8 @@ def _apply_precision_filters(
     reasons: List[str] = []
     if regime_block_reason:
         reasons.append(regime_block_reason)
+    elif regime_caution_reason and not signal_ready:
+        reasons.append(regime_caution_reason)
     if not dorado_now:
         reasons.append("dorado_inactivo")
     if enabled and not mtf_ok:
@@ -4210,6 +4284,8 @@ def _apply_precision_filters(
         "regime_phase": regime_phase,
         "regime_direction": regime_direction,
         "regime_ok": regime_ok,
+        "regime_caution": bool(regime_caution_reason),
+        "regime_caution_reason": regime_caution_reason,
         "setup_bucket": setup_bucket,
         "persistence_bars": persistence_effective,
         "mtf": mtf_info,
